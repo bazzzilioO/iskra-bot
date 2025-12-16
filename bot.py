@@ -4,11 +4,7 @@ import os
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 
 DB_PATH = "bot.db"
@@ -28,20 +24,20 @@ TASKS = [
     (11, "Текст о треке (5–7 строк)"),
     (12, "Подготовлены 3 контент-единицы"),
     (13, "Список плейлистов / медиа"),
-    (14, "План пострелиза на 7 дней"),
+    (14, "Питчинг: подача минимум за 14 дней"),
 ]
 
 # help text per task_id
 HELP = {
     1: "Что нужно: финальный мастер в WAV (обычно 24-bit, 44.1k/48k). Без клиппинга.\n"
-       "Где взять: от звукорежа/студии или сам экспорт из проекта.\n"
+       "Где взять: от звукорежа/студии или экспорт из проекта.\n"
        "Частая ошибка: залить mp3 вместо WAV.",
     2: "Если в треке мат/жёсткий контент — некоторые площадки требуют пометку Explicit.\n"
        "Иногда полезно иметь Clean-версию (без мата), если хочешь больше плейлистов/радио.\n"
        "Если мата нет — можно пропустить.",
     3: "Обложка: квадрат 3000×3000 (часто JPG/PNG), без мелкого текста.\n"
-       "Проверь: нет чужих логотипов, брендов, чужих лиц без прав.\n"
-       "Частая ошибка: слишком тёмная/мыльная картинка или маленькое разрешение.",
+       "Проверь: нет чужих логотипов/брендов/чужих лиц без прав.\n"
+       "Частая ошибка: маленькое разрешение и мыльная картинка.",
     4: "Название лучше не менять после загрузки — можно сломать ссылки/ID у площадок.\n"
        "Проверь транслит/символы/капс, чтобы везде было одинаково.",
     5: "Запиши: кто автор музыки/текста/аранжа, доли (сплиты), псевдонимы.\n"
@@ -49,21 +45,22 @@ HELP = {
     6: "Дистрибьютор — сервис, который доставляет релиз на площадки.\n"
        "Для MVP просто выбери одного и не прыгай между ними ради 'лучше'.",
     7: "Загрузить релиз: аудио WAV, обложка, дата релиза, авторы.\n"
-       "Сделай это заранее (хотя бы за 2–3 недели), чтобы всё успело разъехаться.",
-    8: "Метаданные — это имя артиста/трек, жанр, язык, explicit, авторы.\n"
+       "Сделай заранее (лучше 2–3 недели), чтобы всё успело разъехаться.",
+    8: "Метаданные — имя артиста/трек, жанр, язык, explicit, авторы.\n"
        "Частая ошибка: разные написания артиста в разных релизах.",
-    9: "BandLink/Smartlink — страница со ссылками на все площадки.\n"
+    9: "BandLink/Smartlink — одна ссылка на все площадки.\n"
        "Нужно: чтобы одним линком вести людей на Spotify/YM/VK и т.д.",
-    10: "Пресейв — подписка 'сохранить релиз заранее' (если площадки/сервис поддерживают).\n"
+    10: "Пресейв — 'сохранить релиз заранее' (если сервис поддерживает).\n"
         "Не обязателен, но помогает собрать ранний интерес.",
-    11: "Сделай короткий текст: что за трек, настроение, 1–2 референса, чем цепляет.\n"
+    11: "Короткий текст: что за трек, настроение, 1–2 референса, чем цепляет.\n"
         "Это пригодится для постов, питчинга и рассылок.",
-    12: "Минимум 3 штуки: тизер (10–15 сек), пост/карусель, сторис.\n"
-        "Цель: чтобы в день релиза у тебя уже был контент, а не паника.",
+    12: "Минимум 3 штуки: тизер (10–15 сек), пост, сторис.\n"
+        "Цель: в день релиза у тебя уже был контент, а не паника.",
     13: "Собери 10–30 контактов: плейлисты, паблики, блоги, редакторы (где реально твой жанр).\n"
         "Не спамь всем подряд — лучше меньше, но точнее.",
-    14: "Пострелиз: 7 дней — это второй шанс, не 'конец'.\n"
-        "Запланируй 2 инфоповода: лайв-кусок, бэкстейдж, ремикс/акустика, клип-тизер.",
+    14: "Питчинг (ориентир): подавай минимум за 14 дней до релиза.\n"
+        "Почему: площадкам нужно время на рассмотрение.\n"
+        "Если релиз уже близко — всё равно подай, но рассчитывай на меньший эффект.",
 }
 
 load_dotenv()
@@ -113,6 +110,16 @@ async def get_tasks_state(tg_id: int) -> dict[int, int]:
         return {task_id: done for task_id, done in rows}
 
 
+async def set_task_done(tg_id: int, task_id: int, done: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        UPDATE user_tasks
+        SET done = ?
+        WHERE tg_id = ? AND task_id = ?
+        """, (done, tg_id, task_id))
+        await db.commit()
+
+
 async def toggle_task(tg_id: int, task_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -120,6 +127,16 @@ async def toggle_task(tg_id: int, task_id: int):
         SET done = 1 - done
         WHERE tg_id = ? AND task_id = ?
         """, (tg_id, task_id))
+        await db.commit()
+
+
+async def reset_progress(tg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        UPDATE user_tasks
+        SET done = 0
+        WHERE tg_id = ?
+        """, (tg_id,))
         await db.commit()
 
 
@@ -132,6 +149,24 @@ def get_next_task(tasks_state: dict[int, int]):
     return None
 
 
+def get_last_done_task(tasks_state: dict[int, int]):
+    """
+    Берём последнюю выполненную задачу по порядку TASKS.
+    Это и есть 'последнее' для UX фокуса.
+    """
+    last = None
+    for task_id, title in TASKS:
+        if tasks_state.get(task_id, 0) == 1:
+            last = (task_id, title)
+    return last
+
+
+def count_progress(tasks_state: dict[int, int]) -> tuple[int, int]:
+    total = len(TASKS)
+    done = sum(1 for task_id, _ in TASKS if tasks_state.get(task_id, 0) == 1)
+    return done, total
+
+
 async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None):
     try:
         await message.edit_text(text, reply_markup=kb)
@@ -140,10 +175,10 @@ async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None
 
 
 def render_list_text(tasks_state: dict[int, int], header: str) -> str:
-    text = f"{header}\n\n"
+    done, total = count_progress(tasks_state)
+    text = f"{header}\nПрогресс: {done}/{total}\n\n"
     for task_id, title in TASKS:
-        done = tasks_state.get(task_id, 0)
-        status = "✅" if done else "⬜"
+        status = "✅" if tasks_state.get(task_id, 0) else "⬜"
         text += f"{status} {title}\n"
     return text
 
@@ -151,9 +186,26 @@ def render_list_text(tasks_state: dict[int, int], header: str) -> str:
 # -------------------- UI builders --------------------
 
 def build_focus(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]:
+    done_count, total = count_progress(tasks_state)
+
+    # Если всё закрыто — поздравление
+    if done_count == total:
+        text = (
+            "🎉 Поздравляю с закрытием релиза.\n"
+            "Теперь твоя задача — не исчезнуть на следующий день.\n\n"
+            "Хочешь — можешь сбросить прогресс и прогнать релиз заново (например, для другого трека)."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Показать все задачи", callback_data="show_all")],
+            [InlineKeyboardButton(text="🔁 Сбросить прогресс", callback_data="reset")],
+        ])
+        return text, kb
+
     text = render_list_text(tasks_state, "🎯 Фокус-режим")
 
     next_task = get_next_task(tasks_state)
+    last_done = get_last_done_task(tasks_state)
+
     keyboard: list[list[InlineKeyboardButton]] = []
 
     if next_task:
@@ -164,8 +216,13 @@ def build_focus(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]
         keyboard.append([
             InlineKeyboardButton(text="❓ Пояснение", callback_data=f"help:{task_id}")
         ])
-    else:
-        keyboard.append([InlineKeyboardButton(text="✨ Всё выполнено", callback_data="noop")])
+
+    # Отменить последнее выполненное
+    if last_done:
+        last_id, last_title = last_done
+        keyboard.append([
+            InlineKeyboardButton(text=f"↩️ Отменить последнее: {last_title}", callback_data=f"undo:{last_id}")
+        ])
 
     keyboard.append([InlineKeyboardButton(text="📋 Показать все задачи", callback_data="show_all")])
 
@@ -173,11 +230,17 @@ def build_focus(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]
 
 
 def build_all_list(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]:
-    text = render_list_text(tasks_state, "📋 Все задачи (без кнопок на каждую)")
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 Вернуться в фокус-режим", callback_data="back_to_focus")]
-    ])
-    return text, kb
+    text = render_list_text(tasks_state, "📋 Все задачи (можно отметить любую)")
+
+    inline = []
+    for task_id, title in TASKS:
+        done = tasks_state.get(task_id, 0)
+        btn_text = f"{'✅ Снять' if done else '⬜ Отметить'}: {title}"
+        inline.append([InlineKeyboardButton(text=btn_text, callback_data=f"all_toggle:{task_id}")])
+
+    inline.append([InlineKeyboardButton(text="🎯 Вернуться в фокус-режим", callback_data="back_to_focus")])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=inline)
 
 
 def build_help(task_id: int, title: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -206,7 +269,8 @@ async def start(message: Message):
 async def help_cmd(message: Message):
     await message.answer(
         "Открой /plan.\n"
-        "В фокус-режиме ты закрываешь задачи по одной, и можешь читать подсказки."
+        "Фокус-режим ведёт по одной задаче + есть 'Отменить последнее'.\n"
+        "В 'Показать все задачи' можно вручную отметить/снять любую."
     )
 
 
@@ -227,13 +291,28 @@ async def focus_done(callback):
     task_id = int(callback.data.split(":")[1])
 
     await ensure_user(tg_id)
-    await toggle_task(tg_id, task_id)
+    await set_task_done(tg_id, task_id, 1)
 
     tasks_state = await get_tasks_state(tg_id)
     text, kb = build_focus(tasks_state)
 
     await safe_edit(callback.message, text, kb)
     await callback.answer("Отмечено")
+
+
+@dp.callback_query(F.data.startswith("undo:"))
+async def undo_last(callback):
+    tg_id = callback.from_user.id
+    task_id = int(callback.data.split(":")[1])
+
+    await ensure_user(tg_id)
+    await set_task_done(tg_id, task_id, 0)
+
+    tasks_state = await get_tasks_state(tg_id)
+    text, kb = build_focus(tasks_state)
+
+    await safe_edit(callback.message, text, kb)
+    await callback.answer("Откатил")
 
 
 @dp.callback_query(F.data.startswith("help:"))
@@ -261,6 +340,21 @@ async def show_all(callback):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("all_toggle:"))
+async def all_toggle(callback):
+    tg_id = callback.from_user.id
+    task_id = int(callback.data.split(":")[1])
+
+    await ensure_user(tg_id)
+    await toggle_task(tg_id, task_id)
+
+    tasks_state = await get_tasks_state(tg_id)
+    text, kb = build_all_list(tasks_state)
+
+    await safe_edit(callback.message, text, kb)
+    await callback.answer("Ок")
+
+
 @dp.callback_query(F.data == "back_to_focus")
 async def back_to_focus(callback):
     tg_id = callback.from_user.id
@@ -273,9 +367,18 @@ async def back_to_focus(callback):
     await callback.answer()
 
 
-@dp.callback_query(F.data == "noop")
-async def noop(callback):
-    await callback.answer()
+@dp.callback_query(F.data == "reset")
+async def reset(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+
+    await reset_progress(tg_id)
+
+    tasks_state = await get_tasks_state(tg_id)
+    text, kb = build_focus(tasks_state)
+
+    await safe_edit(callback.message, text, kb)
+    await callback.answer("Сбросил")
 
 
 # -------------------- Runner --------------------
