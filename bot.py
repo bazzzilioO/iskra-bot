@@ -16,34 +16,26 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 DB_PATH = "bot.db"
-
-LABEL_EMAIL = "sreda.records@gmail.com"  # твоя почта (лейбл)
+LABEL_EMAIL = "sreda.records@gmail.com"
 
 # --- Links ---
 LINKS = {
     "bandlink_home": "https://band.link/",
     "bandlink_login": "https://band.link/login",
-
     "spotify_for_artists": "https://artists.spotify.com/",
     "spotify_pitch_info": "https://support.spotify.com/us/artists/article/pitching-music-to-playlist-editors/",
-
     "yandex_artists_hub": "https://yandex.ru/support/music/ru/performers-and-copyright-holders",
     "yandex_pitch": "https://yandex.ru/support/music/ru/performers-and-copyright-holders/new-release",
-
     "kion_pitch": "https://music.mts.ru/pitch",
-
     "zvuk_pitch": "https://help.zvuk.com/article/67859",
     "zvuk_studio": "https://studio.zvuk.com/",
-
     "vk_studio_info": "https://the-flow.ru/features/zachem-artistu-studiya-servis-vk-muzyki",
-
     "tiktok_for_artists": "https://artists.tiktok.com/",
     "tiktok_account_types": "https://support.tiktok.com/en/using-tiktok/growing-your-audience/switching-to-a-creator-or-business-account",
     "tiktok_artist_cert_help": "https://artists.tiktok.com/help-center/artist-certification",
     "tiktok_music_tab_help": "https://artists.tiktok.com/help-center/music-tab-management",
 }
 
-# --- Accounts checklist ---
 ACCOUNTS = [
     ("spotify", "Spotify for Artists"),
     ("yandex", "Яндекс для артистов"),
@@ -61,7 +53,6 @@ def next_acc_status(v: int) -> int:
 def task_mark(done: int) -> str:
     return "✓" if done else "·"
 
-# --- Tasks (уже нормальная логика) ---
 TASKS = [
     (1, "Цель релиза выбрана (зачем это выпускаю)"),
     (2, "Права/ownership: все участники согласны + семплы/биты легальны"),
@@ -125,18 +116,25 @@ def menu_keyboard() -> ReplyKeyboardMarkup:
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")  # обязательно (цифры)
+ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")
 
-SMTP_USER = os.getenv("SMTP_USER")  # опционально
-SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")  # опционально
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
 SMTP_TO = os.getenv("SMTP_TO") or LABEL_EMAIL
 
 dp = Dispatcher()
 
-# -------------------- DB --------------------
+
+# -------------------- DB (fast pragmas) --------------------
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # Speed up SQLite (safe for this use-case)
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA synchronous=NORMAL;")
+        await db.execute("PRAGMA temp_store=MEMORY;")
+        await db.execute("PRAGMA cache_size=-20000;")  # ~20MB cache
+
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             tg_id INTEGER PRIMARY KEY,
@@ -238,6 +236,7 @@ async def reset_progress_only(tg_id: int):
         await db.execute("UPDATE user_accounts SET status=0 WHERE tg_id=?", (tg_id,))
         await db.commit()
 
+
 # ---------- Forms (label submission) ----------
 
 async def form_start(tg_id: int, form_name: str):
@@ -274,7 +273,8 @@ async def form_clear(tg_id: int):
         await db.execute("DELETE FROM user_forms WHERE tg_id=?", (tg_id,))
         await db.commit()
 
-# -------------------- UX builders --------------------
+
+# -------------------- UI helpers --------------------
 
 def count_progress(tasks_state: dict[int, int]) -> tuple[int, int]:
     total = len(TASKS)
@@ -375,42 +375,61 @@ async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None
     except Exception:
         pass
 
-# -------------------- Email send (optional) --------------------
 
-def try_send_email(subject: str, body: str) -> bool:
-    """
-    Отправляет письмо через Gmail SMTP, если заданы SMTP_USER и SMTP_APP_PASSWORD.
-    Иначе возвращает False.
-    """
+# -------------------- Email send (async + timeout) --------------------
+
+def _send_email_sync(subject: str, body: str) -> bool:
     if not SMTP_USER or not SMTP_APP_PASSWORD:
         return False
+    msg = MIMEText(body, _charset="utf-8")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = SMTP_TO
 
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=8) as server:
+        server.login(SMTP_USER, SMTP_APP_PASSWORD)
+        server.sendmail(SMTP_USER, [SMTP_TO], msg.as_string())
+    return True
+
+async def try_send_email(subject: str, body: str) -> bool:
+    if not SMTP_USER or not SMTP_APP_PASSWORD:
+        return False
     try:
-        msg = MIMEText(body, _charset="utf-8")
-        msg["Subject"] = subject
-        msg["From"] = SMTP_USER
-        msg["To"] = SMTP_TO
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SMTP_USER, SMTP_APP_PASSWORD)
-            server.sendmail(SMTP_USER, [SMTP_TO], msg.as_string())
-        return True
+        # run sync SMTP in a thread, but don't let it hang the bot
+        return await asyncio.wait_for(asyncio.to_thread(_send_email_sync, subject, body), timeout=10)
     except Exception:
         return False
 
-# -------------------- Commands --------------------
+
+# -------------------- Label form --------------------
+
+LABEL_FORM_STEPS = [
+    ("name", "Шаг 1/6: Как тебя зовут (имя/ник)?"),
+    ("artist_name", "Шаг 2/6: Название проекта/артиста (как будет на площадках)?"),
+    ("contact", "Шаг 3/6: Контакт для связи (Telegram @... или email)?"),
+    ("genre", "Шаг 4/6: Жанр + 1–2 референса (через запятую)?"),
+    ("links", "Шаг 5/6: Ссылки на материал (приватная ссылка/облако/SoundCloud)."),
+    ("release_date", "Шаг 6/6: Планируемая дата релиза (если есть) или напиши «нет»."),
+]
+
+def render_label_summary(data: dict) -> str:
+    return (
+        "📩 Заявка на лейбл\n\n"
+        f"Кто: {data.get('name','')}\n"
+        f"Артист/проект: {data.get('artist_name','')}\n"
+        f"Контакт: {data.get('contact','')}\n"
+        f"Жанр/референсы: {data.get('genre','')}\n"
+        f"Ссылки: {data.get('links','')}\n"
+        f"Дата релиза: {data.get('release_date','')}\n"
+    )
+
+
+# -------------------- Commands & buttons --------------------
 
 @dp.message(CommandStart())
 async def start(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id)
-
-    if not ADMIN_TG_ID:
-        await message.answer(
-            "⚠️ Важно: не задан ADMIN_TG_ID.\n"
-            "Добавь ADMIN_TG_ID (цифры) в переменные окружения, чтобы заявки приходили тебе в личку.",
-            reply_markup=menu_keyboard()
-        )
 
     exp = await get_experience(tg_id)
     if exp == "unknown":
@@ -450,11 +469,67 @@ async def set_date_cmd(message: Message):
     await set_release_date(tg_id, d.isoformat())
     await message.answer(f"Ок. Дата релиза: {d.isoformat()}", reply_markup=menu_keyboard())
 
-# -------------------- Reply keyboard handlers --------------------
+@dp.message(Command("cancel"))
+async def cancel(message: Message):
+    tg_id = message.from_user.id
+    await form_clear(tg_id)
+    await message.answer("Ок, отменил.", reply_markup=menu_keyboard())
 
+# Reply keyboard actions (fast)
 @dp.message(F.text == "🎯 План")
 async def rb_plan(message: Message):
     await plan_cmd(message)
+
+@dp.message(F.text == "📋 Все задачи")
+async def rb_all(message: Message):
+    tg_id = message.from_user.id
+    await ensure_user(tg_id)
+    tasks_state = await get_tasks_state(tg_id)
+    text, kb = build_all_list(tasks_state)
+    await message.answer(text, reply_markup=kb)
+
+@dp.message(F.text == "🧾 Кабинеты")
+async def rb_accounts(message: Message):
+    tg_id = message.from_user.id
+    await ensure_user(tg_id)
+    acc = await get_accounts_state(tg_id)
+    text, kb = build_accounts_checklist(acc)
+    await message.answer(text, reply_markup=kb)
+
+@dp.message(F.text == "📅 Таймлайн")
+async def rb_timeline(message: Message):
+    tg_id = message.from_user.id
+    await ensure_user(tg_id)
+    rd = await get_release_date(tg_id)
+    d = parse_date(rd) if rd else None
+    await message.answer(timeline_text(d), reply_markup=menu_keyboard())
+
+@dp.message(F.text == "🗓️ Установить дату")
+async def rb_set_date_hint(message: Message):
+    await message.answer("Команда:\n/set_date YYYY-MM-DD\nПример:\n/set_date 2026-01-15", reply_markup=menu_keyboard())
+
+@dp.message(F.text == "🔗 Ссылки")
+async def rb_links(message: Message):
+    await message.answer("🔗 Быстрые ссылки:", reply_markup=build_links_kb())
+
+@dp.message(F.text == "🧠 Ожидания")
+async def rb_expectations(message: Message):
+    await message.answer(expectations_text(), reply_markup=menu_keyboard())
+
+@dp.message(F.text == "🧹 Сброс")
+async def rb_reset(message: Message):
+    await message.answer("🧹 Сброс", reply_markup=build_reset_menu_kb())
+
+@dp.message(F.text == "📤 Экспорт")
+async def rb_export(message: Message):
+    tg_id = message.from_user.id
+    await ensure_user(tg_id)
+    tasks_state = await get_tasks_state(tg_id)
+    done, total = count_progress(tasks_state)
+    lines = [f"ИСКРА — экспорт плана релиза\nПрогресс задач: {done}/{total}\n"]
+    for task_id, title in TASKS:
+        lines.append(f"{task_mark(tasks_state.get(task_id, 0))} {title}")
+    await message.answer("\n".join(lines), reply_markup=menu_keyboard())
 
 @dp.message(F.text == "📩 На лейбл")
 async def rb_label(message: Message):
@@ -463,127 +538,16 @@ async def rb_label(message: Message):
     await form_start(tg_id, "label_submit")
     await message.answer(
         "📩 Заявка на лейбл/дистрибуцию.\n\n"
-        "Шаг 1/6: Как тебя зовут (имя/ник)?\n"
-        "Можно в любой момент отменить: /cancel",
+        f"{LABEL_FORM_STEPS[0][1]}\n\n"
+        "Отмена: /cancel",
         reply_markup=menu_keyboard()
     )
 
-@dp.message(Command("cancel"))
-async def cancel(message: Message):
-    tg_id = message.from_user.id
-    await form_clear(tg_id)
-    await message.answer("Ок, отменил.", reply_markup=menu_keyboard())
-
-# -------------------- Form flow handler --------------------
-
-LABEL_FORM_STEPS = [
-    ("name", "Шаг 1/6: Как тебя зовут (имя/ник)?"),
-    ("artist_name", "Шаг 2/6: Название проекта/артиста (как будет на площадках)?"),
-    ("contact", "Шаг 3/6: Контакт для связи (Telegram @... или email)?"),
-    ("genre", "Шаг 4/6: Жанр + 1–2 референса (через запятую)?"),
-    ("links", "Шаг 5/6: Ссылки на материал (приватная ссылка, облако, SoundCloud и т.п.).\nФайлы в бота не кидаем — только ссылки."),
-    ("release_date", "Шаг 6/6: Планируемая дата релиза (если есть) или напиши «нет»."),
-]
-
-def render_label_summary(data: dict) -> str:
-    return (
-        "📩 Заявка на лейбл\n\n"
-        f"Кто: {data.get('name','')}\n"
-        f"Артист/проект: {data.get('artist_name','')}\n"
-        f"Контакт: {data.get('contact','')}\n"
-        f"Жанр/референсы: {data.get('genre','')}\n"
-        f"Ссылки: {data.get('links','')}\n"
-        f"Дата релиза: {data.get('release_date','')}\n"
-    )
-
-@dp.message()
-async def any_message_router(message: Message):
-    """
-    Ловим сообщения пользователя, если он в процессе формы.
-    Остальные сообщения не трогаем (чтобы не ломать UX).
-    """
-    tg_id = message.from_user.id
-    await ensure_user(tg_id)
-
-    form = await form_get(tg_id)
-    if not form or form.get("form_name") != "label_submit":
-        return  # не форма — ничего не делаем
-
-    text_in = (message.text or "").strip()
-    if not text_in:
-        await message.answer("Напиши текстом 🙂 (или /cancel)", reply_markup=menu_keyboard())
-        return
-
-    step = int(form["step"])
-    data = form["data"]
-
-    # guard
-    if step < 0 or step >= len(LABEL_FORM_STEPS):
-        await form_clear(tg_id)
-        await message.answer("Форма сломалась, я сбросил её. Попробуй ещё раз.", reply_markup=menu_keyboard())
-        return
-
-    key, _ = LABEL_FORM_STEPS[step]
-    data[key] = text_in
-
-    step += 1
-    if step < len(LABEL_FORM_STEPS):
-        await form_set(tg_id, step, data)
-        await message.answer(LABEL_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
-        return
-
-    # финал
-    summary = render_label_summary(data)
-
-    # 1) в личку админу (тебе)
-    if ADMIN_TG_ID and ADMIN_TG_ID.isdigit():
-        admin_id = int(ADMIN_TG_ID)
-        try:
-            await message.bot.send_message(
-                admin_id,
-                summary + f"\nОт: @{message.from_user.username or 'без_username'} (tg_id: {tg_id})"
-            )
-            sent_tg = True
-        except Exception:
-            sent_tg = False
-    else:
-        sent_tg = False
-
-    # 2) на почту (если настроено)
-    subject = f"[SREDA / LABEL] Demo submission: {data.get('artist_name','')}".strip()
-    sent_email = try_send_email(subject, summary)
-
-    # 3) если email не настроен — даём артисту готовый текст письма
-    mailto = f"mailto:{LABEL_EMAIL}?subject={subject.replace(' ', '%20')}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✉️ Открыть почту", url=mailto)],
-        [InlineKeyboardButton(text="🎯 Вернуться в план", callback_data="back_to_focus")],
-    ])
-
-    result_lines = ["✅ Заявка собрана."]
-    if sent_tg:
-        result_lines.append("✓ Отправил(а) на лейбл в Telegram.")
-    else:
-        result_lines.append("⚠️ Не смог отправить в Telegram (проверь ADMIN_TG_ID и что бот может писать тебе).")
-
-    if sent_email:
-        result_lines.append("✓ И на почту тоже отправил автоматически.")
-    else:
-        result_lines.append("⧗ Авто-почта не настроена — ниже готовый шаблон письма (можно просто отправить вручную).")
-
-    await message.answer("\n".join(result_lines), reply_markup=menu_keyboard())
-    if not sent_email:
-        await message.answer(
-            f"Почта: {LABEL_EMAIL}\n\nТекст письма (скопируй):\n\n{summary}",
-            reply_markup=kb
-        )
-
-    await form_clear(tg_id)
 
 # -------------------- Inline callbacks --------------------
 
 @dp.callback_query(F.data.startswith("exp:"))
-async def set_exp(callback):
+async def set_exp_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     exp = callback.data.split(":")[1]
@@ -592,18 +556,27 @@ async def set_exp(callback):
     await callback.answer("Готово")
 
 @dp.callback_query(F.data.startswith("focus_done:"))
-async def focus_done(callback):
+async def focus_done_cb(callback):
     tg_id = callback.from_user.id
-    task_id = int(callback.data.split(":")[1])
     await ensure_user(tg_id)
+    task_id = int(callback.data.split(":")[1])
     await set_task_done(tg_id, task_id, 1)
     tasks_state = await get_tasks_state(tg_id)
     text, kb = build_focus(tasks_state)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Ок")
 
+@dp.callback_query(F.data.startswith("help:"))
+async def help_cb(callback):
+    task_id = int(callback.data.split(":")[1])
+    title = next((t for tid, t in TASKS if tid == task_id), "Задача")
+    body = HELP.get(task_id, "Пояснение пока не добавлено.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]])
+    await safe_edit(callback.message, f"❓ {title}\n\n{body}", kb)
+    await callback.answer()
+
 @dp.callback_query(F.data == "show_all")
-async def show_all(callback):
+async def show_all_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     tasks_state = await get_tasks_state(tg_id)
@@ -612,10 +585,10 @@ async def show_all(callback):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("all_toggle:"))
-async def all_toggle(callback):
+async def all_toggle_cb(callback):
     tg_id = callback.from_user.id
-    task_id = int(callback.data.split(":")[1])
     await ensure_user(tg_id)
+    task_id = int(callback.data.split(":")[1])
     await toggle_task(tg_id, task_id)
     tasks_state = await get_tasks_state(tg_id)
     text, kb = build_all_list(tasks_state)
@@ -623,7 +596,7 @@ async def all_toggle(callback):
     await callback.answer("Ок")
 
 @dp.callback_query(F.data == "accounts:open")
-async def accounts_open(callback):
+async def accounts_open_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     state = await get_accounts_state(tg_id)
@@ -632,12 +605,12 @@ async def accounts_open(callback):
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("accounts:cycle:"))
-async def accounts_cycle(callback):
+async def accounts_cycle_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     key = callback.data.split(":")[2]
     if key not in [k for k, _ in ACCOUNTS]:
-        await callback.answer("Неизвестно", show_alert=True)
+        await callback.answer("Неизвестный пункт", show_alert=True)
         return
     await cycle_account_status(tg_id, key)
     state = await get_accounts_state(tg_id)
@@ -646,7 +619,7 @@ async def accounts_cycle(callback):
     await callback.answer("Ок")
 
 @dp.callback_query(F.data == "timeline")
-async def show_timeline(callback):
+async def timeline_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     rd = await get_release_date(tg_id)
@@ -656,17 +629,17 @@ async def show_timeline(callback):
     await callback.answer()
 
 @dp.callback_query(F.data == "links")
-async def show_links(callback):
+async def links_cb(callback):
     await safe_edit(callback.message, "🔗 Быстрые ссылки:", build_links_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "reset_menu")
-async def reset_menu(callback):
+async def reset_menu_cb(callback):
     await safe_edit(callback.message, "🧹 Сброс", build_reset_menu_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "reset_progress_yes")
-async def reset_progress_yes(callback):
+async def reset_progress_yes_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     await reset_progress_only(tg_id)
@@ -676,7 +649,7 @@ async def reset_progress_yes(callback):
     await callback.answer("Сбросил")
 
 @dp.callback_query(F.data == "back_to_focus")
-async def back_to_focus(callback):
+async def back_to_focus_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     tasks_state = await get_tasks_state(tg_id)
@@ -685,19 +658,102 @@ async def back_to_focus(callback):
     await callback.answer()
 
 @dp.callback_query(F.data == "label:start")
-async def label_start(callback):
+async def label_start_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     await form_start(tg_id, "label_submit")
-    await callback.message.answer("📩 Заявка на лейбл.\n\n" + LABEL_FORM_STEPS[0][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+    await callback.message.answer(
+        "📩 Заявка на лейбл.\n\n"
+        f"{LABEL_FORM_STEPS[0][1]}\n\n"
+        "Отмена: /cancel",
+        reply_markup=menu_keyboard()
+    )
     await callback.answer()
+
+
+# -------------------- Form router (optimized) --------------------
+
+@dp.message()
+async def any_message_router(message: Message):
+    """
+    Оптимизация:
+    - мгновенно выходим на команды
+    - не трогаем БД, если пользователь не в форме
+    - ensure_user() вызываем только когда форма активна
+    """
+    txt = (message.text or "").strip()
+    if not txt:
+        return
+    if txt.startswith("/"):
+        return
+
+    tg_id = message.from_user.id
+
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") != "label_submit":
+        return  # не форма — не мешаем
+
+    # форма активна — теперь точно нужен юзер в БД
+    await ensure_user(tg_id)
+
+    step = int(form["step"])
+    data = form["data"]
+
+    if step < 0 or step >= len(LABEL_FORM_STEPS):
+        await form_clear(tg_id)
+        await message.answer("Форма сломалась, я её сбросил. Нажми «📩 На лейбл» снова.", reply_markup=menu_keyboard())
+        return
+
+    key, _ = LABEL_FORM_STEPS[step]
+    data[key] = txt
+
+    step += 1
+    if step < len(LABEL_FORM_STEPS):
+        await form_set(tg_id, step, data)
+        await message.answer(LABEL_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+        return
+
+    # финал
+    summary = render_label_summary(data)
+    subject = f"[SREDA / LABEL] Demo submission: {data.get('artist_name','')}".strip()
+
+    # 1) Telegram admin
+    sent_tg = False
+    if ADMIN_TG_ID and ADMIN_TG_ID.isdigit():
+        try:
+            await message.bot.send_message(
+                int(ADMIN_TG_ID),
+                summary + f"\nОт: @{message.from_user.username or 'без_username'} (tg_id: {tg_id})"
+            )
+            sent_tg = True
+        except Exception:
+            sent_tg = False
+
+    # 2) Email (optional, with timeout)
+    sent_email = await try_send_email(subject, summary)
+
+    mailto = f"mailto:{LABEL_EMAIL}?subject={subject.replace(' ', '%20')}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✉️ Открыть почту", url=mailto)],
+        [InlineKeyboardButton(text="🎯 Вернуться в план", callback_data="back_to_focus")],
+    ])
+
+    result_lines = ["✅ Заявка собрана."]
+    result_lines.append("✓ Отправил в Telegram лейблу." if sent_tg else "⚠️ Не смог отправить в Telegram (проверь ADMIN_TG_ID).")
+    result_lines.append("✓ И на почту отправил автоматически." if sent_email else "⧗ Авто-почта не настроена/не доступна — ниже шаблон письма.")
+    await message.answer("\n".join(result_lines), reply_markup=menu_keyboard())
+
+    if not sent_email:
+        await message.answer(f"Почта: {LABEL_EMAIL}\n\nТекст письма (скопируй):\n\n{summary}", reply_markup=kb)
+
+    await form_clear(tg_id)
+
 
 # -------------------- Runner --------------------
 
 async def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN не задан.")
-
     await init_db()
     bot = Bot(token=TOKEN)
     await dp.start_polling(bot)
