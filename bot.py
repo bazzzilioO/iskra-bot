@@ -18,7 +18,8 @@ from dotenv import load_dotenv
 DB_PATH = "bot.db"
 LABEL_EMAIL = "sreda.records@gmail.com"
 
-# --- Links ---
+# -------------------- CONFIG --------------------
+
 LINKS = {
     "bandlink_home": "https://band.link/",
     "bandlink_login": "https://band.link/login",
@@ -26,14 +27,11 @@ LINKS = {
     "spotify_pitch_info": "https://support.spotify.com/us/artists/article/pitching-music-to-playlist-editors/",
     "yandex_artists_hub": "https://yandex.ru/support/music/ru/performers-and-copyright-holders",
     "yandex_pitch": "https://yandex.ru/support/music/ru/performers-and-copyright-holders/new-release",
-    "kion_pitch": "https://music.mts.ru/pitch",
+    "kion_pitch": "https://music.mts.ru/pitch",  # КИОН (бывш. МТС Music)
     "zvuk_pitch": "https://help.zvuk.com/article/67859",
     "zvuk_studio": "https://studio.zvuk.com/",
     "vk_studio_info": "https://the-flow.ru/features/zachem-artistu-studiya-servis-vk-muzyki",
     "tiktok_for_artists": "https://artists.tiktok.com/",
-    "tiktok_account_types": "https://support.tiktok.com/en/using-tiktok/growing-your-audience/switching-to-a-creator-or-business-account",
-    "tiktok_artist_cert_help": "https://artists.tiktok.com/help-center/artist-certification",
-    "tiktok_music_tab_help": "https://artists.tiktok.com/help-center/music-tab-management",
 }
 
 ACCOUNTS = [
@@ -51,7 +49,8 @@ def next_acc_status(v: int) -> int:
     return (v + 1) % 3
 
 def task_mark(done: int) -> str:
-    return "✓" if done else "·"
+    # менее “рябит”, чем точки/квадраты
+    return "✅" if done else "▫️"
 
 TASKS = [
     (1, "Цель релиза выбрана (зачем это выпускаю)"),
@@ -86,11 +85,46 @@ TASKS = [
     (24, "Список плейлистов / медиа собран (10–30 точечных)"),
 ]
 
+SECTIONS = [
+    ("prep", "1) Подготовка", [1, 2, 3, 4, 5]),
+    ("assets", "2) Материалы релиза", [6, 7, 8, 9]),
+    ("dist", "3) Дистрибуция", [10, 11, 12]),
+    ("links", "4) UPC / BandLink / Лирика", [13, 14, 15, 16]),
+    ("accounts", "5) Кабинеты / Питчинг", [17, 18, 19]),
+    ("content", "6) Контент", [20, 21, 22, 23, 24]),
+]
+
+# Пояснения — для всех задач
 HELP = {
-    13: "UPC/ISRC часто нужны для smartlink и верификаций. Запроси у дистрибьютора.",
-    14: "Опционально: Musixmatch/Genius. Помогает с карточкой трека/поиском.",
-    21: "30 ДО — тестируешь моменты трека. Объём > идеальность.",
-    23: "30 ПОСЛЕ — реакции, мини-истории, новые моменты песни.",
+    1: "Определи одну главную цель: подписчики / плейлисты / медиа / деньги / проверка гипотезы. Цель влияет на контент и питчинг.",
+    2: "Проверь права: кто автор текста/музыки, кто владеет битом, есть ли разрешение на семплы. Без этого можно словить блок/страйк.",
+    3: "Одинаковое написание артиста/трека/фитов везде (обложка, дистрибьютор, BandLink, соцсети) — иначе трек «разъедется» по карточкам.",
+    4: "Жанр и 1–2 референса нужны для питчинга и алгоритмов. Референсы — это не копия, а «куда ставить на полку».",
+    5: "Мини-EPK: аватар, 1 норм фотка, 3–5 предложений био. Это помогает, когда пишешь медиа/плейлистам/промоутерам.",
+
+    6: "Экспорт мастера: WAV 24bit (обычно 44.1k/48k), без клиппинга, норм loudness. Сохрани финальный файл отдельно.",
+    7: "Если есть мат/жёсткий контент — площадки требуют Explicit. Иногда полезно иметь Clean-версию для радио/плейлистов.",
+    8: "3000×3000, без мелкого текста, без запрещёнки/логотипов. Лучше простая читаемая графика, чем перегруз.",
+    9: "Запиши сплиты: кто что написал, в каких долях. Даже если «по дружбе». Потом это спасает от конфликтов.",
+
+    10: "Выбери дистрибьютора (FreshTunes/ONErpm/DistroKid/…): комиссия, выплаты, доступ к UPC/ISRC, саппорт, сроки модерации.",
+    11: "Загрузи релиз заранее (лучше 2–4 недели), чтобы успеть получить ссылки и сделать пресейв/питчинг.",
+    12: "Проверь метаданные: язык текста, explicit, жанр, авторы, фиты, обложка. Ошибка = отказ/разные карточки трека.",
+
+    13: "UPC/ISRC часто нужны для smartlink, верификаций и некоторых кабинетов артиста. Запроси у дистрибьютора, если не видишь.",
+    14: "Опционально: Musixmatch/Genius. Лирика помогает поиску и карточке трека, но это не критично для самого релиза.",
+    15: "BandLink/Smartlink — единая ссылка на релиз. Делай страницу релиза заранее (когда появились ссылки/пресейв).",
+    16: "Пресейв делается, когда площадки дали ссылки/интеграции. Если недоступно — не мучайся, просто готовь smartlink.",
+
+    17: "Кабинеты артиста: Spotify/Яндекс/VK/Звук/TikTok. Иногда доступны только после первого релиза — тогда ставь «⏳» и возвращайся позже.",
+    18: "Сделай шаблон: 5–7 строк о треке + 1 ссылка + 1 предложение «почему это вам подходит». Экономит часы.",
+    19: "Питчинг: Spotify/Яндекс/VK/Звук/КИОН (бывш. МТС). Как правило, лучше подавать до релиза (рекомендуем −14 дней).",
+
+    20: "Минимум 3 контент-единицы: тизер, пост, сторис. Не усложняй — главное начать движение.",
+    21: "30 вертикалок ДО релиза — рекомендация: тестируешь разные фрагменты/хуки. Лучше много простого, чем 1 идеальное.",
+    22: "Проверь Content ID/UGC: чтобы твой трек не сносил твои же видео и не ловил ложные страйки.",
+    23: "30 вертикалок ПОСЛЕ релиза — рекомендация: реакции, лайв-куски, смысл трека, комментарии, «как делали».",
+    24: "Собери 10–30 точечных плейлистов/медиа и пиши адресно. Массовая рассылка хуже, чем точечные 15 сообщений.",
 }
 
 def expectations_text() -> str:
@@ -105,7 +139,7 @@ def expectations_text() -> str:
 def menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🎯 План"), KeyboardButton(text="📋 Все задачи")],
+            [KeyboardButton(text="🎯 План"), KeyboardButton(text="📋 Задачи по разделам")],
             [KeyboardButton(text="🧾 Кабинеты"), KeyboardButton(text="📅 Таймлайн")],
             [KeyboardButton(text="🗓️ Установить дату"), KeyboardButton(text="🔗 Ссылки")],
             [KeyboardButton(text="📩 На лейбл"), KeyboardButton(text="📤 Экспорт")],
@@ -124,16 +158,37 @@ SMTP_TO = os.getenv("SMTP_TO") or LABEL_EMAIL
 
 dp = Dispatcher()
 
+# -------------------- DATE: RU format --------------------
 
-# -------------------- DB (fast pragmas) --------------------
+def format_date_ru(d: dt.date) -> str:
+    return d.strftime("%d.%m.%Y")
+
+def parse_date(date_str: str) -> dt.date | None:
+    """
+    Понимает:
+      - YYYY-MM-DD
+      - DD.MM.YYYY
+    """
+    s = (date_str or "").strip()
+    try:
+        if "-" in s:
+            y, m, d = s.split("-")
+            return dt.date(int(y), int(m), int(d))
+        if "." in s:
+            d, m, y = s.split(".")
+            return dt.date(int(y), int(m), int(d))
+    except Exception:
+        return None
+    return None
+
+# -------------------- DB --------------------
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # Speed up SQLite (safe for this use-case)
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
         await db.execute("PRAGMA temp_store=MEMORY;")
-        await db.execute("PRAGMA cache_size=-20000;")  # ~20MB cache
+        await db.execute("PRAGMA cache_size=-20000;")
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -236,8 +291,7 @@ async def reset_progress_only(tg_id: int):
         await db.execute("UPDATE user_accounts SET status=0 WHERE tg_id=?", (tg_id,))
         await db.commit()
 
-
-# ---------- Forms (label submission) ----------
+# -------------------- Forms --------------------
 
 async def form_start(tg_id: int, form_name: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -273,8 +327,7 @@ async def form_clear(tg_id: int):
         await db.execute("DELETE FROM user_forms WHERE tg_id=?", (tg_id,))
         await db.commit()
 
-
-# -------------------- UI helpers --------------------
+# -------------------- UX helpers --------------------
 
 def count_progress(tasks_state: dict[int, int]) -> tuple[int, int]:
     total = len(TASKS)
@@ -287,46 +340,130 @@ def get_next_task(tasks_state: dict[int, int]):
             return task_id, title
     return None
 
-def render_list_text(tasks_state: dict[int, int], header: str) -> str:
-    done, total = count_progress(tasks_state)
-    text = f"{header}\nПрогресс: {done}/{total}\n\n"
-    for task_id, title in TASKS:
-        text += f"{task_mark(tasks_state.get(task_id, 0))} {title}\n"
-    return text
+def get_task_title(task_id: int) -> str:
+    for tid, t in TASKS:
+        if tid == task_id:
+            return t
+    return "Задача"
+
+def find_section_for_task(task_id: int) -> tuple[str, str] | None:
+    for sid, stitle, ids in SECTIONS:
+        if task_id in ids:
+            return sid, stitle
+    return None
 
 def build_focus(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]:
-    text = render_list_text(tasks_state, "🎯 Фокус-режим")
+    done, total = count_progress(tasks_state)
     next_task = get_next_task(tasks_state)
 
+    lines = []
+    lines.append("🎯 Фокус-режим")
+    lines.append(f"Прогресс: {done}/{total}\n")
+
     rows: list[list[InlineKeyboardButton]] = []
-    if next_task:
-        task_id, title = next_task
-        rows.append([InlineKeyboardButton(text=f"✓ Сделано: {title}", callback_data=f"focus_done:{task_id}")])
-        rows.append([InlineKeyboardButton(text="❓ Пояснение", callback_data=f"help:{task_id}")])
 
+    if not next_task:
+        lines.append("✨ Всё выполнено. Поздравляю с закрытием релиза.")
+        rows.append([InlineKeyboardButton(text="📋 Задачи по разделам", callback_data="sections:open")])
+        rows.append([InlineKeyboardButton(text="📤 Экспорт", callback_data="export:inline")])
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    task_id, title = next_task
+    sec = find_section_for_task(task_id)
+    if sec:
+        _, stitle = sec
+        lines.append(f"Раздел: {stitle}")
+    lines.append(f"Следующая задача:\n▫️ {title}\n")
+
+    upcoming = []
+    for tid, t in TASKS:
+        if tid == task_id:
+            continue
+        if tasks_state.get(tid, 0) == 0:
+            upcoming.append(t)
+        if len(upcoming) >= 3:
+            break
+    if upcoming:
+        lines.append("Дальше по очереди:")
+        for t in upcoming:
+            lines.append(f"▫️ {t}")
+
+    rows.append([InlineKeyboardButton(text=f"✅ Сделано: {title}", callback_data=f"focus_done:{task_id}")])
+    rows.append([InlineKeyboardButton(text="❓ Пояснение", callback_data=f"help:{task_id}")])
+    rows.append([
+        InlineKeyboardButton(text="📋 Задачи по разделам", callback_data="sections:open"),
+        InlineKeyboardButton(text="🧾 Кабинеты", callback_data="accounts:open"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="📅 Таймлайн", callback_data="timeline"),
+        InlineKeyboardButton(text="🔗 Ссылки", callback_data="links"),
+    ])
     rows.append([InlineKeyboardButton(text="📩 На лейбл", callback_data="label:start")])
-    rows.append([InlineKeyboardButton(text="📋 Все задачи", callback_data="show_all"),
-                 InlineKeyboardButton(text="🧾 Кабинеты", callback_data="accounts:open")])
-    rows.append([InlineKeyboardButton(text="📅 Таймлайн", callback_data="timeline"),
-                 InlineKeyboardButton(text="🔗 Ссылки", callback_data="links")])
     rows.append([InlineKeyboardButton(text="🧹 Сброс", callback_data="reset_menu")])
-    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
-def build_all_list(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]:
-    text = render_list_text(tasks_state, "📋 Все задачи")
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+def build_sections_menu(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]:
+    done, total = count_progress(tasks_state)
+    text = f"📋 Задачи по разделам\nПрогресс: {done}/{total}\n\nВыбери раздел:"
     inline = []
-    for task_id, title in TASKS:
-        done = tasks_state.get(task_id, 0)
-        btn_text = f"{'✓ Снять' if done else '· Отметить'}: {title}"
-        inline.append([InlineKeyboardButton(text=btn_text, callback_data=f"all_toggle:{task_id}")])
-    inline.append([InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")])
+    for sid, title, ids in SECTIONS:
+        section_done = sum(1 for tid in ids if tasks_state.get(tid, 0) == 1)
+        inline.append([InlineKeyboardButton(text=f"{title} ({section_done}/{len(ids)})", callback_data=f"section:{sid}:0")])
+    inline.append([InlineKeyboardButton(text="↩️ Назад в фокус", callback_data="back_to_focus")])
     return text, InlineKeyboardMarkup(inline_keyboard=inline)
 
-def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, InlineKeyboardMarkup]:
-    text = "🧾 Кабинеты артиста\nСостояния: · → ⧗ → ✓\n\n"
-    for key, name in ACCOUNTS:
-        text += f"{acc_status_emoji(accounts_state.get(key, 0))} {name}\n"
+def build_section_page(tasks_state: dict[int, int], section_id: str, page: int, page_size: int = 6) -> tuple[str, InlineKeyboardMarkup]:
+    sec = next((s for s in SECTIONS if s[0] == section_id), None)
+    if not sec:
+        return "Раздел не найден.", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="sections:open")]])
 
+    _, title, ids = sec
+    items = [(tid, get_task_title(tid)) for tid in ids]
+
+    total_pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * page_size
+    chunk = items[start:start + page_size]
+
+    done, total = count_progress(tasks_state)
+    header = f"{title}\nПрогресс общий: {done}/{total}\nСтраница: {page+1}/{total_pages}\n"
+    text_lines = [header]
+
+    inline = []
+
+    for tid, t in chunk:
+        is_done = tasks_state.get(tid, 0) == 1
+        text_lines.append(f"{task_mark(1 if is_done else 0)} {t}")
+
+        btn = "✅ Снять" if is_done else "▫️ Отметить"
+        inline.append([
+            InlineKeyboardButton(text=f"{btn}", callback_data=f"sec_toggle:{section_id}:{page}:{tid}"),
+            InlineKeyboardButton(text="❓", callback_data=f"help:{tid}")
+        ])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"section:{section_id}:{page-1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"section:{section_id}:{page+1}"))
+    if nav_row:
+        inline.append(nav_row)
+
+    inline.append([
+        InlineKeyboardButton(text="📋 К разделам", callback_data="sections:open"),
+        InlineKeyboardButton(text="🎯 В фокус", callback_data="back_to_focus"),
+    ])
+
+    return "\n".join(text_lines), InlineKeyboardMarkup(inline_keyboard=inline)
+
+def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, InlineKeyboardMarkup]:
+    text = "🧾 Кабинеты артиста\nСостояния: ▫️ → ⏳ → ✅\n\n"
+    for key, name in ACCOUNTS:
+        v = accounts_state.get(key, 0)
+        emoji = "▫️" if v == 0 else ("⏳" if v == 1 else "✅")
+        text += f"{emoji} {name}\n"
     inline = []
     for key, name in ACCOUNTS:
         inline.append([InlineKeyboardButton(text=f"{name}", callback_data=f"accounts:cycle:{key}")])
@@ -344,23 +481,16 @@ def build_links_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]
     ])
 
-def parse_date(date_str: str) -> dt.date | None:
-    try:
-        y, m, d = date_str.split("-")
-        return dt.date(int(y), int(m), int(d))
-    except Exception:
-        return None
-
 def timeline_text(release_date: dt.date | None) -> str:
     if not release_date:
-        return "📅 Таймлайн\n\nДата релиза не задана.\nУстанови: /set_date YYYY-MM-DD"
+        return "📅 Таймлайн\n\nДата релиза не задана.\nУстанови: /set_date ДД.ММ.ГГГГ\nПример: /set_date 31.12.2025"
     pitch = release_date - dt.timedelta(days=14)
     after_end = release_date + dt.timedelta(days=7)
     return (
         "📅 Таймлайн\n\n"
-        f"Дата релиза: {release_date.isoformat()}\n"
-        f"Питчинг: до {pitch.isoformat()} (−14)\n"
-        f"После релиза: {release_date.isoformat()} → {after_end.isoformat()}\n"
+        f"Дата релиза: {format_date_ru(release_date)}\n"
+        f"Питчинг: до {format_date_ru(pitch)} (−14)\n"
+        f"После релиза: {format_date_ru(release_date)} → {format_date_ru(after_end)}\n"
     )
 
 def build_reset_menu_kb() -> InlineKeyboardMarkup:
@@ -375,8 +505,7 @@ async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None
     except Exception:
         pass
 
-
-# -------------------- Email send (async + timeout) --------------------
+# -------------------- Email send (optional) --------------------
 
 def _send_email_sync(subject: str, body: str) -> bool:
     if not SMTP_USER or not SMTP_APP_PASSWORD:
@@ -385,7 +514,6 @@ def _send_email_sync(subject: str, body: str) -> bool:
     msg["Subject"] = subject
     msg["From"] = SMTP_USER
     msg["To"] = SMTP_TO
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=8) as server:
         server.login(SMTP_USER, SMTP_APP_PASSWORD)
         server.sendmail(SMTP_USER, [SMTP_TO], msg.as_string())
@@ -395,11 +523,9 @@ async def try_send_email(subject: str, body: str) -> bool:
     if not SMTP_USER or not SMTP_APP_PASSWORD:
         return False
     try:
-        # run sync SMTP in a thread, but don't let it hang the bot
         return await asyncio.wait_for(asyncio.to_thread(_send_email_sync, subject, body), timeout=10)
     except Exception:
         return False
-
 
 # -------------------- Label form --------------------
 
@@ -409,7 +535,7 @@ LABEL_FORM_STEPS = [
     ("contact", "Шаг 3/6: Контакт для связи (Telegram @... или email)?"),
     ("genre", "Шаг 4/6: Жанр + 1–2 референса (через запятую)?"),
     ("links", "Шаг 5/6: Ссылки на материал (приватная ссылка/облако/SoundCloud)."),
-    ("release_date", "Шаг 6/6: Планируемая дата релиза (если есть) или напиши «нет»."),
+    ("release_date", "Шаг 6/6: Планируемая дата релиза (если есть) или «нет»."),
 ]
 
 def render_label_summary(data: dict) -> str:
@@ -422,7 +548,6 @@ def render_label_summary(data: dict) -> str:
         f"Ссылки: {data.get('links','')}\n"
         f"Дата релиза: {data.get('release_date','')}\n"
     )
-
 
 # -------------------- Commands & buttons --------------------
 
@@ -458,16 +583,16 @@ async def plan_cmd(message: Message):
 async def set_date_cmd(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id)
-    parts = message.text.strip().split()
+    parts = message.text.strip().split(maxsplit=1)
     if len(parts) != 2:
-        await message.answer("Формат: /set_date YYYY-MM-DD", reply_markup=menu_keyboard())
+        await message.answer("Формат: /set_date ДД.ММ.ГГГГ\nПример: /set_date 31.12.2025", reply_markup=menu_keyboard())
         return
     d = parse_date(parts[1])
     if not d:
-        await message.answer("Не понял дату. Пример: /set_date 2026-01-15", reply_markup=menu_keyboard())
+        await message.answer("Не понял дату. Пример: /set_date 31.12.2025", reply_markup=menu_keyboard())
         return
     await set_release_date(tg_id, d.isoformat())
-    await message.answer(f"Ок. Дата релиза: {d.isoformat()}", reply_markup=menu_keyboard())
+    await message.answer(f"Ок. Дата релиза: {format_date_ru(d)}", reply_markup=menu_keyboard())
 
 @dp.message(Command("cancel"))
 async def cancel(message: Message):
@@ -475,17 +600,17 @@ async def cancel(message: Message):
     await form_clear(tg_id)
     await message.answer("Ок, отменил.", reply_markup=menu_keyboard())
 
-# Reply keyboard actions (fast)
+# Reply keyboard actions
 @dp.message(F.text == "🎯 План")
 async def rb_plan(message: Message):
     await plan_cmd(message)
 
-@dp.message(F.text == "📋 Все задачи")
-async def rb_all(message: Message):
+@dp.message(F.text == "📋 Задачи по разделам")
+async def rb_sections(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id)
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_all_list(tasks_state)
+    text, kb = build_sections_menu(tasks_state)
     await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == "🧾 Кабинеты")
@@ -506,7 +631,7 @@ async def rb_timeline(message: Message):
 
 @dp.message(F.text == "🗓️ Установить дату")
 async def rb_set_date_hint(message: Message):
-    await message.answer("Команда:\n/set_date YYYY-MM-DD\nПример:\n/set_date 2026-01-15", reply_markup=menu_keyboard())
+    await message.answer("Команда:\n/set_date ДД.ММ.ГГГГ\nПример:\n/set_date 31.12.2025", reply_markup=menu_keyboard())
 
 @dp.message(F.text == "🔗 Ссылки")
 async def rb_links(message: Message):
@@ -543,7 +668,6 @@ async def rb_label(message: Message):
         reply_markup=menu_keyboard()
     )
 
-
 # -------------------- Inline callbacks --------------------
 
 @dp.callback_query(F.data.startswith("exp:"))
@@ -569,29 +693,44 @@ async def focus_done_cb(callback):
 @dp.callback_query(F.data.startswith("help:"))
 async def help_cb(callback):
     task_id = int(callback.data.split(":")[1])
-    title = next((t for tid, t in TASKS if tid == task_id), "Задача")
+    title = get_task_title(task_id)
     body = HELP.get(task_id, "Пояснение пока не добавлено.")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]])
     await safe_edit(callback.message, f"❓ {title}\n\n{body}", kb)
     await callback.answer()
 
-@dp.callback_query(F.data == "show_all")
-async def show_all_cb(callback):
+@dp.callback_query(F.data == "sections:open"))
+async def sections_open_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_all_list(tasks_state)
+    text, kb = build_sections_menu(tasks_state)
     await safe_edit(callback.message, text, kb)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("all_toggle:"))
-async def all_toggle_cb(callback):
+@dp.callback_query(F.data.startswith("section:"))
+async def section_page_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
-    task_id = int(callback.data.split(":")[1])
+    _, sid, page_s = callback.data.split(":")
+    page = int(page_s)
+    tasks_state = await get_tasks_state(tg_id)
+    text, kb = build_section_page(tasks_state, sid, page)
+    await safe_edit(callback.message, text, kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sec_toggle:"))
+async def section_toggle_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+
+    _, sid, page_s, tid_s = callback.data.split(":")
+    page = int(page_s)
+    task_id = int(tid_s)
+
     await toggle_task(tg_id, task_id)
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_all_list(tasks_state)
+    text, kb = build_section_page(tasks_state, sid, page)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Ок")
 
@@ -670,30 +809,19 @@ async def label_start_cb(callback):
     )
     await callback.answer()
 
-
-# -------------------- Form router (optimized) --------------------
+# -------------------- Form router --------------------
 
 @dp.message()
 async def any_message_router(message: Message):
-    """
-    Оптимизация:
-    - мгновенно выходим на команды
-    - не трогаем БД, если пользователь не в форме
-    - ensure_user() вызываем только когда форма активна
-    """
     txt = (message.text or "").strip()
-    if not txt:
-        return
-    if txt.startswith("/"):
+    if not txt or txt.startswith("/"):
         return
 
     tg_id = message.from_user.id
-
     form = await form_get(tg_id)
     if not form or form.get("form_name") != "label_submit":
-        return  # не форма — не мешаем
+        return
 
-    # форма активна — теперь точно нужен юзер в БД
     await ensure_user(tg_id)
 
     step = int(form["step"])
@@ -701,7 +829,7 @@ async def any_message_router(message: Message):
 
     if step < 0 or step >= len(LABEL_FORM_STEPS):
         await form_clear(tg_id)
-        await message.answer("Форма сломалась, я её сбросил. Нажми «📩 На лейбл» снова.", reply_markup=menu_keyboard())
+        await message.answer("Форма сбросилась. Нажми «📩 На лейбл» ещё раз.", reply_markup=menu_keyboard())
         return
 
     key, _ = LABEL_FORM_STEPS[step]
@@ -713,11 +841,9 @@ async def any_message_router(message: Message):
         await message.answer(LABEL_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
         return
 
-    # финал
     summary = render_label_summary(data)
     subject = f"[SREDA / LABEL] Demo submission: {data.get('artist_name','')}".strip()
 
-    # 1) Telegram admin
     sent_tg = False
     if ADMIN_TG_ID and ADMIN_TG_ID.isdigit():
         try:
@@ -729,13 +855,12 @@ async def any_message_router(message: Message):
         except Exception:
             sent_tg = False
 
-    # 2) Email (optional, with timeout)
     sent_email = await try_send_email(subject, summary)
 
     mailto = f"mailto:{LABEL_EMAIL}?subject={subject.replace(' ', '%20')}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✉️ Открыть почту", url=mailto)],
-        [InlineKeyboardButton(text="🎯 Вернуться в план", callback_data="back_to_focus")],
+        [InlineKeyboardButton(text="🎯 Вернуться в фокус", callback_data="back_to_focus")],
     ])
 
     result_lines = ["✅ Заявка собрана."]
@@ -747,7 +872,6 @@ async def any_message_router(message: Message):
         await message.answer(f"Почта: {LABEL_EMAIL}\n\nТекст письма (скопируй):\n\n{summary}", reply_markup=kb)
 
     await form_clear(tg_id)
-
 
 # -------------------- Runner --------------------
 
