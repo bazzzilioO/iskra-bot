@@ -50,6 +50,29 @@ def next_acc_status(v: int) -> int:
 def task_mark(done: int) -> str:
     return "✅" if done else "▫️"
 
+def build_export_text(tasks_state: dict[int, int]) -> str:
+    done, total = count_progress(tasks_state)
+    lines = [f"ИСКРА — экспорт плана релиза\nПрогресс задач: {done}/{total}\n"]
+    for task_id, title in TASKS:
+        lines.append(f"{task_mark(tasks_state.get(task_id, 0))} {title}")
+    return "\n".join(lines)
+
+async def send_export_invoice(message: Message):
+    await message.answer(
+        "📤 Экспорт плана — 25 ⭐\n\n"
+        "Оплата через Telegram Stars. После оплаты пришлю чек-лист релиза.",
+        reply_markup=menu_keyboard()
+    )
+    prices = [LabeledPrice(label="Экспорт плана", amount=25)]
+    await message.answer_invoice(
+        title="Экспорт плана",
+        description="Чек-лист задач с прогрессом (25 ⭐)",
+        payload="export_plan_25",
+        provider_token="",
+        currency="XTR",
+        prices=prices
+    )
+
 # -------------------- DATE: RU format --------------------
 
 def format_date_ru(d: dt.date) -> str:
@@ -379,9 +402,7 @@ def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> t
 
     if not next_task:
         lines.append("✨ Всё выполнено. Поздравляю с закрытием релиза.")
-        rows.append([InlineKeyboardButton(text="📋 Задачи по разделам", callback_data="sections:open")])
-        rows.append([InlineKeyboardButton(text="📤 Экспорт", callback_data="export:inline")])
-        rows.append([InlineKeyboardButton(text="💫 Поддержать ИСКРУ", callback_data="donate:menu")])
+        rows.append([InlineKeyboardButton(text="🧹 Сброс", callback_data="reset_menu")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     task_id, title = next_task
@@ -524,11 +545,16 @@ def build_donate_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]
     ])
 
-async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None):
+async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None) -> Message | None:
     try:
         await message.edit_text(text, reply_markup=kb)
-    except Exception:
-        pass
+        return message
+    except Exception as edit_err:
+        try:
+            return await message.answer(text, reply_markup=kb)
+        except Exception as answer_err:
+            print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
+            return None
 
 # -------------------- Email send (optional) --------------------
 
@@ -713,12 +739,7 @@ async def rb_reset(message: Message):
 async def rb_export(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id)
-    tasks_state = await get_tasks_state(tg_id)
-    done, total = count_progress(tasks_state)
-    lines = [f"ИСКРА — экспорт плана релиза\nПрогресс задач: {done}/{total}\n"]
-    for task_id, title in TASKS:
-        lines.append(f"{task_mark(tasks_state.get(task_id, 0))} {title}")
-    await message.answer("\n".join(lines), reply_markup=menu_keyboard())
+    await send_export_invoice(message)
 
 @dp.message(F.text == "📩 Запросить дистрибуцию")
 async def rb_label(message: Message):
@@ -788,8 +809,20 @@ async def successful_payment(message: Message):
     # sp.currency для Stars будет "XTR" :contentReference[oaicite:2]{index=2}
     if (sp.invoice_payload or "").startswith("donate_iskra_"):
         await message.answer("💫 Принято! Спасибо за поддержку ИСКРЫ 🤝", reply_markup=menu_keyboard())
+    elif sp.invoice_payload == "export_plan_25":
+        tg_id = message.from_user.id
+        await ensure_user(tg_id)
+        tasks_state = await get_tasks_state(tg_id)
+        await message.answer(build_export_text(tasks_state), reply_markup=menu_keyboard())
 
 # -------------------- Inline callbacks --------------------
+
+@dp.callback_query(F.data == "export:inline")
+async def export_inline_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await send_export_invoice(callback.message)
+    await callback.answer("Счёт на экспорт плана")
 
 @dp.callback_query(F.data.startswith("exp:"))
 async def set_exp_cb(callback):
@@ -800,7 +833,8 @@ async def set_exp_cb(callback):
     await callback.message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
     tasks_state = await get_tasks_state(tg_id)
     text, kb = build_focus(tasks_state, "first" if exp == "first" else "old")
-    await callback.message.answer(text, reply_markup=kb)
+
+    await safe_edit(callback.message, text, kb)
     await callback.answer("Готово")
 
 @dp.callback_query(F.data.startswith("focus_done:"))
