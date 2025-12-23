@@ -818,7 +818,7 @@ async def set_exp_cb(callback):
     await callback.message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
     tasks_state = await get_tasks_state(tg_id)
     text, kb = build_focus(tasks_state, "first" if exp == "first" else "old")
-    await callback.message.answer(text, reply_markup=kb)
+    await safe_edit(callback.message, text, kb)
     await callback.answer("Готово")
 
 @dp.callback_query(F.data.startswith("focus_done:"))
