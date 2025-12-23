@@ -535,14 +535,16 @@ def build_donate_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]
     ])
 
-async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None):
+async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None) -> Message | None:
     try:
         await message.edit_text(text, reply_markup=kb)
-    except Exception:
+        return message
+    except Exception as edit_err:
         try:
-            await message.answer(text, reply_markup=kb)
-        except Exception:
-            pass
+            return await message.answer(text, reply_markup=kb)
+        except Exception as answer_err:
+            print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
+            return None
 
 # -------------------- Email send (optional) --------------------
 
