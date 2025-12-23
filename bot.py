@@ -427,6 +427,16 @@ def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> t
 
     rows.append([InlineKeyboardButton(text=f"✅ Сделано: {title}", callback_data=f"focus_done:{task_id}")])
     rows.append([InlineKeyboardButton(text="❓ Пояснение", callback_data=f"help:{task_id}")])
+    rows.append([
+        InlineKeyboardButton(text="📋 Задачи по разделам", callback_data="sections:open"),
+        InlineKeyboardButton(text="🧾 Кабинеты", callback_data="accounts:open"),
+    ])
+    rows.append([
+        InlineKeyboardButton(text="📅 Таймлайн", callback_data="timeline"),
+        InlineKeyboardButton(text="🔗 Ссылки", callback_data="links"),
+    ])
+    rows.append([InlineKeyboardButton(text="📩 Запросить дистрибуцию", callback_data="label:start")])
+    rows.append([InlineKeyboardButton(text="💫 Поддержать ИСКРУ", callback_data="donate:menu")])
     rows.append([InlineKeyboardButton(text="🧹 Сброс", callback_data="reset_menu")])
 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
@@ -823,6 +833,7 @@ async def set_exp_cb(callback):
     await callback.message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
     tasks_state = await get_tasks_state(tg_id)
     text, kb = build_focus(tasks_state, "first" if exp == "first" else "old")
+
     await safe_edit(callback.message, text, kb)
     await callback.answer("Готово")
 
