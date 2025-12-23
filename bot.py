@@ -539,7 +539,10 @@ async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None
     try:
         await message.edit_text(text, reply_markup=kb)
     except Exception:
-        pass
+        try:
+            await message.answer(text, reply_markup=kb)
+        except Exception:
+            pass
 
 # -------------------- Email send (optional) --------------------
 
