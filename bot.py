@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import datetime as dt
+import re
 import aiosqlite
 import smtplib
 from email.mime.text import MIMEText
@@ -157,13 +158,24 @@ def expectations_text() -> str:
         "4) Мерь себя качеством процесса, не цифрами первого релиза.\n"
     )
 
+def experience_prompt() -> tuple[str, InlineKeyboardMarkup]:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆕 Первый релиз", callback_data="exp:first")],
+        [InlineKeyboardButton(text="🎧 Уже выпускал(а)", callback_data="exp:old")],
+    ])
+    text = (
+        "Я ИСКРА — помощник по релизу.\n\n"
+        "Это твой первый релиз или ты уже выпускал музыку?"
+    )
+    return text, kb
+
 def menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎯 План"), KeyboardButton(text="📋 Задачи по разделам")],
             [KeyboardButton(text="🧾 Кабинеты"), KeyboardButton(text="📅 Таймлайн")],
             [KeyboardButton(text="🗓️ Установить дату"), KeyboardButton(text="🔗 Ссылки")],
-            [KeyboardButton(text="📩 На лейбл"), KeyboardButton(text="📤 Экспорт")],
+            [KeyboardButton(text="📩 Запросить дистрибуцию"), KeyboardButton(text="📤 Экспорт")],
             [KeyboardButton(text="💫 Поддержать ИСКРУ"), KeyboardButton(text="🧠 Ожидания")],
             [KeyboardButton(text="🧹 Сброс")],
         ],
@@ -351,12 +363,16 @@ def find_section_for_task(task_id: int) -> tuple[str, str] | None:
             return sid, stitle
     return None
 
-def build_focus(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]:
+def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
     done, total = count_progress(tasks_state)
     next_task = get_next_task(tasks_state)
 
     lines = []
     lines.append("🎯 Фокус-режим")
+    if experience == "first":
+        lines.append("Тип релиза: первый")
+    elif experience == "old":
+        lines.append("Тип релиза: не первый")
     lines.append(f"Прогресс: {done}/{total}\n")
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -398,7 +414,7 @@ def build_focus(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]
         InlineKeyboardButton(text="📅 Таймлайн", callback_data="timeline"),
         InlineKeyboardButton(text="🔗 Ссылки", callback_data="links"),
     ])
-    rows.append([InlineKeyboardButton(text="📩 На лейбл", callback_data="label:start")])
+    rows.append([InlineKeyboardButton(text="📩 Запросить дистрибуцию", callback_data="label:start")])
     rows.append([InlineKeyboardButton(text="💫 Поддержать ИСКРУ", callback_data="donate:menu")])
     rows.append([InlineKeyboardButton(text="🧹 Сброс", callback_data="reset_menu")])
 
@@ -549,7 +565,7 @@ LABEL_FORM_STEPS = [
 
 def render_label_summary(data: dict) -> str:
     return (
-        "📩 Заявка на лейбл\n\n"
+        "📩 Заявка на дистрибуцию\n\n"
         f"Кто: {data.get('name','')}\n"
         f"Артист/проект: {data.get('artist_name','')}\n"
         f"Контакт: {data.get('contact','')}\n"
@@ -557,6 +573,42 @@ def render_label_summary(data: dict) -> str:
         f"Ссылки: {data.get('links','')}\n"
         f"Дата релиза: {data.get('release_date','')}\n"
     )
+
+def validate_label_input(key: str, raw: str) -> tuple[bool, str | None, str | None]:
+    value = (raw or "").strip()
+
+    def fail(msg: str) -> tuple[bool, None, str]:
+        return False, None, msg
+
+    if key in {"name", "artist_name", "genre"}:
+        if len(value) < 2:
+            return fail("Слишком коротко. Напиши минимум пару символов.")
+        return True, value, None
+
+    if key == "contact":
+        email_ok = bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", value))
+        tg_ok = value.startswith("@") or "t.me/" in value.lower()
+        phone_ok = value.startswith("+") and len(value) >= 8
+        if not (email_ok or tg_ok or phone_ok):
+            return fail("Нужен контакт: @username, t.me/ссылка или email.")
+        return True, value, None
+
+    if key == "links":
+        has_link = any(part.startswith("http") for part in value.replace("\n", " ").split())
+        if not has_link:
+            return fail("Добавь хотя бы одну ссылку вида https://...")
+        return True, value, None
+
+    if key == "release_date":
+        lower = value.lower()
+        if lower in {"нет", "не знаю", "unknown", "no"}:
+            return True, "нет", None
+        parsed = parse_date(value)
+        if not parsed:
+            return fail("Формат даты: ДД.ММ.ГГГГ или YYYY-MM-DD, либо напиши «нет»." )
+        return True, format_date_ru(parsed), None
+
+    return True, value, None
 
 # -------------------- Commands & buttons --------------------
 
@@ -567,25 +619,28 @@ async def start(message: Message):
 
     exp = await get_experience(tg_id)
     if exp == "unknown":
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🆕 Первый релиз", callback_data="exp:first")],
-            [InlineKeyboardButton(text="🎧 Уже выпускал(а)", callback_data="exp:old")],
-        ])
-        await message.answer(
-            "Я ИСКРА — помощник по релизу.\n\n"
-            "Это твой первый релиз или ты уже выпускал музыку?",
-            reply_markup=kb
-        )
+        text, kb = experience_prompt()
+        await message.answer(text, reply_markup=kb)
         return
 
     await message.answer("ИСКРА активна. Жми кнопки меню снизу 👇", reply_markup=menu_keyboard())
+
+    tasks_state = await get_tasks_state(tg_id)
+    focus_text, kb = build_focus(tasks_state, exp)
+    await message.answer(focus_text, reply_markup=kb)
 
 @dp.message(Command("plan"))
 async def plan_cmd(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id)
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        text, kb = experience_prompt()
+        await message.answer(text, reply_markup=kb)
+        return
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state)
+    await message.answer("Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
+    text, kb = build_focus(tasks_state, exp)
     await message.answer(text, reply_markup=kb)
 
 @dp.message(Command("set_date"))
@@ -665,13 +720,13 @@ async def rb_export(message: Message):
         lines.append(f"{task_mark(tasks_state.get(task_id, 0))} {title}")
     await message.answer("\n".join(lines), reply_markup=menu_keyboard())
 
-@dp.message(F.text == "📩 На лейбл")
+@dp.message(F.text == "📩 Запросить дистрибуцию")
 async def rb_label(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id)
     await form_start(tg_id, "label_submit")
     await message.answer(
-        "📩 Заявка на лейбл/дистрибуцию.\n\n"
+        "📩 Заявка на дистрибуцию.\n\n"
         f"{LABEL_FORM_STEPS[0][1]}\n\n"
         "Отмена: /cancel",
         reply_markup=menu_keyboard()
@@ -742,17 +797,26 @@ async def set_exp_cb(callback):
     await ensure_user(tg_id)
     exp = callback.data.split(":")[1]
     await set_experience(tg_id, "first" if exp == "first" else "old")
-    await callback.message.answer("Ок. Жми «🎯 План» снизу 👇", reply_markup=menu_keyboard())
+    await callback.message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
+    tasks_state = await get_tasks_state(tg_id)
+    text, kb = build_focus(tasks_state, "first" if exp == "first" else "old")
+    await callback.message.answer(text, reply_markup=kb)
     await callback.answer("Готово")
 
 @dp.callback_query(F.data.startswith("focus_done:"))
 async def focus_done_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        text, kb = experience_prompt()
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+        return
     task_id = int(callback.data.split(":")[1])
     await set_task_done(tg_id, task_id, 1)
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state)
+    text, kb = build_focus(tasks_state, exp)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Ок")
 
@@ -847,9 +911,15 @@ async def reset_menu_cb(callback):
 async def reset_progress_yes_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        text, kb = experience_prompt()
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+        return
     await reset_progress_only(tg_id)
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state)
+    text, kb = build_focus(tasks_state, exp)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Сбросил")
 
@@ -857,8 +927,14 @@ async def reset_progress_yes_cb(callback):
 async def back_to_focus_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        text, kb = experience_prompt()
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+        return
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state)
+    text, kb = build_focus(tasks_state, exp)
     await safe_edit(callback.message, text, kb)
     await callback.answer()
 
@@ -868,7 +944,7 @@ async def label_start_cb(callback):
     await ensure_user(tg_id)
     await form_start(tg_id, "label_submit")
     await callback.message.answer(
-        "📩 Заявка на лейбл.\n\n"
+        "📩 Заявка на дистрибуцию.\n\n"
         f"{LABEL_FORM_STEPS[0][1]}\n\n"
         "Отмена: /cancel",
         reply_markup=menu_keyboard()
@@ -895,11 +971,19 @@ async def any_message_router(message: Message):
 
     if step < 0 or step >= len(LABEL_FORM_STEPS):
         await form_clear(tg_id)
-        await message.answer("Форма сбросилась. Нажми «📩 На лейбл» ещё раз.", reply_markup=menu_keyboard())
+        await message.answer("Форма сбросилась. Нажми «📩 Запросить дистрибуцию» ещё раз.", reply_markup=menu_keyboard())
         return
 
     key, _ = LABEL_FORM_STEPS[step]
-    data[key] = txt
+    ok, normalized, err = validate_label_input(key, txt)
+    if not ok:
+        await message.answer(
+            f"{err}\n\n{LABEL_FORM_STEPS[step][1]}\n\n(Отмена: /cancel)",
+            reply_markup=menu_keyboard()
+        )
+        return
+
+    data[key] = normalized
 
     step += 1
     if step < len(LABEL_FORM_STEPS):
