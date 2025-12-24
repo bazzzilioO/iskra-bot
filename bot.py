@@ -40,6 +40,8 @@ LINKS = {
     "tiktok_for_artists": "https://artists.tiktok.com/",
 }
 
+UPDATES_POST_URL = os.getenv("UPDATES_POST_URL", "")
+
 ACCOUNTS = [
     ("spotify", "Spotify for Artists"),
     ("yandex", "Яндекс для артистов"),
@@ -65,7 +67,7 @@ async def send_export_invoice(message: Message):
     await message.answer(
         "📤 Экспорт плана — 25 ⭐\n\n"
         "Оплата через Telegram Stars. После оплаты пришлю чек-лист релиза.",
-        reply_markup=menu_keyboard()
+        reply_markup=menu_keyboard(await get_updates_opt_in(message.from_user.id) if message.from_user else True)
     )
     prices = [LabeledPrice(label="Экспорт плана", amount=25)]
     await message.answer_invoice(
@@ -259,7 +261,8 @@ def experience_prompt() -> tuple[str, InlineKeyboardMarkup]:
     )
     return text, kb
 
-def menu_keyboard() -> ReplyKeyboardMarkup:
+def menu_keyboard(updates_enabled: bool | None = None) -> ReplyKeyboardMarkup:
+    updates_text = "🔔 Обновления: Вкл" if updates_enabled is not False else "🔔 Обновления: Выкл"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🎯 План"), KeyboardButton(text="📋 Задачи по разделам")],
@@ -268,9 +271,14 @@ def menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📩 Запросить дистрибуцию"), KeyboardButton(text="📤 Экспорт")],
             [KeyboardButton(text="💫 Поддержать ИСКРУ"), KeyboardButton(text="🧠 Ожидания")],
             [KeyboardButton(text="🧹 Сброс")],
+            [KeyboardButton(text="🆕 Что нового"), KeyboardButton(text=updates_text)],
         ],
         resize_keyboard=True
     )
+
+async def user_menu_keyboard(tg_id: int) -> ReplyKeyboardMarkup:
+    updates_enabled = await get_updates_opt_in(tg_id)
+    return menu_keyboard(updates_enabled)
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -310,6 +318,14 @@ async def init_db():
             pass
         try:
             await db.execute("ALTER TABLE users ADD COLUMN release_date TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN updates_opt_in INTEGER DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN last_update_notified TEXT")
         except Exception:
             pass
         await db.execute("""
@@ -428,6 +444,47 @@ async def get_reminders_enabled(tg_id: int) -> bool:
         cur = await db.execute("SELECT reminders_enabled FROM users WHERE tg_id=?", (tg_id,))
         row = await cur.fetchone()
         return bool(row[0]) if row and row[0] is not None else True
+
+async def get_updates_opt_in(tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT updates_opt_in FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        return bool(row[0]) if row and row[0] is not None else True
+
+async def set_updates_opt_in(tg_id: int, enabled: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET updates_opt_in=? WHERE tg_id=?", (1 if enabled else 0, tg_id))
+        await db.commit()
+
+async def toggle_updates_opt_in(tg_id: int) -> bool:
+    enabled = await get_updates_opt_in(tg_id)
+    await set_updates_opt_in(tg_id, not enabled)
+    return not enabled
+
+async def get_last_update_notified(tg_id: int) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT last_update_notified FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+async def set_last_update_notified(tg_id: int, value: str | None, db: aiosqlite.Connection | None = None):
+    if db:
+        await db.execute("UPDATE users SET last_update_notified=? WHERE tg_id=?", (value, tg_id))
+        return
+    async with aiosqlite.connect(DB_PATH) as db_conn:
+        await db_conn.execute("UPDATE users SET last_update_notified=? WHERE tg_id=?", (value, tg_id))
+        await db_conn.commit()
+
+async def maybe_send_update_notice(message: Message, tg_id: int):
+    if not UPDATES_POST_URL:
+        return
+    if not await get_updates_opt_in(tg_id):
+        return
+    last_notified = await get_last_update_notified(tg_id)
+    if last_notified == UPDATES_POST_URL:
+        return
+    await message.answer(f"⚡️ Есть обновление ИСКРЫ. Подробнее: {UPDATES_POST_URL}")
+    await set_last_update_notified(tg_id, UPDATES_POST_URL)
 
 async def get_tasks_state(tg_id: int) -> dict[int, int]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -1102,14 +1159,16 @@ def validate_label_input(key: str, raw: str) -> tuple[bool, str | None, str | No
 async def start(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
+    await maybe_send_update_notice(message, tg_id)
 
     exp = await get_experience(tg_id)
+    menu_kb = await user_menu_keyboard(tg_id)
     if exp == "unknown":
         text, kb = experience_prompt()
-        await message.answer(text, reply_markup=kb)
+        await message.answer(text, reply_markup=menu_kb)
         return
 
-    await message.answer("ИСКРА активна. Жми кнопки меню снизу 👇", reply_markup=menu_keyboard())
+    await message.answer("ИСКРА активна. Жми кнопки меню снизу 👇", reply_markup=menu_kb)
 
     focus_text, kb = await build_focus_for_user(tg_id, exp)
     await message.answer(focus_text, reply_markup=kb)
@@ -1118,13 +1177,14 @@ async def start(message: Message):
 async def plan_cmd(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
+    await maybe_send_update_notice(message, tg_id)
     exp = await get_experience(tg_id)
     if exp == "unknown":
         text, kb = experience_prompt()
-        await message.answer(text, reply_markup=kb)
+        await message.answer(text, reply_markup=await user_menu_keyboard(tg_id))
         return
     tasks_state = await get_tasks_state(tg_id)
-    await message.answer("Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
+    await message.answer("Меню снизу, держу фокус здесь:", reply_markup=await user_menu_keyboard(tg_id))
     important = await get_important_tasks(tg_id)
     text, kb = build_focus(tasks_state, exp, important)
     await message.answer(text, reply_markup=kb)
@@ -1138,24 +1198,60 @@ async def set_date_cmd(message: Message):
         await form_start(tg_id, "release_date")
         await message.answer(
             "Введи дату релиза в формате ДД.ММ.ГГГГ.\nПример: 31.12.2025\n\nОтмена: /cancel",
-            reply_markup=menu_keyboard(),
+            reply_markup=await user_menu_keyboard(tg_id),
         )
         return
     d = parse_date(parts[1])
     if not d:
-        await message.answer("Не понял дату. Пример: /set_date 31.12.2025", reply_markup=menu_keyboard())
+        await message.answer("Не понял дату. Пример: /set_date 31.12.2025", reply_markup=await user_menu_keyboard(tg_id))
         return
     await set_release_date(tg_id, d.isoformat())
     await form_clear(tg_id)
     reminders = await get_reminders_enabled(tg_id)
     await message.answer(f"Ок. Дата релиза: {format_date_ru(d)}", reply_markup=build_timeline_kb(reminders, has_date=True))
-    await message.answer(timeline_text(d, reminders), reply_markup=menu_keyboard())
+    await message.answer(timeline_text(d, reminders), reply_markup=await user_menu_keyboard(tg_id))
 
 @dp.message(Command("cancel"))
 async def cancel(message: Message):
     tg_id = message.from_user.id
     await form_clear(tg_id)
-    await message.answer("Ок, отменил.", reply_markup=menu_keyboard())
+    await message.answer("Ок, отменил.", reply_markup=await user_menu_keyboard(tg_id))
+
+@dp.message(Command("broadcast_update"))
+async def broadcast_update(message: Message, bot: Bot):
+    if not ADMIN_TG_ID or str(message.from_user.id) != ADMIN_TG_ID:
+        await message.answer("Нет доступа.")
+        return
+    await ensure_user(message.from_user.id, message.from_user.username)
+    parts = message.text.split(maxsplit=1)
+    url = parts[1].strip() if len(parts) == 2 else UPDATES_POST_URL
+    if not url:
+        await message.answer("Укажи ссылку: /broadcast_update <url> или задай UPDATES_POST_URL.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT tg_id, last_update_notified FROM users WHERE updates_opt_in=1"
+        )
+        users = await cur.fetchall()
+        sent = skipped = errors = 0
+        for tg_id, last_notified in users:
+            if last_notified == url:
+                skipped += 1
+                continue
+            try:
+                await bot.send_message(tg_id, f"⚡️ Есть обновление ИСКРЫ. Подробнее: {url}")
+                await set_last_update_notified(tg_id, url, db)
+                sent += 1
+            except TelegramForbiddenError:
+                skipped += 1
+            except Exception:
+                errors += 1
+            await asyncio.sleep(0.1)
+        await db.commit()
+    await message.answer(
+        f"Рассылка завершена. Отправлено: {sent}. Пропущено/ошибок: {skipped + errors}.",
+        reply_markup=await user_menu_keyboard(message.from_user.id)
+    )
 
 # Reply keyboard actions
 @dp.message(F.text == "🎯 План")
@@ -1189,7 +1285,9 @@ async def rb_timeline(message: Message):
 
 @dp.message(F.text == "🗓️ Установить дату")
 async def rb_set_date_hint(message: Message):
-    await message.answer("Команда:\n/set_date ДД.ММ.ГГГГ\nПример:\n/set_date 31.12.2025", reply_markup=menu_keyboard())
+    tg_id = message.from_user.id
+    await ensure_user(tg_id, message.from_user.username)
+    await message.answer("Команда:\n/set_date ДД.ММ.ГГГГ\nПример:\n/set_date 31.12.2025", reply_markup=await user_menu_keyboard(tg_id))
 
 @dp.message(F.text == "🔗 Ссылки")
 async def rb_links(message: Message):
@@ -1197,7 +1295,24 @@ async def rb_links(message: Message):
 
 @dp.message(F.text == "🧠 Ожидания")
 async def rb_expectations(message: Message):
-    await message.answer(expectations_text(), reply_markup=menu_keyboard())
+    await message.answer(expectations_text(), reply_markup=await user_menu_keyboard(message.from_user.id))
+
+@dp.message(F.text == "🆕 Что нового")
+async def rb_whats_new(message: Message):
+    tg_id = message.from_user.id
+    await ensure_user(tg_id, message.from_user.username)
+    if UPDATES_POST_URL:
+        await message.answer(f"🆕 Что нового: {UPDATES_POST_URL}", reply_markup=await user_menu_keyboard(tg_id))
+    else:
+        await message.answer("Админ ещё не указал ссылку на пост.", reply_markup=await user_menu_keyboard(tg_id))
+
+@dp.message(F.text.startswith("🔔 Обновления"))
+async def rb_toggle_updates(message: Message):
+    tg_id = message.from_user.id
+    await ensure_user(tg_id, message.from_user.username)
+    enabled = await toggle_updates_opt_in(tg_id)
+    reply = "Ок, обновления включены ✅" if enabled else "Ок, обновления выключены ❌"
+    await message.answer(reply, reply_markup=await user_menu_keyboard(tg_id))
 
 @dp.message(F.text == "🧹 Сброс")
 async def rb_reset(message: Message):
@@ -1218,7 +1333,7 @@ async def rb_label(message: Message):
         "📩 Заявка на дистрибуцию.\n\n"
         f"{LABEL_FORM_STEPS[0][1]}\n\n"
         "Отмена: /cancel",
-        reply_markup=menu_keyboard()
+        reply_markup=await user_menu_keyboard(tg_id)
     )
 
 # -------------------- Stars: DONATE --------------------
@@ -1276,12 +1391,12 @@ async def successful_payment(message: Message):
     sp = message.successful_payment
     # sp.currency для Stars будет "XTR" :contentReference[oaicite:2]{index=2}
     if (sp.invoice_payload or "").startswith("donate_iskra_"):
-        await message.answer("💫 Принято! Спасибо за поддержку ИСКРЫ 🤝", reply_markup=menu_keyboard())
+        await message.answer("💫 Принято! Спасибо за поддержку ИСКРЫ 🤝", reply_markup=await user_menu_keyboard(message.from_user.id))
     elif sp.invoice_payload == "export_plan_25":
         tg_id = message.from_user.id
         await ensure_user(tg_id)
         tasks_state = await get_tasks_state(tg_id)
-        await message.answer(build_export_text(tasks_state), reply_markup=menu_keyboard())
+        await message.answer(build_export_text(tasks_state), reply_markup=await user_menu_keyboard(tg_id))
 
 # -------------------- Inline callbacks --------------------
 
@@ -1298,7 +1413,7 @@ async def set_exp_cb(callback):
     await ensure_user(tg_id)
     exp = callback.data.split(":")[1]
     await set_experience(tg_id, "first" if exp == "first" else "old")
-    await callback.message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
+    await callback.message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=await user_menu_keyboard(tg_id))
     text, kb = await build_focus_for_user(tg_id, "first" if exp == "first" else "old")
 
     await safe_edit(callback.message, text, kb)
@@ -1347,7 +1462,7 @@ async def qc_answer_cb(callback):
         return
     await save_qc_check(tg_id, task_id, qc["key"], value)
     if value == "no":
-        await callback.message.answer(f"Подсказка: {qc['tip']}", reply_markup=menu_keyboard())
+        await callback.message.answer(f"Подсказка: {qc['tip']}", reply_markup=await user_menu_keyboard(tg_id))
     await callback.answer("Записал")
 
 @dp.callback_query(F.data == "sections:open")
@@ -1439,7 +1554,7 @@ async def timeline_set_date_cb(callback):
     await form_start(tg_id, "release_date")
     await callback.message.answer(
         "Введи дату релиза в формате ДД.ММ.ГГГГ.\nПример: 31.12.2025\n\nОтмена: /cancel",
-        reply_markup=menu_keyboard(),
+        reply_markup=await user_menu_keyboard(tg_id),
     )
     await callback.answer()
 
@@ -1464,7 +1579,7 @@ async def texts_start_cb(callback):
     await ensure_user(tg_id)
     await form_start(tg_id, "pitch_texts")
     await form_set(tg_id, 0, {})
-    await callback.message.answer("✍️ Тексты для питчинга.\n\n" + TEXT_FORM_STEPS[0][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+    await callback.message.answer("✍️ Тексты для питчинга.\n\n" + TEXT_FORM_STEPS[0][1] + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("texts:copy:"))
@@ -1480,7 +1595,7 @@ async def texts_copy_cb(callback):
     if idx < 0 or idx >= len(texts):
         await callback.answer("Нет варианта", show_alert=True)
         return
-    await callback.message.answer(texts[idx], reply_markup=menu_keyboard())
+    await callback.message.answer(texts[idx], reply_markup=await user_menu_keyboard(tg_id))
     await callback.answer("Скопируй текст")
 
 @dp.callback_query(F.data == "reset_menu")
@@ -1546,7 +1661,7 @@ async def reset_progress_yes_cb(callback):
     await reset_progress_only(tg_id)
     text, kb = await build_focus_for_user(tg_id, exp)
     await safe_edit(callback.message, text, kb)
-    await callback.message.answer("Прогресс очищен.", reply_markup=menu_keyboard())
+    await callback.message.answer("Прогресс очищен.", reply_markup=await user_menu_keyboard(tg_id))
     await callback.answer("Сбросил")
 
 @dp.callback_query(F.data == "reset_all_yes")
@@ -1562,7 +1677,7 @@ async def reset_all_yes_cb(callback):
     await reset_all_data(tg_id)
     text, kb = await build_focus_for_user(tg_id, exp)
     await safe_edit(callback.message, text, kb)
-    await callback.message.answer("Сбросил всё: чеклист, дату и напоминания.", reply_markup=menu_keyboard())
+    await callback.message.answer("Сбросил всё: чеклист, дату и напоминания.", reply_markup=await user_menu_keyboard(tg_id))
     await callback.answer("Полный сброс")
 
 @dp.callback_query(F.data == "back_to_focus")
@@ -1588,7 +1703,7 @@ async def label_start_cb(callback):
         "📩 Заявка на дистрибуцию.\n\n"
         f"{LABEL_FORM_STEPS[0][1]}\n\n"
         "Отмена: /cancel",
-        reply_markup=menu_keyboard()
+        reply_markup=await user_menu_keyboard(tg_id)
     )
     await callback.answer()
 
@@ -1613,7 +1728,7 @@ async def any_message_router(message: Message):
         if not d:
             await message.answer(
                 "Не понял дату. Формат: ДД.ММ.ГГГГ. Пример: 31.12.2025\n\nПопробуй ещё раз:",
-                reply_markup=menu_keyboard(),
+                reply_markup=await user_menu_keyboard(tg_id),
             )
             return
         await set_release_date(tg_id, d.isoformat())
@@ -1623,7 +1738,7 @@ async def any_message_router(message: Message):
             f"Ок. Дата релиза: {format_date_ru(d)}",
             reply_markup=build_timeline_kb(reminders, has_date=True),
         )
-        await message.answer(timeline_text(d, reminders), reply_markup=menu_keyboard())
+        await message.answer(timeline_text(d, reminders), reply_markup=await user_menu_keyboard(tg_id))
         return
 
     if form_name == "pitch_texts":
@@ -1631,7 +1746,7 @@ async def any_message_router(message: Message):
         data = form["data"]
         if step < 0 or step >= len(TEXT_FORM_STEPS):
             await form_clear(tg_id)
-            await message.answer("Форма сброшена. Нажми «✍️ Тексты» ещё раз.", reply_markup=menu_keyboard())
+            await message.answer("Форма сброшена. Нажми «✍️ Тексты» ещё раз.", reply_markup=await user_menu_keyboard(tg_id))
             return
         key, prompt, *rest = TEXT_FORM_STEPS[step]
         optional = rest[0] if rest else False
@@ -1639,7 +1754,7 @@ async def any_message_router(message: Message):
         if not value and optional:
             data[key] = ""
         elif len(value) < 2:
-            await message.answer(prompt + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+            await message.answer(prompt + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
             return
         else:
             data[key] = value
@@ -1647,7 +1762,7 @@ async def any_message_router(message: Message):
         step += 1
         if step < len(TEXT_FORM_STEPS):
             await form_set(tg_id, step, data)
-            await message.answer(TEXT_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+            await message.answer(TEXT_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
             return
 
         texts = generate_pitch_texts(data)
@@ -1655,7 +1770,7 @@ async def any_message_router(message: Message):
         await form_set(tg_id, 0, {"texts": texts})
 
         for idx, text in enumerate(texts, start=1):
-            await message.answer(f"Вариант {idx}:\n{text}", reply_markup=menu_keyboard())
+            await message.answer(f"Вариант {idx}:\n{text}", reply_markup=await user_menu_keyboard(tg_id))
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="📋 Скопировать 1", callback_data="texts:copy:0")],
@@ -1678,7 +1793,7 @@ async def any_message_router(message: Message):
 
     if step < 0 or step >= len(LABEL_FORM_STEPS):
         await form_clear(tg_id)
-        await message.answer("Форма сбросилась. Нажми «📩 Запросить дистрибуцию» ещё раз.", reply_markup=menu_keyboard())
+        await message.answer("Форма сбросилась. Нажми «📩 Запросить дистрибуцию» ещё раз.", reply_markup=await user_menu_keyboard(tg_id))
         return
 
     key, _ = LABEL_FORM_STEPS[step]
@@ -1686,7 +1801,7 @@ async def any_message_router(message: Message):
     if not ok:
         await message.answer(
             f"{err}\n\n{LABEL_FORM_STEPS[step][1]}\n\n(Отмена: /cancel)",
-            reply_markup=menu_keyboard()
+            reply_markup=await user_menu_keyboard(tg_id)
         )
         return
 
@@ -1695,7 +1810,7 @@ async def any_message_router(message: Message):
     step += 1
     if step < len(LABEL_FORM_STEPS):
         await form_set(tg_id, step, data)
-        await message.answer(LABEL_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+        await message.answer(LABEL_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
         return
 
     summary = render_label_summary(data)
@@ -1723,14 +1838,14 @@ async def any_message_router(message: Message):
     result_lines = ["✅ Заявка собрана."]
     result_lines.append("✓ Отправил в Telegram лейблу." if sent_tg else "⚠️ Не смог отправить в Telegram (проверь ADMIN_TG_ID).")
     result_lines.append("✓ И на почту отправил автоматически." if sent_email else "⧗ Авто-почта не настроена/не доступна — ниже шаблон письма.")
-    await message.answer("\n".join(result_lines), reply_markup=menu_keyboard())
+    await message.answer("\n".join(result_lines), reply_markup=await user_menu_keyboard(tg_id))
 
     if not sent_email:
         await message.answer(f"Почта: {LABEL_EMAIL}\n\nТекст письма (скопируй):\n\n{summary}", reply_markup=kb)
 
     await message.answer(
         "Заявка принята. Срок ответа: 7 дней. Если нет ответа — значит не подошло/не актуально.",
-        reply_markup=menu_keyboard(),
+        reply_markup=await user_menu_keyboard(tg_id),
     )
 
     await form_clear(tg_id)
