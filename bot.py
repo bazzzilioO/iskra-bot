@@ -40,6 +40,7 @@ LINKS = {
     "tiktok_for_artists": "https://artists.tiktok.com/",
 }
 
+UPDATES_CHANNEL_URL = "https://t.me/sreda_music"
 UPDATES_POST_URL = os.getenv("UPDATES_POST_URL", "")
 
 ACCOUNTS = [
@@ -1224,7 +1225,7 @@ async def broadcast_update(message: Message, bot: Bot):
         return
     await ensure_user(message.from_user.id, message.from_user.username)
     parts = message.text.split(maxsplit=1)
-    url = parts[1].strip() if len(parts) == 2 else UPDATES_POST_URL
+    url = (parts[1] if len(parts) == 2 else UPDATES_POST_URL).strip()
     if not url:
         await message.answer("Укажи ссылку: /broadcast_update <url> или задай UPDATES_POST_URL.")
         return
@@ -1302,9 +1303,10 @@ async def rb_whats_new(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
     if UPDATES_POST_URL:
-        await message.answer(f"🆕 Что нового: {UPDATES_POST_URL}", reply_markup=await user_menu_keyboard(tg_id))
+        text = f"🆕 Что нового: {UPDATES_POST_URL}"
     else:
-        await message.answer("Админ ещё не указал ссылку на пост.", reply_markup=await user_menu_keyboard(tg_id))
+        text = f"{UPDATES_CHANNEL_URL}\nПоследнее обновление — в закреплённом посте канала."
+    await message.answer(text, reply_markup=await user_menu_keyboard(tg_id))
 
 @dp.message(F.text.startswith("🔔 Обновления"))
 async def rb_toggle_updates(message: Message):
