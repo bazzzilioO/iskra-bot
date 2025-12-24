@@ -21,6 +21,8 @@ from dotenv import load_dotenv
 DB_PATH = "bot.db"
 LABEL_EMAIL = "sreda.records@gmail.com"
 REMINDER_INTERVAL_SECONDS = 300
+REMINDER_CLEAN_DAYS = 60
+REMINDER_LAST_CLEAN: dt.date | None = None
 
 # -------------------- CONFIG --------------------
 
@@ -184,6 +186,41 @@ HELP = {
     24: "Собери 10–30 плейлистов/медиа и пиши точечно. Адресно конвертит лучше массовых рассылок.",
 }
 
+QC_PROMPTS = {
+    6: {
+        "key": "master_wav24",
+        "question": "WAV 24bit?",
+        "tip": "Проверь формат мастера: WAV 24bit, без клиппинга и лимитера на мастер-шине.",
+    },
+    8: {
+        "key": "cover_size",
+        "question": "3000x3000 + без запрещённых логотипов?",
+        "tip": "Держи обложку 3000x3000, без чужих/запрещённых логотипов и мелкого текста.",
+    },
+    12: {
+        "key": "metadata_check",
+        "question": "язык/explicit/жанр заполнены?",
+        "tip": "Проверь язык, explicit, жанр, авторов и написание фитов — это частые причины отклонений.",
+    },
+}
+
+
+async def maybe_send_qc_prompt(callback, tg_id: int, task_id: int):
+    qc = QC_PROMPTS.get(task_id)
+    if not qc:
+        return
+    if await was_qc_checked(tg_id, task_id, qc["key"]):
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да", callback_data=f"qc:{task_id}:yes"),
+                InlineKeyboardButton(text="Нет", callback_data=f"qc:{task_id}:no"),
+            ]
+        ]
+    )
+    await callback.message.answer(f"Мини-проверка: {qc['question']}", reply_markup=kb)
+
 def expectations_text() -> str:
     return (
         "🧠 Ожидания / реальность\n\n"
@@ -191,6 +228,24 @@ def expectations_text() -> str:
         "2) Цель — система: процесс, контент, кабинеты.\n"
         "3) Алгоритмы любят регулярность.\n"
         "4) Мерь себя качеством процесса, не цифрами первого релиза.\n"
+    )
+
+
+def lyrics_sync_text() -> str:
+    return (
+        "Лирика/синхронизация: Musixmatch / Genius\n\n"
+        "Что подготовить: чистый текст песни, при наличии таймкоды и авторы.\n"
+        "Где и когда: Musixmatch/Genius после появления релиза или ближе к релизу, чтобы карточка выглядела полно.\n"
+        "Частые отказы: не тот текст, капслок/эмодзи, неуказанные авторы, дубликаты карточек."
+    )
+
+
+def ugc_tip_text() -> str:
+    return (
+        "UGC/Content ID — как не словить страйки\n\n"
+        "• Если включён Content ID, свои же ролики могут уйти в блок или монетизацию.\n"
+        "• При активных тиктоках/вертикалках иногда лучше временно отключать.\n"
+        "• Уточни у дистрибьютора: где включено, можно ли гибко отключать/белить свои каналы."
     )
 
 def experience_prompt() -> tuple[str, InlineKeyboardMarkup]:
@@ -262,9 +317,15 @@ async def init_db():
             tg_id INTEGER,
             key TEXT,
             "when" TEXT,
+            sent_on TEXT,
             PRIMARY KEY (tg_id, key, "when")
         )
         """)
+        try:
+            await db.execute("ALTER TABLE reminder_log ADD COLUMN sent_on TEXT")
+        except Exception:
+            pass
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_reminder_log_sent_on ON reminder_log(sent_on)")
         await db.execute("""
         CREATE TABLE IF NOT EXISTS user_tasks (
             tg_id INTEGER,
@@ -273,6 +334,9 @@ async def init_db():
             PRIMARY KEY (tg_id, task_id)
         )
         """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_tasks_tg ON user_tasks(tg_id)"
+        )
         await db.execute("""
         CREATE TABLE IF NOT EXISTS user_accounts (
             tg_id INTEGER,
@@ -287,6 +351,25 @@ async def init_db():
             form_name TEXT,
             step INTEGER DEFAULT 0,
             data_json TEXT DEFAULT '{}'
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS important_tasks (
+            tg_id INTEGER,
+            task_id INTEGER,
+            PRIMARY KEY (tg_id, task_id)
+        )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_important_tasks_tg ON important_tasks(tg_id)"
+        )
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS qc_checks (
+            tg_id INTEGER,
+            task_id INTEGER,
+            key TEXT,
+            value TEXT,
+            PRIMARY KEY (tg_id, task_id, key)
         )
         """)
         await db.commit()
@@ -315,6 +398,11 @@ async def set_experience(tg_id: int, exp: str):
 
 async def set_release_date(tg_id: int, date_str: str | None):
     async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT release_date FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        current = row[0] if row else None
+        if current == date_str:
+            return
         await db.execute("UPDATE users SET release_date=? WHERE tg_id=?", (date_str, tg_id))
         await db.execute("DELETE FROM reminder_log WHERE tg_id=?", (tg_id,))
         await db.commit()
@@ -327,6 +415,11 @@ async def get_release_date(tg_id: int) -> str | None:
 
 async def set_reminders_enabled(tg_id: int, enabled: bool):
     async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT reminders_enabled FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        current = row[0] if row else 1
+        if current == (1 if enabled else 0):
+            return
         await db.execute("UPDATE users SET reminders_enabled=? WHERE tg_id=?", (1 if enabled else 0, tg_id))
         await db.commit()
 
@@ -347,10 +440,16 @@ async def toggle_task(tg_id: int, task_id: int):
         await db.execute("UPDATE user_tasks SET done = 1 - done WHERE tg_id=? AND task_id=?", (tg_id, task_id))
         await db.commit()
 
-async def set_task_done(tg_id: int, task_id: int, done: int):
+async def set_task_done(tg_id: int, task_id: int, done: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT done FROM user_tasks WHERE tg_id=? AND task_id=?", (tg_id, task_id))
+        row = await cur.fetchone()
+        current = row[0] if row else 0
+        if current == done:
+            return False
         await db.execute("UPDATE user_tasks SET done=? WHERE tg_id=? AND task_id=?", (done, tg_id, task_id))
         await db.commit()
+        return True
 
 async def get_accounts_state(tg_id: int) -> dict[str, int]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -367,10 +466,66 @@ async def cycle_account_status(tg_id: int, key: str):
         await db.execute("UPDATE user_accounts SET status=? WHERE tg_id=? AND key=?", (new, tg_id, key))
         await db.commit()
 
+async def add_important_task(tg_id: int, task_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO important_tasks (tg_id, task_id) VALUES (?, ?)",
+            (tg_id, task_id)
+        )
+        await db.commit()
+
+async def remove_important_task(tg_id: int, task_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM important_tasks WHERE tg_id=? AND task_id=?",
+            (tg_id, task_id)
+        )
+        await db.commit()
+
+async def get_important_tasks(tg_id: int) -> set[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT task_id FROM important_tasks WHERE tg_id=?",
+            (tg_id,)
+        )
+        rows = await cur.fetchall()
+        return {r[0] for r in rows}
+
+async def save_qc_check(tg_id: int, task_id: int, key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO qc_checks (tg_id, task_id, key, value) VALUES (?, ?, ?, ?)",
+            (tg_id, task_id, key, value)
+        )
+        await db.commit()
+
+async def was_qc_checked(tg_id: int, task_id: int, key: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM qc_checks WHERE tg_id=? AND task_id=? AND key=?",
+            (tg_id, task_id, key)
+        )
+        row = await cur.fetchone()
+        return row is not None
+
 async def reset_progress_only(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE user_tasks SET done=0 WHERE tg_id=?", (tg_id,))
         await db.execute("UPDATE user_accounts SET status=0 WHERE tg_id=?", (tg_id,))
+        await db.commit()
+
+async def reset_all_data(tg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE user_tasks SET done=0 WHERE tg_id=?", (tg_id,))
+        await db.execute("UPDATE user_accounts SET status=0 WHERE tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM important_tasks WHERE tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM qc_checks WHERE tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM reminder_log WHERE tg_id=?", (tg_id,))
+        await db.execute(
+            "UPDATE users SET release_date=NULL, reminders_enabled=1 WHERE tg_id=?",
+            (tg_id,)
+        )
+        await db.execute("DELETE FROM user_forms WHERE tg_id=?", (tg_id,))
         await db.commit()
 
 # -------------------- Forms --------------------
@@ -434,9 +589,23 @@ def find_section_for_task(task_id: int) -> tuple[str, str] | None:
             return sid, stitle
     return None
 
-def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> tuple[str, InlineKeyboardMarkup]:
+async def build_focus_for_user(tg_id: int, exp: str, focus_task_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
+    tasks_state = await get_tasks_state(tg_id)
+    important = await get_important_tasks(tg_id)
+    return build_focus(tasks_state, exp, important, focus_task_id)
+
+def build_focus(
+    tasks_state: dict[int, int],
+    experience: str | None = None,
+    important: set[int] | None = None,
+    focus_task_id: int | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
     done, total = count_progress(tasks_state)
-    next_task = get_next_task(tasks_state)
+    next_task = None
+    if focus_task_id:
+        next_task = (focus_task_id, get_task_title(focus_task_id))
+    else:
+        next_task = get_next_task(tasks_state)
 
     lines = []
     lines.append("🎯 Фокус-режим")
@@ -444,7 +613,7 @@ def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> t
         lines.append("Тип релиза: первый")
     elif experience == "old":
         lines.append("Тип релиза: не первый")
-    lines.append(f"Прогресс: {done}/{total}\n")
+    lines.append(f"Прогресс общий: {done}/{total}\n")
 
     rows: list[list[InlineKeyboardButton]] = []
 
@@ -455,8 +624,13 @@ def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> t
     task_id, title = next_task
     sec = find_section_for_task(task_id)
     if sec:
-        _, stitle = sec
-        lines.append(f"Раздел: {stitle}")
+        sid, stitle = sec
+        idx = next((i for i, s in enumerate(SECTIONS) if s[0] == sid), 0) + 1
+        sec_total = len(SECTIONS)
+        section_ids = next((s[2] for s in SECTIONS if s[0] == sid), [])
+        section_done = sum(1 for tid in section_ids if tasks_state.get(tid, 0) == 1)
+        lines.append(f"Раздел: {idx}/{sec_total} — {stitle}")
+        lines.append(f"Прогресс по разделу: {section_done}/{len(section_ids)}")
     lines.append(f"Следующая задача:\n▫️ {title}\n")
 
     upcoming = []
@@ -473,14 +647,16 @@ def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> t
             lines.append(f"▫️ {t}")
 
     is_done = tasks_state.get(task_id, 0) == 1
+    mark_text = f"↩️ Отменить: {title}" if is_done else f"✅ Сделано: {title}"
     rows.append([
         InlineKeyboardButton(
-            text=(
-                f"↩️ Отменить: {title}" if is_done else f"✅ Сделано: {title}"
-            ),
+            text=mark_text,
             callback_data=f"focus_done:{task_id}"
         )
     ])
+    imp_set = important or set()
+    imp_text = "🔥 Убрать из важных" if task_id in imp_set else "⭐ Важное"
+    rows.append([InlineKeyboardButton(text=imp_text, callback_data=f"important:toggle:{task_id}")])
     rows.append([InlineKeyboardButton(text="❓ Пояснение", callback_data=f"help:{task_id}")])
 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
@@ -540,6 +716,28 @@ def build_section_page(tasks_state: dict[int, int], section_id: str, page: int, 
 
     return "\n".join(text_lines), InlineKeyboardMarkup(inline_keyboard=inline)
 
+
+def build_important_screen(tasks_state: dict[int, int], important_ids: set[int]) -> tuple[str, InlineKeyboardMarkup]:
+    if not important_ids:
+        text = "🔥 Важное\n\nПока ничего не закреплено. Отметь задачу кнопкой ⭐ Важное во фокусе."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎯 В фокус", callback_data="back_to_focus")]])
+        return text, kb
+
+    text_lines = ["🔥 Важное"]
+    inline: list[list[InlineKeyboardButton]] = []
+    for tid in sorted(important_ids):
+        title = get_task_title(tid)
+        status = "✅" if tasks_state.get(tid, 0) == 1 else "▫️"
+        text_lines.append(f"{status} {title}")
+        inline.append(
+            [
+                InlineKeyboardButton(text="➡️ В фокус", callback_data=f"important:focus:{tid}"),
+                InlineKeyboardButton(text="🔥 Снять", callback_data=f"important:toggle:{tid}"),
+            ]
+        )
+    inline.append([InlineKeyboardButton(text="🎯 В фокус", callback_data="back_to_focus")])
+    return "\n".join(text_lines), InlineKeyboardMarkup(inline_keyboard=inline)
+
 def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, InlineKeyboardMarkup]:
     text = "🧾 Кабинеты артиста\nСостояния: ▫️ → ⏳ → ✅\n\n"
     for key, name in ACCOUNTS:
@@ -554,23 +752,26 @@ def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, Inlin
 
 def build_links_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥 Важное", callback_data="important:list")],
+        [InlineKeyboardButton(text="✍️ Тексты", callback_data="texts:start")],
         [InlineKeyboardButton(text="BandLink", url=LINKS["bandlink_home"])],
         [InlineKeyboardButton(text="Spotify for Artists", url=LINKS["spotify_for_artists"])],
         [InlineKeyboardButton(text="Яндекс (артистам)", url=LINKS["yandex_artists_hub"])],
         [InlineKeyboardButton(text="Звук Studio", url=LINKS["zvuk_studio"])],
         [InlineKeyboardButton(text="КИОН (бывш. МТС) питчинг", url=LINKS["kion_pitch"])],
         [InlineKeyboardButton(text="TikTok for Artists", url=LINKS["tiktok_for_artists"])],
+        [InlineKeyboardButton(text="Лирика/синхронизация", callback_data="links:lyrics")],
+        [InlineKeyboardButton(text="UGC / Content ID", callback_data="links:ugc")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]
     ])
 
-def build_timeline_kb(reminders_enabled: bool) -> InlineKeyboardMarkup:
+def build_timeline_kb(reminders_enabled: bool, has_date: bool = True) -> InlineKeyboardMarkup:
     toggle_text = "🔔 Напоминания: Вкл" if reminders_enabled else "🔔 Напоминания: Выкл"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_text, callback_data="reminders:toggle")],
-            [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")],
-        ]
-    )
+    rows = [[InlineKeyboardButton(text=toggle_text, callback_data="reminders:toggle")]]
+    if not has_date:
+        rows.append([InlineKeyboardButton(text="📅 Установить дату", callback_data="timeline:set_date")])
+    rows.append([InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def build_deadlines(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
     items: list[tuple[str, str, dt.date]] = []
@@ -581,25 +782,66 @@ def build_deadlines(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
 
 def timeline_text(release_date: dt.date | None, reminders_enabled: bool = True) -> str:
     if not release_date:
-        return "📅 Таймлайн\n\nДата релиза не задана.\nУстанови: /set_date ДД.ММ.ГГГГ\nПример: /set_date 31.12.2025"
+        return (
+            "📅 Таймлайн\n\nДата релиза не задана."
+            "\nНажми «📅 Установить дату» или команду /set_date ДД.ММ.ГГГГ"
+        )
+
+    blocks: list[tuple[str, list[tuple[str, dt.date]]]] = []
+    start_prep = release_date + dt.timedelta(days=-21)
+    end_prep = release_date + dt.timedelta(days=-14)
+    blocks.append(("−21…−14 (подготовка к питчингу)", [("Окно подготовки", start_prep), ("Конец окна", end_prep)]))
+
+    deadlines = build_deadlines(release_date)
+    events: list[tuple[str, dt.date]] = [("Релиз", release_date)]
+    for _, title, d in deadlines:
+        events.append((title, d))
+
+    grouped: dict[str, list[tuple[str, dt.date]]] = {
+        "pitch": [],
+        "pre": [],
+        "release": [],
+        "post": [],
+    }
+    for title, d in events:
+        offset = (d - release_date).days
+        if -21 <= offset <= -15:
+            grouped.setdefault("prep", []).append((title, d))
+        if offset == -14:
+            grouped["pitch"].append((title, d))
+        if offset == -7:
+            grouped["pre"].append((title, d))
+        if offset == 0:
+            grouped["release"].append((title, d))
+        if offset in {1, 3, 7}:
+            grouped["post"].append((title, d))
+
+    blocks.append(("−14 Питчинг", grouped.get("pitch", [])))
+    blocks.append(("−7 Пресейв/бендлинк", grouped.get("pre", [])))
+    blocks.append(("0 Релиз", grouped.get("release", [])))
+    blocks.append(("+1/+3/+7 пост-релиз", grouped.get("post", [])))
 
     lines = ["📅 Таймлайн", "", f"Дата релиза: {format_date_ru(release_date)}"]
-    lines.append(f"Напоминания: {'включены' if reminders_enabled else 'выключены'}")
-    lines.append("")
-    lines.append("Ближайшие дедлайны:")
+    lines.append(f"Напоминания: {'включены' if reminders_enabled else 'выключены'}\n")
 
     today = dt.date.today()
-    for _, title, d in build_deadlines(release_date):
-        delta = (d - today).days
-        delta_text = " (сегодня)" if delta == 0 else (f" (через {delta} дн)" if delta > 0 else f" ({abs(delta)} дн назад)")
-        lines.append(f"▫️ {format_date_ru(d)} — {title}{delta_text}")
+    for title, items in blocks:
+        if not items:
+            continue
+        lines.append(title)
+        for item_title, d in sorted(items, key=lambda x: x[1]):
+            delta = (d - today).days
+            delta_text = " (сегодня)" if delta == 0 else (f" (через {delta} дн)" if delta > 0 else f" ({abs(delta)} дн назад)")
+            lines.append(f"▫️ {format_date_ru(d)} — {item_title}{delta_text}")
+        lines.append("")
 
-    return "\n".join(lines)
+    return "\n".join([l for l in lines if l is not None])
 
 def build_reset_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧹 Сбросить прогресс", callback_data="reset_progress_yes")],
-        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")],
+        [InlineKeyboardButton(text="Да, сбросить", callback_data="reset_progress_yes")],
+        [InlineKeyboardButton(text="Сбросить всё (дата/настройки)", callback_data="reset_all_yes")],
+        [InlineKeyboardButton(text="Отмена", callback_data="back_to_focus")],
     ])
 
 def build_donate_menu_kb() -> InlineKeyboardMarkup:
@@ -632,10 +874,18 @@ async def was_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when
     return row is not None
 
 
-async def mark_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when: str):
+async def mark_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when: str, sent_on: dt.date):
     await db.execute(
-        "INSERT OR IGNORE INTO reminder_log (tg_id, key, \"when\") VALUES (?, ?, ?)",
-        (tg_id, key, when)
+        "INSERT OR IGNORE INTO reminder_log (tg_id, key, \"when\", sent_on) VALUES (?, ?, ?, ?)",
+        (tg_id, key, when, sent_on.isoformat())
+    )
+
+
+async def cleanup_reminder_log(db: aiosqlite.Connection, today: dt.date):
+    threshold = today - dt.timedelta(days=REMINDER_CLEAN_DAYS)
+    await db.execute(
+        "DELETE FROM reminder_log WHERE sent_on IS NOT NULL AND sent_on < ?",
+        (threshold.isoformat(),)
     )
 
 
@@ -649,6 +899,10 @@ def build_deadline_messages(release_date: dt.date) -> list[tuple[str, str, dt.da
 async def process_reminders(bot: Bot):
     today = dt.date.today()
     async with aiosqlite.connect(DB_PATH) as db:
+        global REMINDER_LAST_CLEAN
+        if REMINDER_LAST_CLEAN != today:
+            await cleanup_reminder_log(db, today)
+            REMINDER_LAST_CLEAN = today
         cur = await db.execute(
             "SELECT tg_id, username, release_date FROM users WHERE reminders_enabled=1 AND release_date IS NOT NULL"
         )
@@ -670,7 +924,7 @@ async def process_reminders(bot: Bot):
                         continue
                     try:
                         await bot.send_message(tg_id, prefix)
-                        await mark_reminder_sent(db, tg_id, key, when_label)
+                        await mark_reminder_sent(db, tg_id, key, when_label, today)
                     except TelegramForbiddenError:
                         continue
                     except Exception:
@@ -711,12 +965,22 @@ async def try_send_email(subject: str, body: str) -> bool:
 # -------------------- Label form --------------------
 
 LABEL_FORM_STEPS = [
-    ("name", "Шаг 1/6: Как тебя зовут (имя/ник)?"),
-    ("artist_name", "Шаг 2/6: Название проекта/артиста (как будет на площадках)?"),
-    ("contact", "Шаг 3/6: Контакт для связи (Telegram @... или email)?"),
-    ("genre", "Шаг 4/6: Жанр + 1–2 референса (через запятую)?"),
-    ("links", "Шаг 5/6: Ссылки на материал (приватная ссылка/облако/SoundCloud)."),
-    ("release_date", "Шаг 6/6: Планируемая дата релиза (если есть) или «нет»."),
+    ("name", "Шаг 1/8: Как тебя зовут (имя/ник)?"),
+    ("artist_name", "Шаг 2/8: Название проекта/артиста (как будет на площадках)?"),
+    ("contact", "Шаг 3/8: Контакт для связи (Telegram @... или email)?"),
+    ("genre", "Шаг 4/8: Жанр + 1–2 референса (через запятую)?"),
+    ("links", "Шаг 5/8: Ссылки на материал (приватная ссылка/облако/SoundCloud)."),
+    ("release_date", "Шаг 6/8: Планируемая дата релиза (если есть) или «нет»."),
+    ("goal", "Шаг 7/8: Цель заявки (лейбл / дистрибуция / промо)?"),
+    ("readiness", "Шаг 8/8: Готовность материала (демо / почти готов / готов)?"),
+]
+
+TEXT_FORM_STEPS = [
+    ("genre", "Шаг 1/5: Жанр?"),
+    ("refs", "Шаг 2/5: 1–2 референса (через запятую)?"),
+    ("mood", "Шаг 3/5: Настроение/темы (1 строка)?"),
+    ("city", "Шаг 4/5: Город/страна (опционально, можно пропустить)", True),
+    ("link", "Шаг 5/5: Ссылка на трек/приват (опционально, можно пропустить)", True),
 ]
 
 def render_label_summary(data: dict) -> str:
@@ -728,7 +992,61 @@ def render_label_summary(data: dict) -> str:
         f"Жанр/референсы: {data.get('genre','')}\n"
         f"Ссылки: {data.get('links','')}\n"
         f"Дата релиза: {data.get('release_date','')}\n"
+        f"Цель: {data.get('goal','')}\n"
+        f"Готовность: {data.get('readiness','')}\n"
     )
+
+
+def generate_pitch_texts(data: dict) -> list[str]:
+    genre = data.get("genre", "жанр не указан")
+    refs = data.get("refs") or data.get("ref") or data.get("reference") or data.get("genre")
+    mood = data.get("mood", "настроение")
+    city = data.get("city")
+    link = data.get("link")
+
+    base_lines = [
+        f"Жанр: {genre}",
+        f"Референсы: {refs}",
+        f"Настроение/темы: {mood}",
+    ]
+    if city:
+        base_lines.append(f"Город/страна: {city}")
+    if link:
+        base_lines.append(f"Ссылка: {link}")
+
+    variants = []
+    # короткий
+    lines_short = [
+        "Коротко о релизе:",
+        *base_lines[:],
+        "Готов к подборкам/редакторам",
+    ]
+    variants.append("\n".join(lines_short))
+
+    # нейтральный
+    lines_neutral = [
+        "Новый трек для плейлистов:",
+        *base_lines[:],
+        "Фокус: чистый звук + понятная история",
+        "Буду рад фидбеку/подборкам",
+    ]
+    variants.append("\n".join(lines_neutral))
+
+    # дерзкий
+    lines_bold = [
+        "Чуть дерзкий питч:",
+        f"{genre.capitalize()} с упором на вайб {mood}",
+        f"Рефы: {refs}",
+        "Хочу зайти в плейлисты и рекомендации",
+    ]
+    if city:
+        lines_bold.append(f"Местная точка: {city}")
+    if link:
+        lines_bold.append(f"Слушать: {link}")
+    lines_bold.append("Готов к ревью/подкастам")
+    variants.append("\n".join(lines_bold))
+
+    return variants
 
 def validate_label_input(key: str, raw: str) -> tuple[bool, str | None, str | None]:
     value = (raw or "").strip()
@@ -764,6 +1082,18 @@ def validate_label_input(key: str, raw: str) -> tuple[bool, str | None, str | No
             return fail("Формат даты: ДД.ММ.ГГГГ или YYYY-MM-DD, либо напиши «нет»." )
         return True, format_date_ru(parsed), None
 
+    if key == "goal":
+        if len(value) < 3:
+            return fail("Опиши цель: лейбл / дистрибуция / промо.")
+        return True, value, None
+
+    if key == "readiness":
+        normalized = value.lower()
+        allowed = {"демо", "почти готов", "готов"}
+        if normalized not in allowed:
+            return fail("Готовность: демо / почти готов / готов.")
+        return True, normalized, None
+
     return True, value, None
 
 # -------------------- Commands & buttons --------------------
@@ -781,8 +1111,7 @@ async def start(message: Message):
 
     await message.answer("ИСКРА активна. Жми кнопки меню снизу 👇", reply_markup=menu_keyboard())
 
-    tasks_state = await get_tasks_state(tg_id)
-    focus_text, kb = build_focus(tasks_state, exp)
+    focus_text, kb = await build_focus_for_user(tg_id, exp)
     await message.answer(focus_text, reply_markup=kb)
 
 @dp.message(Command("plan"))
@@ -796,7 +1125,8 @@ async def plan_cmd(message: Message):
         return
     tasks_state = await get_tasks_state(tg_id)
     await message.answer("Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
-    text, kb = build_focus(tasks_state, exp)
+    important = await get_important_tasks(tg_id)
+    text, kb = build_focus(tasks_state, exp, important)
     await message.answer(text, reply_markup=kb)
 
 @dp.message(Command("set_date"))
@@ -818,7 +1148,7 @@ async def set_date_cmd(message: Message):
     await set_release_date(tg_id, d.isoformat())
     await form_clear(tg_id)
     reminders = await get_reminders_enabled(tg_id)
-    await message.answer(f"Ок. Дата релиза: {format_date_ru(d)}", reply_markup=build_timeline_kb(reminders))
+    await message.answer(f"Ок. Дата релиза: {format_date_ru(d)}", reply_markup=build_timeline_kb(reminders, has_date=True))
     await message.answer(timeline_text(d, reminders), reply_markup=menu_keyboard())
 
 @dp.message(Command("cancel"))
@@ -855,7 +1185,7 @@ async def rb_timeline(message: Message):
     rd = await get_release_date(tg_id)
     d = parse_date(rd) if rd else None
     reminders = await get_reminders_enabled(tg_id)
-    await message.answer(timeline_text(d, reminders), reply_markup=build_timeline_kb(reminders))
+    await message.answer(timeline_text(d, reminders), reply_markup=build_timeline_kb(reminders, has_date=bool(d)))
 
 @dp.message(F.text == "🗓️ Установить дату")
 async def rb_set_date_hint(message: Message):
@@ -871,7 +1201,7 @@ async def rb_expectations(message: Message):
 
 @dp.message(F.text == "🧹 Сброс")
 async def rb_reset(message: Message):
-    await message.answer("🧹 Сброс", reply_markup=build_reset_menu_kb())
+    await message.answer("⚠️ Сбросить чеклист?", reply_markup=build_reset_menu_kb())
 
 @dp.message(F.text == "📤 Экспорт")
 async def rb_export(message: Message):
@@ -969,8 +1299,7 @@ async def set_exp_cb(callback):
     exp = callback.data.split(":")[1]
     await set_experience(tg_id, "first" if exp == "first" else "old")
     await callback.message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=menu_keyboard())
-    tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state, "first" if exp == "first" else "old")
+    text, kb = await build_focus_for_user(tg_id, "first" if exp == "first" else "old")
 
     await safe_edit(callback.message, text, kb)
     await callback.answer("Готово")
@@ -986,10 +1315,15 @@ async def focus_done_cb(callback):
         await callback.answer()
         return
     task_id = int(callback.data.split(":")[1])
-    await set_task_done(tg_id, task_id, 1)
     tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state, exp)
+    was_done = tasks_state.get(task_id, 0) == 1
+    await set_task_done(tg_id, task_id, 0 if was_done else 1)
+    tasks_state = await get_tasks_state(tg_id)
+    important = await get_important_tasks(tg_id)
+    text, kb = build_focus(tasks_state, exp, important)
     await safe_edit(callback.message, text, kb)
+    if not was_done:
+        await maybe_send_qc_prompt(callback, tg_id, task_id)
     await callback.answer("Ок")
 
 @dp.callback_query(F.data.startswith("help:"))
@@ -1000,6 +1334,21 @@ async def help_cb(callback):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]])
     await safe_edit(callback.message, f"❓ {title}\n\n{body}", kb)
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("qc:"))
+async def qc_answer_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    _, task_s, value = callback.data.split(":")
+    task_id = int(task_s)
+    qc = QC_PROMPTS.get(task_id)
+    if not qc:
+        await callback.answer("Не актуально")
+        return
+    await save_qc_check(tg_id, task_id, qc["key"], value)
+    if value == "no":
+        await callback.message.answer(f"Подсказка: {qc['tip']}", reply_markup=menu_keyboard())
+    await callback.answer("Записал")
 
 @dp.callback_query(F.data == "sections:open")
 async def sections_open_cb(callback):
@@ -1066,7 +1415,7 @@ async def timeline_cb(callback):
     rd = await get_release_date(tg_id)
     d = parse_date(rd) if rd else None
     reminders = await get_reminders_enabled(tg_id)
-    kb = build_timeline_kb(reminders)
+    kb = build_timeline_kb(reminders, has_date=bool(d))
     await safe_edit(callback.message, timeline_text(d, reminders), kb)
     await callback.answer()
 
@@ -1079,19 +1428,110 @@ async def reminders_toggle_cb(callback):
     await set_reminders_enabled(tg_id, not current)
     rd = await get_release_date(tg_id)
     d = parse_date(rd) if rd else None
-    kb = build_timeline_kb(not current)
+    kb = build_timeline_kb(not current, has_date=bool(d))
     await safe_edit(callback.message, timeline_text(d, not current), kb)
     await callback.answer("Напоминания обновлены")
+
+@dp.callback_query(F.data == "timeline:set_date")
+async def timeline_set_date_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await form_start(tg_id, "release_date")
+    await callback.message.answer(
+        "Введи дату релиза в формате ДД.ММ.ГГГГ.\nПример: 31.12.2025\n\nОтмена: /cancel",
+        reply_markup=menu_keyboard(),
+    )
+    await callback.answer()
 
 @dp.callback_query(F.data == "links")
 async def links_cb(callback):
     await safe_edit(callback.message, "🔗 Быстрые ссылки:", build_links_kb())
     await callback.answer()
 
+@dp.callback_query(F.data == "links:lyrics")
+async def links_lyrics_cb(callback):
+    await safe_edit(callback.message, lyrics_sync_text(), build_links_kb())
+    await callback.answer()
+
+@dp.callback_query(F.data == "links:ugc")
+async def links_ugc_cb(callback):
+    await safe_edit(callback.message, ugc_tip_text(), build_links_kb())
+    await callback.answer()
+
+@dp.callback_query(F.data == "texts:start")
+async def texts_start_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await form_start(tg_id, "pitch_texts")
+    await form_set(tg_id, 0, {})
+    await callback.message.answer("✍️ Тексты для питчинга.\n\n" + TEXT_FORM_STEPS[0][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("texts:copy:"))
+async def texts_copy_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    idx = int(callback.data.split(":")[2])
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") not in {"pitch_texts_ready"}:
+        await callback.answer("Нет готовых текстов", show_alert=True)
+        return
+    texts = form.get("data", {}).get("texts", [])
+    if idx < 0 or idx >= len(texts):
+        await callback.answer("Нет варианта", show_alert=True)
+        return
+    await callback.message.answer(texts[idx], reply_markup=menu_keyboard())
+    await callback.answer("Скопируй текст")
+
 @dp.callback_query(F.data == "reset_menu")
 async def reset_menu_cb(callback):
     await safe_edit(callback.message, "🧹 Сброс", build_reset_menu_kb())
     await callback.answer()
+
+@dp.callback_query(F.data == "important:list")
+async def important_list_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    tasks_state = await get_tasks_state(tg_id)
+    important = await get_important_tasks(tg_id)
+    text, kb = build_important_screen(tasks_state, important)
+    await safe_edit(callback.message, text, kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("important:toggle:"))
+async def important_toggle_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    task_id = int(callback.data.split(":")[2])
+    important = await get_important_tasks(tg_id)
+    if task_id in important:
+        await remove_important_task(tg_id, task_id)
+    else:
+        await add_important_task(tg_id, task_id)
+    important = await get_important_tasks(tg_id)
+    tasks_state = await get_tasks_state(tg_id)
+    exp = await get_experience(tg_id)
+    if callback.message.text and callback.message.text.startswith("🔥 Важное"):
+        text, kb = build_important_screen(tasks_state, important)
+    else:
+        text, kb = build_focus(tasks_state, exp, important)
+    await safe_edit(callback.message, text, kb)
+    await callback.answer("Обновил")
+
+@dp.callback_query(F.data.startswith("important:focus:"))
+async def important_focus_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    task_id = int(callback.data.split(":")[2])
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        text, kb = experience_prompt()
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+        return
+    text, kb = await build_focus_for_user(tg_id, exp, focus_task_id=task_id)
+    await safe_edit(callback.message, text, kb)
+    await callback.answer("Готово")
 
 @dp.callback_query(F.data == "reset_progress_yes")
 async def reset_progress_yes_cb(callback):
@@ -1104,10 +1544,26 @@ async def reset_progress_yes_cb(callback):
         await callback.answer()
         return
     await reset_progress_only(tg_id)
-    tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state, exp)
+    text, kb = await build_focus_for_user(tg_id, exp)
     await safe_edit(callback.message, text, kb)
+    await callback.message.answer("Прогресс очищен.", reply_markup=menu_keyboard())
     await callback.answer("Сбросил")
+
+@dp.callback_query(F.data == "reset_all_yes")
+async def reset_all_yes_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        text, kb = experience_prompt()
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+        return
+    await reset_all_data(tg_id)
+    text, kb = await build_focus_for_user(tg_id, exp)
+    await safe_edit(callback.message, text, kb)
+    await callback.message.answer("Сбросил всё: чеклист, дату и напоминания.", reply_markup=menu_keyboard())
+    await callback.answer("Полный сброс")
 
 @dp.callback_query(F.data == "back_to_focus")
 async def back_to_focus_cb(callback):
@@ -1119,8 +1575,7 @@ async def back_to_focus_cb(callback):
         await callback.message.answer(text, reply_markup=kb)
         await callback.answer()
         return
-    tasks_state = await get_tasks_state(tg_id)
-    text, kb = build_focus(tasks_state, exp)
+    text, kb = await build_focus_for_user(tg_id, exp)
     await safe_edit(callback.message, text, kb)
     await callback.answer()
 
@@ -1166,9 +1621,53 @@ async def any_message_router(message: Message):
         reminders = await get_reminders_enabled(tg_id)
         await message.answer(
             f"Ок. Дата релиза: {format_date_ru(d)}",
-            reply_markup=build_timeline_kb(reminders),
+            reply_markup=build_timeline_kb(reminders, has_date=True),
         )
         await message.answer(timeline_text(d, reminders), reply_markup=menu_keyboard())
+        return
+
+    if form_name == "pitch_texts":
+        step = int(form["step"])
+        data = form["data"]
+        if step < 0 or step >= len(TEXT_FORM_STEPS):
+            await form_clear(tg_id)
+            await message.answer("Форма сброшена. Нажми «✍️ Тексты» ещё раз.", reply_markup=menu_keyboard())
+            return
+        key, prompt, *rest = TEXT_FORM_STEPS[step]
+        optional = rest[0] if rest else False
+        value = txt.strip()
+        if not value and optional:
+            data[key] = ""
+        elif len(value) < 2:
+            await message.answer(prompt + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+            return
+        else:
+            data[key] = value
+
+        step += 1
+        if step < len(TEXT_FORM_STEPS):
+            await form_set(tg_id, step, data)
+            await message.answer(TEXT_FORM_STEPS[step][1] + "\n\n(Отмена: /cancel)", reply_markup=menu_keyboard())
+            return
+
+        texts = generate_pitch_texts(data)
+        await form_start(tg_id, "pitch_texts_ready")
+        await form_set(tg_id, 0, {"texts": texts})
+
+        for idx, text in enumerate(texts, start=1):
+            await message.answer(f"Вариант {idx}:\n{text}", reply_markup=menu_keyboard())
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Скопировать 1", callback_data="texts:copy:0")],
+                [InlineKeyboardButton(text="📋 Скопировать 2", callback_data="texts:copy:1")],
+                [InlineKeyboardButton(text="📋 Скопировать 3", callback_data="texts:copy:2")],
+                [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
+            ]
+        )
+        await message.answer("Выбери, что скопировать:", reply_markup=kb)
+        return
+
+    if form_name == "pitch_texts_ready":
         return
 
     if form_name != "label_submit":
@@ -1228,6 +1727,11 @@ async def any_message_router(message: Message):
 
     if not sent_email:
         await message.answer(f"Почта: {LABEL_EMAIL}\n\nТекст письма (скопируй):\n\n{summary}", reply_markup=kb)
+
+    await message.answer(
+        "Заявка принята. Срок ответа: 7 дней. Если нет ответа — значит не подошло/не актуально.",
+        reply_markup=menu_keyboard(),
+    )
 
     await form_clear(tg_id)
 
