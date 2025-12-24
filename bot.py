@@ -1166,7 +1166,8 @@ async def start(message: Message):
     menu_kb = await user_menu_keyboard(tg_id)
     if exp == "unknown":
         text, kb = experience_prompt()
-        await message.answer(text, reply_markup=menu_kb)
+        await message.answer("ИСКРА активна. Жми кнопки меню снизу 👇", reply_markup=menu_kb)
+        await message.answer(text, reply_markup=kb)
         return
 
     await message.answer("ИСКРА активна. Жми кнопки меню снизу 👇", reply_markup=menu_kb)
@@ -1718,11 +1719,31 @@ async def any_message_router(message: Message):
         return
 
     tg_id = message.from_user.id
+    await ensure_user(tg_id, message.from_user.username)
+
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        lower = txt.lower()
+        inferred: str | None = None
+        if "уже" in lower or "не первый" in lower:
+            inferred = "old"
+        elif "перв" in lower:
+            inferred = "first"
+
+        if not inferred:
+            text, kb = experience_prompt()
+            await message.answer(text, reply_markup=kb)
+            return
+
+        await set_experience(tg_id, inferred)
+        await message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=await user_menu_keyboard(tg_id))
+        focus_text, kb = await build_focus_for_user(tg_id, inferred)
+        await message.answer(focus_text, reply_markup=kb)
+        return
+
     form = await form_get(tg_id)
     if not form:
         return
-
-    await ensure_user(tg_id)
 
     form_name = form.get("form_name")
     if form_name == "release_date":
