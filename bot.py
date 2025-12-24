@@ -450,7 +450,6 @@ def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> t
 
     if not next_task:
         lines.append("✨ Всё выполнено. Поздравляю с закрытием релиза.")
-        rows.append([InlineKeyboardButton(text="🧹 Сброс", callback_data="reset_menu")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     task_id, title = next_task
@@ -473,19 +472,16 @@ def build_focus(tasks_state: dict[int, int], experience: str | None = None) -> t
         for t in upcoming:
             lines.append(f"▫️ {t}")
 
-    rows.append([InlineKeyboardButton(text=f"✅ Сделано: {title}", callback_data=f"focus_done:{task_id}")])
+    is_done = tasks_state.get(task_id, 0) == 1
+    rows.append([
+        InlineKeyboardButton(
+            text=(
+                f"↩️ Отменить: {title}" if is_done else f"✅ Сделано: {title}"
+            ),
+            callback_data=f"focus_done:{task_id}"
+        )
+    ])
     rows.append([InlineKeyboardButton(text="❓ Пояснение", callback_data=f"help:{task_id}")])
-    rows.append([
-        InlineKeyboardButton(text="📋 Задачи по разделам", callback_data="sections:open"),
-        InlineKeyboardButton(text="🧾 Кабинеты", callback_data="accounts:open"),
-    ])
-    rows.append([
-        InlineKeyboardButton(text="📅 Таймлайн", callback_data="timeline"),
-        InlineKeyboardButton(text="🔗 Ссылки", callback_data="links"),
-    ])
-    rows.append([InlineKeyboardButton(text="📩 Запросить дистрибуцию", callback_data="label:start")])
-    rows.append([InlineKeyboardButton(text="💫 Поддержать ИСКРУ", callback_data="donate:menu")])
-    rows.append([InlineKeyboardButton(text="🧹 Сброс", callback_data="reset_menu")])
 
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
