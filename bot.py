@@ -266,13 +266,13 @@ def menu_keyboard(updates_enabled: bool | None = None) -> ReplyKeyboardMarkup:
     updates_text = "🔔 Обновления: Вкл" if updates_enabled is not False else "🔔 Обновления: Выкл"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🎯 План"), KeyboardButton(text="📋 Задачи по разделам")],
-            [KeyboardButton(text="🧾 Кабинеты"), KeyboardButton(text="📅 Таймлайн")],
-            [KeyboardButton(text="🗓️ Установить дату"), KeyboardButton(text="🔗 Ссылки")],
-            [KeyboardButton(text="📩 Запросить дистрибуцию"), KeyboardButton(text="📤 Экспорт")],
-            [KeyboardButton(text="💫 Поддержать ИСКРУ"), KeyboardButton(text="🧠 Ожидания")],
-            [KeyboardButton(text="🧹 Сброс")],
-            [KeyboardButton(text="🆕 Что нового"), KeyboardButton(text=updates_text)],
+            [KeyboardButton(text="🎯 План"), KeyboardButton(text="📦 Задачи по разделам")],
+            [KeyboardButton(text="📅 Таймлайн"), KeyboardButton(text="⏰ Дата релиза")],
+            [KeyboardButton(text="🔗 Ссылки"), KeyboardButton(text="👤 Кабинеты")],
+            [KeyboardButton(text="🧾 Экспорт"), KeyboardButton(text="📩 Запросить дистрибуцию")],
+            [KeyboardButton(text="📰 Что нового"), KeyboardButton(text=updates_text)],
+            [KeyboardButton(text="💫 Поддержать ИСКРУ")],
+            [KeyboardButton(text="🔄 Сброс")],
         ],
         resize_keyboard=True
     )
@@ -721,7 +721,7 @@ def build_focus(
 
 def build_sections_menu(tasks_state: dict[int, int]) -> tuple[str, InlineKeyboardMarkup]:
     done, total = count_progress(tasks_state)
-    text = f"📋 Задачи по разделам\nПрогресс: {done}/{total}\n\nВыбери раздел:"
+    text = f"📦 Задачи по разделам\nПрогресс: {done}/{total}\n\nВыбери раздел:"
     inline = []
     for sid, title, ids in SECTIONS:
         section_done = sum(1 for tid in ids if tasks_state.get(tid, 0) == 1)
@@ -797,7 +797,7 @@ def build_important_screen(tasks_state: dict[int, int], important_ids: set[int])
     return "\n".join(text_lines), InlineKeyboardMarkup(inline_keyboard=inline)
 
 def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, InlineKeyboardMarkup]:
-    text = "🧾 Кабинеты артиста\nСостояния: ▫️ → ⏳ → ✅\n\n"
+    text = "👤 Кабинеты артиста\nСостояния: ▫️ → ⏳ → ✅\n\n"
     for key, name in ACCOUNTS:
         v = accounts_state.get(key, 0)
         emoji = "▫️" if v == 0 else ("⏳" if v == 1 else "✅")
@@ -1260,7 +1260,7 @@ async def broadcast_update(message: Message, bot: Bot):
 async def rb_plan(message: Message):
     await plan_cmd(message)
 
-@dp.message(F.text == "📋 Задачи по разделам")
+@dp.message(F.text == "📦 Задачи по разделам")
 async def rb_sections(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
@@ -1268,7 +1268,7 @@ async def rb_sections(message: Message):
     text, kb = build_sections_menu(tasks_state)
     await message.answer(text, reply_markup=kb)
 
-@dp.message(F.text == "🧾 Кабинеты")
+@dp.message(F.text == "👤 Кабинеты")
 async def rb_accounts(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
@@ -1285,7 +1285,7 @@ async def rb_timeline(message: Message):
     reminders = await get_reminders_enabled(tg_id)
     await message.answer(timeline_text(d, reminders), reply_markup=build_timeline_kb(reminders, has_date=bool(d)))
 
-@dp.message(F.text == "🗓️ Установить дату")
+@dp.message(F.text == "⏰ Дата релиза")
 async def rb_set_date_hint(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
@@ -1299,12 +1299,12 @@ async def rb_links(message: Message):
 async def rb_expectations(message: Message):
     await message.answer(expectations_text(), reply_markup=await user_menu_keyboard(message.from_user.id))
 
-@dp.message(F.text == "🆕 Что нового")
+@dp.message(F.text == "📰 Что нового")
 async def rb_whats_new(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
     if UPDATES_POST_URL:
-        text = f"🆕 Что нового: {UPDATES_POST_URL}"
+        text = f"📰 Что нового: {UPDATES_POST_URL}"
     else:
         text = f"{UPDATES_CHANNEL_URL}\nПоследнее обновление — в закреплённом посте канала."
     await message.answer(text, reply_markup=await user_menu_keyboard(tg_id))
@@ -1317,11 +1317,11 @@ async def rb_toggle_updates(message: Message):
     reply = "Ок, обновления включены ✅" if enabled else "Ок, обновления выключены ❌"
     await message.answer(reply, reply_markup=await user_menu_keyboard(tg_id))
 
-@dp.message(F.text == "🧹 Сброс")
+@dp.message(F.text == "🔄 Сброс")
 async def rb_reset(message: Message):
     await message.answer("⚠️ Сбросить чеклист?", reply_markup=build_reset_menu_kb())
 
-@dp.message(F.text == "📤 Экспорт")
+@dp.message(F.text == "🧾 Экспорт")
 async def rb_export(message: Message):
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
@@ -1603,7 +1603,7 @@ async def texts_copy_cb(callback):
 
 @dp.callback_query(F.data == "reset_menu")
 async def reset_menu_cb(callback):
-    await safe_edit(callback.message, "🧹 Сброс", build_reset_menu_kb())
+    await safe_edit(callback.message, "🔄 Сброс", build_reset_menu_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "important:list")
