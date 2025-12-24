@@ -8,6 +8,7 @@ import smtplib
 from email.mime.text import MIMEText
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 
 DB_PATH = "bot.db"
 LABEL_EMAIL = "sreda.records@gmail.com"
+REMINDER_INTERVAL_SECONDS = 300
 
 # -------------------- CONFIG --------------------
 
@@ -140,6 +142,16 @@ SECTIONS = [
     ("content", "6) Контент", [20, 21, 22, 23, 24]),
 ]
 
+DEADLINES = [
+    {"key": "pitching", "title": "Pitching (Spotify / Яндекс / VK / Звук / МТС-КИОН)", "offset": -14},
+    {"key": "presave", "title": "Pre-save", "offset": -7},
+    {"key": "bandlink", "title": "BandLink / Smartlink", "offset": -7},
+    {"key": "content_sprint", "title": "Контент-спринт ДО — старт", "offset": -14},
+    {"key": "post_1", "title": "Пост-релиз план (+1)", "offset": 1},
+    {"key": "post_3", "title": "Пост-релиз план (+3)", "offset": 3},
+    {"key": "post_7", "title": "Пост-релиз план (+7)", "offset": 7},
+]
+
 HELP = {
     1: "Определи 1 цель: подписчики / плейлисты / медиа / деньги / проверка гипотезы. Это задаёт весь план.",
     2: "Проверь права: кто автор текста/музыки, кому принадлежит бит, есть ли разрешение на семплы.",
@@ -228,7 +240,29 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS users (
             tg_id INTEGER PRIMARY KEY,
             experience TEXT DEFAULT 'unknown',
-            release_date TEXT DEFAULT NULL
+            username TEXT,
+            release_date TEXT DEFAULT NULL,
+            reminders_enabled INTEGER DEFAULT 1
+        )
+        """)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN reminders_enabled INTEGER DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN release_date TEXT")
+        except Exception:
+            pass
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS reminder_log (
+            tg_id INTEGER,
+            key TEXT,
+            "when" TEXT,
+            PRIMARY KEY (tg_id, key, "when")
         )
         """)
         await db.execute("""
@@ -257,9 +291,11 @@ async def init_db():
         """)
         await db.commit()
 
-async def ensure_user(tg_id: int):
+async def ensure_user(tg_id: int, username: str | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR IGNORE INTO users (tg_id) VALUES (?)", (tg_id,))
+        if username is not None:
+            await db.execute("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
         for task_id, _ in TASKS:
             await db.execute("INSERT OR IGNORE INTO user_tasks (tg_id, task_id) VALUES (?, ?)", (tg_id, task_id))
         for key, _ in ACCOUNTS:
@@ -280,6 +316,7 @@ async def set_experience(tg_id: int, exp: str):
 async def set_release_date(tg_id: int, date_str: str | None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET release_date=? WHERE tg_id=?", (date_str, tg_id))
+        await db.execute("DELETE FROM reminder_log WHERE tg_id=?", (tg_id,))
         await db.commit()
 
 async def get_release_date(tg_id: int) -> str | None:
@@ -287,6 +324,17 @@ async def get_release_date(tg_id: int) -> str | None:
         cur = await db.execute("SELECT release_date FROM users WHERE tg_id=?", (tg_id,))
         row = await cur.fetchone()
         return row[0] if row and row[0] else None
+
+async def set_reminders_enabled(tg_id: int, enabled: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET reminders_enabled=? WHERE tg_id=?", (1 if enabled else 0, tg_id))
+        await db.commit()
+
+async def get_reminders_enabled(tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT reminders_enabled FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        return bool(row[0]) if row and row[0] is not None else True
 
 async def get_tasks_state(tg_id: int) -> dict[int, int]:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -519,17 +567,38 @@ def build_links_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]
     ])
 
-def timeline_text(release_date: dt.date | None) -> str:
+def build_timeline_kb(reminders_enabled: bool) -> InlineKeyboardMarkup:
+    toggle_text = "🔔 Напоминания: Вкл" if reminders_enabled else "🔔 Напоминания: Выкл"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=toggle_text, callback_data="reminders:toggle")],
+            [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")],
+        ]
+    )
+
+def build_deadlines(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
+    items: list[tuple[str, str, dt.date]] = []
+    for d in DEADLINES:
+        items.append((d["key"], d["title"], release_date + dt.timedelta(days=d["offset"])))
+    return sorted(items, key=lambda x: x[2])
+
+
+def timeline_text(release_date: dt.date | None, reminders_enabled: bool = True) -> str:
     if not release_date:
         return "📅 Таймлайн\n\nДата релиза не задана.\nУстанови: /set_date ДД.ММ.ГГГГ\nПример: /set_date 31.12.2025"
-    pitch = release_date - dt.timedelta(days=14)
-    after_end = release_date + dt.timedelta(days=7)
-    return (
-        "📅 Таймлайн\n\n"
-        f"Дата релиза: {format_date_ru(release_date)}\n"
-        f"Питчинг: до {format_date_ru(pitch)} (−14)\n"
-        f"После релиза: {format_date_ru(release_date)} → {format_date_ru(after_end)}\n"
-    )
+
+    lines = ["📅 Таймлайн", "", f"Дата релиза: {format_date_ru(release_date)}"]
+    lines.append(f"Напоминания: {'включены' if reminders_enabled else 'выключены'}")
+    lines.append("")
+    lines.append("Ближайшие дедлайны:")
+
+    today = dt.date.today()
+    for _, title, d in build_deadlines(release_date):
+        delta = (d - today).days
+        delta_text = " (сегодня)" if delta == 0 else (f" (через {delta} дн)" if delta > 0 else f" ({abs(delta)} дн назад)")
+        lines.append(f"▫️ {format_date_ru(d)} — {title}{delta_text}")
+
+    return "\n".join(lines)
 
 def build_reset_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -555,6 +624,71 @@ async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None
         except Exception as answer_err:
             print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
             return None
+
+# -------------------- Reminders --------------------
+
+async def was_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when: str) -> bool:
+    cur = await db.execute(
+        "SELECT 1 FROM reminder_log WHERE tg_id=? AND key=? AND \"when\"=?",
+        (tg_id, key, when)
+    )
+    row = await cur.fetchone()
+    return row is not None
+
+
+async def mark_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when: str):
+    await db.execute(
+        "INSERT OR IGNORE INTO reminder_log (tg_id, key, \"when\") VALUES (?, ?, ?)",
+        (tg_id, key, when)
+    )
+
+
+def build_deadline_messages(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
+    messages: list[tuple[str, str, dt.date]] = []
+    for key, title, d in build_deadlines(release_date):
+        messages.append((key, title, d))
+    return messages
+
+
+async def process_reminders(bot: Bot):
+    today = dt.date.today()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT tg_id, username, release_date FROM users WHERE reminders_enabled=1 AND release_date IS NOT NULL"
+        )
+        users = await cur.fetchall()
+
+        for tg_id, _username, rd_s in users:
+            rd = parse_date(rd_s)
+            if not rd:
+                continue
+            deadlines = build_deadline_messages(rd)
+            for key, title, ddate in deadlines:
+                for when_label, send_date, prefix in (
+                    ("pre2", ddate - dt.timedelta(days=2), "⏳ Через 2 дня дедлайн: " + title),
+                    ("day0", ddate, "🚨 Сегодня дедлайн: " + title),
+                ):
+                    if today != send_date:
+                        continue
+                    if await was_reminder_sent(db, tg_id, key, when_label):
+                        continue
+                    try:
+                        await bot.send_message(tg_id, prefix)
+                        await mark_reminder_sent(db, tg_id, key, when_label)
+                    except TelegramForbiddenError:
+                        continue
+                    except Exception:
+                        continue
+        await db.commit()
+
+
+async def reminder_scheduler(bot: Bot):
+    while True:
+        try:
+            await process_reminders(bot)
+        except Exception as e:
+            print(f"[reminder_scheduler] error: {e}")
+        await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
 
 # -------------------- Email send (optional) --------------------
 
@@ -641,7 +775,7 @@ def validate_label_input(key: str, raw: str) -> tuple[bool, str | None, str | No
 @dp.message(CommandStart())
 async def start(message: Message):
     tg_id = message.from_user.id
-    await ensure_user(tg_id)
+    await ensure_user(tg_id, message.from_user.username)
 
     exp = await get_experience(tg_id)
     if exp == "unknown":
@@ -658,7 +792,7 @@ async def start(message: Message):
 @dp.message(Command("plan"))
 async def plan_cmd(message: Message):
     tg_id = message.from_user.id
-    await ensure_user(tg_id)
+    await ensure_user(tg_id, message.from_user.username)
     exp = await get_experience(tg_id)
     if exp == "unknown":
         text, kb = experience_prompt()
@@ -672,17 +806,24 @@ async def plan_cmd(message: Message):
 @dp.message(Command("set_date"))
 async def set_date_cmd(message: Message):
     tg_id = message.from_user.id
-    await ensure_user(tg_id)
+    await ensure_user(tg_id, message.from_user.username)
     parts = message.text.strip().split(maxsplit=1)
     if len(parts) != 2:
-        await message.answer("Формат: /set_date ДД.ММ.ГГГГ\nПример: /set_date 31.12.2025", reply_markup=menu_keyboard())
+        await form_start(tg_id, "release_date")
+        await message.answer(
+            "Введи дату релиза в формате ДД.ММ.ГГГГ.\nПример: 31.12.2025\n\nОтмена: /cancel",
+            reply_markup=menu_keyboard(),
+        )
         return
     d = parse_date(parts[1])
     if not d:
         await message.answer("Не понял дату. Пример: /set_date 31.12.2025", reply_markup=menu_keyboard())
         return
     await set_release_date(tg_id, d.isoformat())
-    await message.answer(f"Ок. Дата релиза: {format_date_ru(d)}", reply_markup=menu_keyboard())
+    await form_clear(tg_id)
+    reminders = await get_reminders_enabled(tg_id)
+    await message.answer(f"Ок. Дата релиза: {format_date_ru(d)}", reply_markup=build_timeline_kb(reminders))
+    await message.answer(timeline_text(d, reminders), reply_markup=menu_keyboard())
 
 @dp.message(Command("cancel"))
 async def cancel(message: Message):
@@ -698,7 +839,7 @@ async def rb_plan(message: Message):
 @dp.message(F.text == "📋 Задачи по разделам")
 async def rb_sections(message: Message):
     tg_id = message.from_user.id
-    await ensure_user(tg_id)
+    await ensure_user(tg_id, message.from_user.username)
     tasks_state = await get_tasks_state(tg_id)
     text, kb = build_sections_menu(tasks_state)
     await message.answer(text, reply_markup=kb)
@@ -706,7 +847,7 @@ async def rb_sections(message: Message):
 @dp.message(F.text == "🧾 Кабинеты")
 async def rb_accounts(message: Message):
     tg_id = message.from_user.id
-    await ensure_user(tg_id)
+    await ensure_user(tg_id, message.from_user.username)
     acc = await get_accounts_state(tg_id)
     text, kb = build_accounts_checklist(acc)
     await message.answer(text, reply_markup=kb)
@@ -714,10 +855,11 @@ async def rb_accounts(message: Message):
 @dp.message(F.text == "📅 Таймлайн")
 async def rb_timeline(message: Message):
     tg_id = message.from_user.id
-    await ensure_user(tg_id)
+    await ensure_user(tg_id, message.from_user.username)
     rd = await get_release_date(tg_id)
     d = parse_date(rd) if rd else None
-    await message.answer(timeline_text(d), reply_markup=menu_keyboard())
+    reminders = await get_reminders_enabled(tg_id)
+    await message.answer(timeline_text(d, reminders), reply_markup=build_timeline_kb(reminders))
 
 @dp.message(F.text == "🗓️ Установить дату")
 async def rb_set_date_hint(message: Message):
@@ -738,7 +880,7 @@ async def rb_reset(message: Message):
 @dp.message(F.text == "📤 Экспорт")
 async def rb_export(message: Message):
     tg_id = message.from_user.id
-    await ensure_user(tg_id)
+    await ensure_user(tg_id, message.from_user.username)
     await send_export_invoice(message)
 
 @dp.message(F.text == "📩 Запросить дистрибуцию")
@@ -927,9 +1069,23 @@ async def timeline_cb(callback):
     await ensure_user(tg_id)
     rd = await get_release_date(tg_id)
     d = parse_date(rd) if rd else None
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]])
-    await safe_edit(callback.message, timeline_text(d), kb)
+    reminders = await get_reminders_enabled(tg_id)
+    kb = build_timeline_kb(reminders)
+    await safe_edit(callback.message, timeline_text(d, reminders), kb)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "reminders:toggle")
+async def reminders_toggle_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    current = await get_reminders_enabled(tg_id)
+    await set_reminders_enabled(tg_id, not current)
+    rd = await get_release_date(tg_id)
+    d = parse_date(rd) if rd else None
+    kb = build_timeline_kb(not current)
+    await safe_edit(callback.message, timeline_text(d, not current), kb)
+    await callback.answer("Напоминания обновлены")
 
 @dp.callback_query(F.data == "links")
 async def links_cb(callback):
@@ -995,10 +1151,32 @@ async def any_message_router(message: Message):
 
     tg_id = message.from_user.id
     form = await form_get(tg_id)
-    if not form or form.get("form_name") != "label_submit":
+    if not form:
         return
 
     await ensure_user(tg_id)
+
+    form_name = form.get("form_name")
+    if form_name == "release_date":
+        d = parse_date(txt)
+        if not d:
+            await message.answer(
+                "Не понял дату. Формат: ДД.ММ.ГГГГ. Пример: 31.12.2025\n\nПопробуй ещё раз:",
+                reply_markup=menu_keyboard(),
+            )
+            return
+        await set_release_date(tg_id, d.isoformat())
+        await form_clear(tg_id)
+        reminders = await get_reminders_enabled(tg_id)
+        await message.answer(
+            f"Ок. Дата релиза: {format_date_ru(d)}",
+            reply_markup=build_timeline_kb(reminders),
+        )
+        await message.answer(timeline_text(d, reminders), reply_markup=menu_keyboard())
+        return
+
+    if form_name != "label_submit":
+        return
 
     step = int(form["step"])
     data = form["data"]
@@ -1064,6 +1242,7 @@ async def main():
         raise RuntimeError("BOT_TOKEN не задан.")
     await init_db()
     bot = Bot(token=TOKEN)
+    asyncio.create_task(reminder_scheduler(bot))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
