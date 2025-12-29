@@ -38,6 +38,11 @@ SMARTLINK_PLATFORMS = [
     ("deezer", "Deezer"),
 ]
 
+EXTRA_SMARTLINK_PLATFORMS = [
+    ("itunes", "iTunes"),
+    ("kion", "MTS Music / КИОН"),
+]
+
 
 def smartlink_step_prompt(step: int) -> str:
     total = 5 + len(SMARTLINK_PLATFORMS)
@@ -60,6 +65,18 @@ def smartlink_step_prompt(step: int) -> str:
 BANDLINK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+SONGLINK_API_URL = "https://api.song.link/v1-alpha.1/links"
+
+RESOLVER_FALLBACK_TEXT = (
+    "BandLink открывается через JS, поэтому бот иногда не видит кнопки.\n"
+    "Сделай так:\n"
+    "1) Открой BandLink в браузере\n"
+    "2) Зажми кнопку ‘Слушать’ нужной платформы (Spotify/Apple/Яндекс)\n"
+    "3) Нажми ‘Копировать адрес ссылки’\n"
+    "4) Пришли эту ссылку сюда — я подтяну остальные.\n\n"
+    "Если не получится, добавь ссылки вручную."
 )
 
 # -------------------- CONFIG --------------------
@@ -1087,6 +1104,50 @@ def _normalize_music_url(url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(cleaned_query), fragment=""))
 
 
+async def resolve_links(url: str) -> dict[str, str]:
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    platform_aliases = {
+        "spotify": "spotify",
+        "applemusic": "apple",
+        "itunes": "itunes",
+        "youtubemusic": "youtube",
+        "youtube": "youtube",
+        "yandex": "yandex",
+        "yandexmusic": "yandex",
+        "vk": "vk",
+        "zvuk": "zvuk",
+        "kion": "kion",
+        "mts": "kion",
+    }
+
+    def collect(platforms: dict, acc: dict[str, str]):
+        for platform_key, info in (platforms or {}).items():
+            normalized_platform = platform_aliases.get(platform_key.lower())
+            normalized_url = _normalize_music_url((info or {}).get("url") or "")
+            if normalized_platform and normalized_url and normalized_platform not in acc:
+                acc[normalized_platform] = normalized_url
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
+            async with session.get(SONGLINK_API_URL, params={"url": url}) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json()
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return {}
+    except Exception:
+        return {}
+
+    links: dict[str, str] = {}
+    collect(data.get("linksByPlatform") or {}, links)
+
+    for entity in (data.get("entitiesByUniqueId") or {}).values():
+        collect((entity or {}).get("linksByPlatform") or {}, links)
+
+    return links
+
+
 def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
     links: dict[str, str] = {}
     for href in re.findall(r"href=['\"]([^'\"]+)", html_content):
@@ -1268,7 +1329,7 @@ def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str
 def build_smartlink_buttons(smartlink: dict, subscribed: bool = False, can_remind: bool = False) -> InlineKeyboardMarkup | None:
     rows: list[list[InlineKeyboardButton]] = []
     links = smartlink.get("links") or {}
-    for key, label in SMARTLINK_PLATFORMS:
+    for key, label in [*SMARTLINK_PLATFORMS, *EXTRA_SMARTLINK_PLATFORMS]:
         url = links.get(key)
         if url:
             rows.append([InlineKeyboardButton(text=label, url=url)])
@@ -1290,7 +1351,7 @@ def build_copy_links_text(smartlink: dict) -> str:
     lines = [f"{artist} — {title}"]
 
     link_lines: list[str] = []
-    for key, label in SMARTLINK_PLATFORMS:
+    for key, label in [*SMARTLINK_PLATFORMS, *EXTRA_SMARTLINK_PLATFORMS]:
         url = links.get(key)
         if url:
             display_label = "YouTube" if key == "youtube" else label
@@ -2127,7 +2188,7 @@ async def smartlink_open_cb(callback):
         if SPOTIFY_UPC_ENABLED:
             inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
         inline_keyboard.extend([
-            [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
+            [InlineKeyboardButton(text="⚡ Импорт по ссылке", callback_data="smartlink:import")],
             [InlineKeyboardButton(text="✏️ Создать вручную", callback_data="smartlink:new")],
             [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
         ])
@@ -2144,7 +2205,7 @@ async def smartlink_open_cb(callback):
     if SPOTIFY_UPC_ENABLED:
         inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
     inline_keyboard.extend([
-        [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
+        [InlineKeyboardButton(text="⚡ Импорт по ссылке", callback_data="smartlink:import")],
         [InlineKeyboardButton(text="✏️ Обновить", callback_data="smartlink:new")],
         [InlineKeyboardButton(text="✍️ Изменить текст", callback_data="smartlink:caption_edit")],
         [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
@@ -2185,7 +2246,10 @@ async def smartlink_import_cb(callback):
     await ensure_user(tg_id)
     await form_start(tg_id, "smartlink_import")
     await callback.message.answer(
-        "Пришли ссылку BandLink. Постараюсь вытащить ссылки на площадки автоматически.\n\nОтмена: /cancel",
+        "Пришли ссылку на трек: BandLink / Spotify / Apple Music / YouTube.\n"
+        "Я попробую подтянуть все площадки автоматически.\n"
+        "Если BandLink не отдаст ссылки — подскажу, как скопировать одну кнопку платформы.\n\n"
+        "Отмена: /cancel",
         reply_markup=await user_menu_keyboard(tg_id),
     )
     await callback.answer()
@@ -2557,13 +2621,12 @@ async def any_message_router(message: Message):
     if form_name == "smartlink_import":
         if not re.match(r"https?://", txt):
             await message.answer(
-                "Нужна ссылка BandLink (http/https).\n\nОтмена: /cancel",
+                "Нужна ссылка (http/https).\n\nОтмена: /cancel",
                 reply_markup=await user_menu_keyboard(tg_id),
             )
             return
 
-        html_content = await fetch_bandlink_html(txt)
-        links = extract_links_from_bandlink(html_content or "") if html_content else {}
+        links = await resolve_links(txt)
 
         if len(links) >= 2:
             latest = await get_latest_smartlink(tg_id)
@@ -2592,24 +2655,23 @@ async def any_message_router(message: Message):
                 subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
                 await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
                 await message.answer(
-                    "Импортировал ссылки из BandLink. Смартлинк обновлён.",
+                    "Импортировал ссылки по ссылке. Смартлинк обновлён.",
                     reply_markup=await user_menu_keyboard(tg_id),
                 )
                 await form_clear(tg_id)
                 return
 
             await message.answer(
-                "Нашёл ссылки в BandLink. Давай заполним карточку и обложку — ссылки уже подставлены.",
+                "Нашёл ссылки. Давай заполним карточку и обложку — ссылки уже подставлены.",
                 reply_markup=await user_menu_keyboard(tg_id),
             )
             await start_smartlink_form(message, tg_id, initial_links=links)
             return
 
         await message.answer(
-            "Не удалось извлечь ссылки, добавь вручную.",
+            RESOLVER_FALLBACK_TEXT,
             reply_markup=await user_menu_keyboard(tg_id),
         )
-        await start_smartlink_form(message, tg_id)
         return
 
     if form_name == "smartlink":
