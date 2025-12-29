@@ -91,6 +91,7 @@ SONGLINK_PLATFORM_ALIASES = {
     "itunes": "itunes",
     "youtubemusic": "youtubemusic",
     "youtube": "youtube",
+    "deezer": "deezer",
     "yandex": "yandex",
     "yandexmusic": "yandex",
     "vk": "vk",
@@ -1369,6 +1370,8 @@ def detect_platform(url: str) -> str | None:
         return "itunes"
     if netloc in {"music.vk.com", "music.vk.ru"}:
         return "vk"
+    if netloc == "deezer.com":
+        return "deezer"
     if netloc in {"youtube.com", "youtu.be"}:
         return "youtube"
     if netloc == "music.youtube.com":
@@ -1412,6 +1415,8 @@ def _normalize_platform_key(value: str | None) -> str | None:
         return None
     if cleaned in {"youtubemusic", "ytmusic"}:
         cleaned = "youtubemusic"
+    if cleaned == "deezer":
+        return "deezer"
     return SONGLINK_PLATFORM_ALIASES.get(cleaned, cleaned)
 
 
@@ -1505,7 +1510,7 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
             class_tokens = {token.strip().lower() for token in class_attr.split() if token.strip()}
             platform_hint = None
             for token in class_tokens:
-                if token in {"yandex", "vk", "spotify", "apple", "itunes", "zvuk", "kion", "youtube", "youtubemusic"}:
+                if token in {"yandex", "vk", "spotify", "apple", "itunes", "zvuk", "kion", "youtube", "youtubemusic", "deezer"}:
                     platform_hint = token
                     break
             add_link(href, platform_hint)
@@ -1739,6 +1744,8 @@ def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
             platform = "youtubemusic"
         elif netloc in {"youtube.com", "youtu.be"}:
             platform = "youtube"
+        elif netloc == "deezer.com":
+            platform = "deezer"
 
         if platform and platform not in links:
             links[platform] = normalized
@@ -2056,11 +2063,21 @@ async def apply_caption_update(message: Message, tg_id: int, smartlink_id: int, 
     await form_clear(tg_id)
 
 
-def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str:
+ATTRIBUTION_HTML = 'Сделано с помощью <a href="https://t.me/iskramusic_bot">ИСКРЫ</a>'
+
+
+def build_smartlink_caption(
+    smartlink: dict, release_today: bool = False, show_listen_label: bool | None = None
+) -> str:
     artist = html.escape(smartlink.get("artist") or "")
     title = html.escape(smartlink.get("title") or "")
     caption_text = html.escape(smartlink.get("caption_text") or "")
     release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
+
+    links = smartlink.get("links") or {}
+    has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
+    include_listen = show_listen_label if show_listen_label is not None else has_platforms
+
     if release_today:
         lines = [f"{artist} — {title}"]
         lines.append("🎉 Сегодня релиз!")
@@ -2069,7 +2086,10 @@ def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str
         if caption_text:
             lines.append(caption_text)
         lines.append("")
-        lines.append("Сделано с помощью ИСКРЫ — @iskramusic_bot")
+        lines.append(ATTRIBUTION_HTML)
+        if include_listen:
+            lines.append("")
+            lines.append("▶️ Слушать:")
         return "\n".join(lines)
 
     lines = [f"{artist} — {title}"]
@@ -2078,7 +2098,10 @@ def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str
     if caption_text:
         lines.append(caption_text)
     lines.append("")
-    lines.append("Сделано с помощью ИСКРЫ — @iskramusic_bot")
+    lines.append(ATTRIBUTION_HTML)
+    if include_listen:
+        lines.append("")
+        lines.append("▶️ Слушать:")
     return "\n".join(lines)
 
 
@@ -2093,7 +2116,6 @@ def build_smartlink_buttons(smartlink: dict, subscribed: bool = False, can_remin
             platform_rows.append([InlineKeyboardButton(text=label, url=url)])
 
     if platform_rows:
-        rows.append([InlineKeyboardButton(text="▶️ Слушать:", callback_data="smartlink:listen_label")])
         rows.extend(platform_rows)
 
     bandlink_url = links.get("bandlink")
@@ -3405,11 +3427,6 @@ async def smartlink_toggle_cb(callback):
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Напомню" if not current else "Напоминание выключено")
-
-
-@dp.callback_query(F.data == "smartlink:listen_label")
-async def smartlink_listen_label_cb(callback):
-    await callback.answer()
 
 
 @dp.callback_query(F.data.in_({"smartlink:caption_skip", "smartlink:skip"}))
