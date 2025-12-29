@@ -350,7 +350,6 @@ def menu_keyboard(updates_enabled: bool | None = None) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="➕ Создать смарт-линк")],
-            [KeyboardButton(text="📂 Мои смарт-линки")],
             [KeyboardButton(text="🧰 Инструменты"), KeyboardButton(text="❓ Помощь")],
             [KeyboardButton(text="⚙️ Настройки")],
         ],
