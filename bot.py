@@ -3,6 +3,7 @@ import os
 import json
 import datetime as dt
 import re
+import html
 import aiosqlite
 import smtplib
 from email.mime.text import MIMEText
@@ -961,16 +962,22 @@ def build_links_kb() -> InlineKeyboardMarkup:
 
 
 def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str:
-    artist = smartlink.get("artist") or ""
-    title = smartlink.get("title") or ""
+    artist = html.escape(smartlink.get("artist") or "")
+    title = html.escape(smartlink.get("title") or "")
     release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
     if release_today:
-        return f"🎉 Сегодня релиз: {artist} — {title}. Слушать 👇"
+        return "\n".join([
+            f"🎉 Сегодня релиз: {artist} — {title}. Слушать 👇",
+            "",
+            'Сделано с помощью <a href="https://t.me/iskramusic_bot">ИСКРА</a>',
+        ])
 
     lines = [f"{artist} — {title}"]
     if release_date:
         lines.append(f"Релиз: {format_date_ru(release_date)}")
     lines.append("Слушать 👇")
+    lines.append("")
+    lines.append('Сделано с помощью <a href="https://t.me/iskramusic_bot">ИСКРА</a>')
     return "\n".join(lines)
 
 
@@ -986,7 +993,30 @@ def build_smartlink_buttons(smartlink: dict, subscribed: bool = False, can_remin
         toggle_text = "✅ Напоминание включено" if subscribed else "🔔 Напомнить о релизе"
         rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"smartlink:toggle:{smartlink.get('id')}")])
 
+    rows.append([InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink.get('id')}")])
+
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def build_copy_links_text(smartlink: dict) -> str:
+    artist = smartlink.get("artist") or ""
+    title = smartlink.get("title") or ""
+    links = smartlink.get("links") or {}
+
+    lines = [f"{artist} — {title}"]
+
+    link_lines: list[str] = []
+    for key, label in SMARTLINK_PLATFORMS:
+        url = links.get(key)
+        if url:
+            display_label = "YouTube" if key == "youtube" else label
+            link_lines.append(f"{display_label}: {url}")
+
+    if link_lines:
+        lines.append("")
+        lines.extend(link_lines)
+
+    return "\n".join(lines)
 
 
 def smartlink_can_remind(smartlink: dict) -> bool:
@@ -1004,7 +1034,13 @@ async def send_smartlink_photo(
 ):
     caption = build_smartlink_caption(smartlink, release_today=release_today)
     kb = build_smartlink_buttons(smartlink, subscribed=subscribed, can_remind=allow_remind)
-    return await bot.send_photo(chat_id, photo=smartlink.get("cover_file_id"), caption=caption, reply_markup=kb)
+    return await bot.send_photo(
+        chat_id,
+        photo=smartlink.get("cover_file_id"),
+        caption=caption,
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 def build_timeline_kb(reminders_enabled: bool, has_date: bool = True) -> InlineKeyboardMarkup:
     toggle_text = "🔔 Напоминания: Вкл" if reminders_enabled else "🔔 Напоминания: Выкл"
@@ -1107,11 +1143,16 @@ async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None
 
 async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMarkup | None) -> Message | None:
     try:
-        await message.edit_caption(caption=caption, reply_markup=kb)
+        await message.edit_caption(caption=caption, reply_markup=kb, parse_mode="HTML")
         return message
     except Exception as edit_err:
         try:
-            return await message.answer_photo(photo=message.photo[-1].file_id if message.photo else None, caption=caption, reply_markup=kb)
+            return await message.answer_photo(
+                photo=message.photo[-1].file_id if message.photo else None,
+                caption=caption,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
         except Exception as answer_err:
             print(f"[safe_edit_caption] edit failed: {edit_err}; answer failed: {answer_err}")
             return None
@@ -1848,6 +1889,26 @@ async def smartlink_toggle_cb(callback):
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Напомню" if not current else "Напоминание выключено")
+
+
+@dp.callback_query(F.data.startswith("smartlinks:copy:"))
+async def smartlinks_copy_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer("Не понял", show_alert=True)
+        return
+
+    smartlink_id = int(parts[2])
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        await callback.answer("Ссылка не найдена", show_alert=True)
+        return
+
+    text = build_copy_links_text(smartlink)
+    await callback.message.answer(text)
+    await callback.answer("Готово")
 
 
 @dp.callback_query(F.data == "links:lyrics")
