@@ -52,19 +52,21 @@ PLATFORM_LABELS = {
     "bandlink": "BandLink",
 }
 
+HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
+
 
 def smartlink_step_prompt(step: int) -> str:
     total = 5 + len(SMARTLINK_PLATFORMS)
     if step == 0:
-        return f"🔗 Смартлинк. Шаг 1/{total}: артист?"
+        return f"🔗 Смартлинк. Шаг 1/{total}: артист? (можно «Пропустить»)."
     if step == 1:
-        return f"Шаг 2/{total}: название трека?"
+        return f"Шаг 2/{total}: название трека? (можно «Пропустить»)."
     if step == 2:
-        return f"Шаг 3/{total}: дата релиза (ДД.ММ.ГГГГ)?"
+        return f"Шаг 3/{total}: дата релиза (ДД.ММ.ГГГГ)? (можно «Пропустить»)."
     if step == 3:
-        return f"Шаг 4/{total}: пришли обложку (фото)."
+        return f"Шаг 4/{total}: пришли обложку (фото). Можно «Пропустить»."
     if step == 4:
-        return "✍️ Добавь короткий текст (необязательно). Отправь сообщением. Или нажми «Пропустить»."
+        return "✍️ Добавь короткий текст (необязательно). Отправь сообщением или нажми «Пропустить»."
     idx = step - 5
     if 0 <= idx < len(SMARTLINK_PLATFORMS):
         label = SMARTLINK_PLATFORMS[idx][1]
@@ -815,10 +817,7 @@ async def start_smartlink_form(
         await finalize_smartlink_form(message, tg_id, data)
         return
 
-    reply_markup = await user_menu_keyboard(tg_id)
-    if step == 4:
-        reply_markup = smartlink_caption_skip_kb()
-    await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=reply_markup)
+    await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_step_kb())
 
 
 # -------------------- Forms --------------------
@@ -1183,6 +1182,24 @@ def platform_label(platform: str) -> str:
     return PLATFORM_LABELS.get(platform, platform)
 
 
+def normalize_meta_value(value: str | None) -> str:
+    cleaned = (value or "").lower().strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = re.sub(r"\b(ep|album|single)\b", "", cleaned)
+    cleaned = re.sub(r"[^a-z0-9а-яё]+", "", cleaned)
+    return cleaned
+
+
+def filter_human_sources(sources: dict[str, dict]) -> dict[str, dict]:
+    filtered: dict[str, dict] = {}
+    for key, meta in (sources or {}).items():
+        normalized_key = SONGLINK_PLATFORM_ALIASES.get(key, key)
+        if normalized_key not in HUMAN_METADATA_PLATFORMS:
+            continue
+        filtered.setdefault(normalized_key, meta or {})
+    return filtered
+
+
 def _normalize_platform_key(value: str | None) -> str | None:
     if not value:
         return None
@@ -1456,9 +1473,12 @@ def merge_metadata(existing: dict | None, new: dict | None) -> dict:
 
     sources = merged.get("sources") or {}
     sources.update((new or {}).get("sources") or {})
+    sources = filter_human_sources(sources)
     merged["sources"] = sources
 
     preferred = new.get("preferred_source") or merged.get("preferred_source")
+    if preferred:
+        preferred = SONGLINK_PLATFORM_ALIASES.get(preferred, preferred)
     if preferred and preferred not in sources and sources:
         preferred = next(iter(sources.keys()))
     if not preferred and sources:
@@ -1467,8 +1487,8 @@ def merge_metadata(existing: dict | None, new: dict | None) -> dict:
     merged["preferred_source"] = preferred
     merged["source_platform"] = preferred or merged.get("source_platform")
 
-    artists = {s.get("artist") for s in sources.values() if s.get("artist")}
-    titles = {s.get("title") for s in sources.values() if s.get("title")}
+    artists = {normalize_meta_value(s.get("artist")) for s in sources.values() if s.get("artist")}
+    titles = {normalize_meta_value(s.get("title")) for s in sources.values() if s.get("title")}
     merged["conflict"] = len(artists) > 1 or len(titles) > 1
 
     def value_from_sources(field: str) -> str:
@@ -1549,6 +1569,9 @@ def skip_prefilled_smartlink_steps(step: int, data: dict) -> int:
         if step == 1 and data.get("title"):
             step += 1
             continue
+        if step == 2 and data.get("release_date"):
+            step += 1
+            continue
         if step == 3 and data.get("cover_file_id"):
             step += 1
             continue
@@ -1562,9 +1585,12 @@ def skip_prefilled_smartlink_steps(step: int, data: dict) -> int:
     return step
 
 
-def smartlink_caption_skip_kb() -> InlineKeyboardMarkup:
+def smartlink_step_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Пропустить", callback_data="smartlink:caption_skip")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить", callback_data="smartlink:skip")],
+            [InlineKeyboardButton(text="Отмена", callback_data="smartlink:cancel")],
+        ]
     )
 
 
@@ -1627,8 +1653,10 @@ async def show_import_confirmation(
     metadata: dict | None,
     latest: dict | None = None,
 ):
-    sources = (metadata or {}).get("sources") or {}
+    sources = filter_human_sources((metadata or {}).get("sources") or {})
     preferred_source = (metadata or {}).get("preferred_source") or (metadata or {}).get("source_platform")
+    if preferred_source:
+        preferred_source = SONGLINK_PLATFORM_ALIASES.get(preferred_source, preferred_source)
     if preferred_source not in sources and sources:
         preferred_source = next(iter(sources.keys()))
     selected_meta = sources.get(preferred_source, metadata or {}) if metadata else {}
@@ -1646,9 +1674,9 @@ async def show_import_confirmation(
         "",
         f"Площадки: {platforms_text}",
     ]
-    if metadata and sources:
-        label = platform_label(preferred_source) if preferred_source else "—"
-        caption_lines.append(f"Источник метаданных: {label}")
+    if metadata and sources and preferred_source:
+        label = platform_label(preferred_source)
+        caption_lines.append(f"Источник: {label}")
     if metadata and metadata.get("conflict"):
         caption_lines.append("⚠️ Название/артист отличаются на площадках. Выбери источник или подтверди по умолчанию.")
     if len(links) < 2:
@@ -1666,7 +1694,7 @@ async def show_import_confirmation(
     if metadata and len(sources) > 1:
         source_row = []
         for platform_key in sorted(sources.keys()):
-            label = SONGLINK_PLATFORM_ALIASES.get(platform_key, platform_key)
+            label = platform_label(platform_key)
             mark = "✅ " if platform_key == preferred_source else ""
             source_row.append(InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"smartlink:import_source:{platform_key}"))
         kb.inline_keyboard.insert(0, source_row)
@@ -2912,7 +2940,7 @@ async def smartlink_caption_edit_cb(callback):
     await form_set(tg_id, 0, {"smartlink_id": existing.get("id"), "caption_text": existing.get("caption_text", "")})
     await callback.message.answer(
         smartlink_step_prompt(4) + "\n\n(Отмена: /cancel)",
-        reply_markup=smartlink_caption_skip_kb(),
+        reply_markup=smartlink_step_kb(),
     )
     await callback.answer()
 
@@ -2976,8 +3004,8 @@ async def smartlink_toggle_cb(callback):
     await callback.answer("Напомню" if not current else "Напоминание выключено")
 
 
-@dp.callback_query(F.data == "smartlink:caption_skip")
-async def smartlink_caption_skip_cb(callback):
+@dp.callback_query(F.data.in_({"smartlink:caption_skip", "smartlink:skip"}))
+async def smartlink_skip_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     form = await form_get(tg_id)
@@ -2987,17 +3015,38 @@ async def smartlink_caption_skip_cb(callback):
     form_name = form.get("form_name")
     data = form.get("data") or {}
     if form_name == "smartlink":
-        if int(form.get("step", 0)) != 4:
-            await callback.answer("Можно пропустить на шаге текста", show_alert=True)
-            return
+        step = int(form.get("step", 0))
         data["links"] = data.get("links") or {}
-        data["caption_text"] = ""
-        next_step = skip_prefilled_smartlink_steps(5, data)
+        total_steps = 5 + len(SMARTLINK_PLATFORMS)
+        if step >= total_steps:
+            await callback.answer("Шагов больше нет", show_alert=True)
+            return
+        if step == 0:
+            data["artist"] = ""
+        elif step == 1:
+            data["title"] = ""
+        elif step == 2:
+            data["release_date"] = ""
+        elif step == 3:
+            data["cover_file_id"] = ""
+        elif step == 4:
+            data["caption_text"] = ""
+        else:
+            idx = step - 5
+            if idx < 0 or idx >= len(SMARTLINK_PLATFORMS):
+                await form_clear(tg_id)
+                await callback.answer("Нет шага", show_alert=True)
+                return
+            data["links"][SMARTLINK_PLATFORMS[idx][0]] = ""
+
+        next_step = skip_prefilled_smartlink_steps(step + 1, data)
         total_steps = 5 + len(SMARTLINK_PLATFORMS)
         if next_step < total_steps:
             await form_set(tg_id, next_step, data)
-            reply_markup = await user_menu_keyboard(tg_id)
-            await callback.message.answer(smartlink_step_prompt(next_step) + "\n\n(Отмена: /cancel)", reply_markup=reply_markup)
+            await callback.message.answer(
+                smartlink_step_prompt(next_step) + "\n\n(Отмена: /cancel)",
+                reply_markup=smartlink_step_kb(),
+            )
         else:
             await finalize_smartlink_form(callback.message, tg_id, data)
         await callback.answer("Пропустил")
@@ -3014,6 +3063,15 @@ async def smartlink_caption_skip_cb(callback):
         return
 
     await callback.answer("Нет шага", show_alert=True)
+
+
+@dp.callback_query(F.data == "smartlink:cancel")
+async def smartlink_cancel_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await form_clear(tg_id)
+    await callback.message.answer("Ок, отменил.", reply_markup=await user_menu_keyboard(tg_id))
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("smartlinks:copy:"))
@@ -3291,11 +3349,11 @@ async def any_message_router(message: Message):
 
         merged_metadata = merge_metadata(existing_metadata, metadata)
 
-        running_total = len(existing_links)
-        for platform_key in added_platforms:
-            running_total += 1
+        if added_platforms:
+            added_labels = [platform_label(p) for p in added_platforms]
+            total_added = len(merged_links)
             await message.answer(
-                f"Добавил площадку: {platform_label(platform_key)}. Всего: {running_total}",
+                f"Добавил площадки: {', '.join(added_labels)}. Всего: {total_added}",
                 reply_markup=await user_menu_keyboard(tg_id),
             )
 
@@ -3401,39 +3459,67 @@ async def any_message_router(message: Message):
         links = data.get("links") or {}
         data["links"] = links
         total_steps = 5 + len(SMARTLINK_PLATFORMS)
+        skip_text = txt.lower() in {"пропустить", "skip"}
 
         if step == 0:
-            if len(txt) < 2:
-                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
-                return
-            data["artist"] = txt
+            if skip_text:
+                data["artist"] = ""
+            else:
+                if len(txt) < 2:
+                    await message.answer(
+                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
+                        reply_markup=smartlink_step_kb(),
+                    )
+                    return
+                data["artist"] = txt
         elif step == 1:
-            if len(txt) < 1:
-                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
-                return
-            data["title"] = txt
+            if skip_text:
+                data["title"] = ""
+            else:
+                if len(txt) < 1:
+                    await message.answer(
+                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
+                        reply_markup=smartlink_step_kb(),
+                    )
+                    return
+                data["title"] = txt
         elif step == 2:
-            d = parse_date(txt)
-            if not d:
-                await message.answer("Не понял дату. Формат: ДД.ММ.ГГГГ\n\n" + smartlink_step_prompt(step), reply_markup=await user_menu_keyboard(tg_id))
-                return
-            data["release_date"] = d.isoformat()
+            if skip_text:
+                data["release_date"] = ""
+            else:
+                d = parse_date(txt)
+                if not d:
+                    await message.answer(
+                        "Не понял дату. Формат: ДД.ММ.ГГГГ\n\n" + smartlink_step_prompt(step),
+                        reply_markup=smartlink_step_kb(),
+                    )
+                    return
+                data["release_date"] = d.isoformat()
         elif step == 3:
-            if not message.photo:
-                await message.answer("Пришли фото для обложки.\n\n" + smartlink_step_prompt(step), reply_markup=await user_menu_keyboard(tg_id))
-                return
-            data["cover_file_id"] = message.photo[-1].file_id
+            if skip_text:
+                data["cover_file_id"] = ""
+            else:
+                if not message.photo:
+                    await message.answer(
+                        "Пришли фото для обложки.\n\n" + smartlink_step_prompt(step),
+                        reply_markup=smartlink_step_kb(),
+                    )
+                    return
+                data["cover_file_id"] = message.photo[-1].file_id
         elif step == 4:
-            if not txt:
-                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_caption_skip_kb())
-                return
-            if txt.lower() in {"пропустить", "skip"}:
+            if skip_text:
                 data["caption_text"] = ""
             else:
+                if not txt:
+                    await message.answer(
+                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
+                        reply_markup=smartlink_step_kb(),
+                    )
+                    return
                 if len(txt) > 600:
                     await message.answer(
                         "Максимум 600 символов. Сократи текст и отправь снова.\n\n" + smartlink_step_prompt(step),
-                        reply_markup=smartlink_caption_skip_kb(),
+                        reply_markup=smartlink_step_kb(),
                     )
                     return
                 data["caption_text"] = txt
@@ -3442,14 +3528,17 @@ async def any_message_router(message: Message):
             if idx < 0 or idx >= len(SMARTLINK_PLATFORMS):
                 await form_clear(tg_id)
                 return
-            if not txt:
-                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
-                return
-            if txt.lower() in {"пропустить", "skip"}:
+            if skip_text:
                 links[SMARTLINK_PLATFORMS[idx][0]] = ""
             else:
+                if not txt:
+                    await message.answer(
+                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
+                        reply_markup=smartlink_step_kb(),
+                    )
+                    return
                 if not re.match(r"https?://", txt):
-                    await message.answer("Нужна ссылка или «Пропустить».", reply_markup=await user_menu_keyboard(tg_id))
+                    await message.answer("Нужна ссылка или «Пропустить».", reply_markup=smartlink_step_kb())
                     return
                 links[SMARTLINK_PLATFORMS[idx][0]] = txt
 
@@ -3457,10 +3546,10 @@ async def any_message_router(message: Message):
         step = skip_prefilled_smartlink_steps(step, data)
         if step < total_steps:
             await form_set(tg_id, step, data)
-            reply_markup = await user_menu_keyboard(tg_id)
-            if step == 4:
-                reply_markup = smartlink_caption_skip_kb()
-            await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=reply_markup)
+            await message.answer(
+                smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
+                reply_markup=smartlink_step_kb(),
+            )
             return
 
         await finalize_smartlink_form(message, tg_id, data)
@@ -3500,7 +3589,7 @@ async def any_message_router(message: Message):
             await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
             return
         if not txt:
-            await message.answer(smartlink_step_prompt(4) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_caption_skip_kb())
+            await message.answer(smartlink_step_prompt(4) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_step_kb())
             return
         if txt.lower() in {"пропустить", "skip"}:
             caption_text = ""
@@ -3508,7 +3597,7 @@ async def any_message_router(message: Message):
             if len(txt) > 600:
                 await message.answer(
                     "Максимум 600 символов. Сократи текст и отправь снова.\n\n" + smartlink_step_prompt(4),
-                    reply_markup=smartlink_caption_skip_kb(),
+                    reply_markup=smartlink_step_kb(),
                 )
                 return
             caption_text = txt
