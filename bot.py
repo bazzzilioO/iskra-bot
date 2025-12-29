@@ -355,6 +355,7 @@ def menu_keyboard(updates_enabled: bool | None = None) -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🔗 Ссылки"), KeyboardButton(text="👤 Кабинеты")],
             [KeyboardButton(text="🧾 Экспорт"), KeyboardButton(text="📩 Запросить дистрибуцию")],
             [KeyboardButton(text="📰 Что нового"), KeyboardButton(text=updates_text)],
+            [KeyboardButton(text="🔗 Смарт-линки")],
             [KeyboardButton(text="💫 Поддержать ИСКРУ")],
             [KeyboardButton(text="🔄 Сброс")],
         ],
@@ -778,6 +779,58 @@ async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
         return _smartlink_row_to_dict(row) if row else None
 
 
+async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (owner_tg_id, limit, offset),
+        )
+        return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
+
+
+async def count_smartlinks(owner_tg_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM smartlinks WHERE owner_tg_id=?", (owner_tg_id,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: dict) -> bool:
+    allowed = {"artist", "title", "release_date", "cover_file_id", "links", "caption_text"}
+    fields: list[str] = []
+    params: list = []
+
+    for key, value in updates.items():
+        if key not in allowed:
+            continue
+        if key == "links":
+            fields.append("links_json=?")
+            params.append(json.dumps(value or {}, ensure_ascii=False))
+        else:
+            fields.append(f"{key}=?")
+            params.append(value)
+
+    if not fields:
+        return False
+
+    params.extend([smartlink_id, owner_tg_id])
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"UPDATE smartlinks SET {', '.join(fields)} WHERE id=? AND owner_tg_id=?",
+            params,
+        )
+        await db.commit()
+    return True
+
+
+async def delete_smartlink(smartlink_id: int, owner_tg_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM smartlinks WHERE id=? AND owner_tg_id=?", (smartlink_id, owner_tg_id))
+        await db.execute("DELETE FROM smartlink_subscriptions WHERE smartlink_id=?", (smartlink_id,))
+        await db.commit()
+
+
 async def set_smartlink_subscription(smartlink_id: int, subscriber_tg_id: int, subscribed: bool):
     async with aiosqlite.connect(DB_PATH) as db:
         if subscribed:
@@ -822,6 +875,22 @@ async def start_smartlink_form(
         return
 
     await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_step_kb())
+
+
+async def start_smartlink_import(message: Message, tg_id: int):
+    await form_start(tg_id, "smartlink_import")
+    await form_set(
+        tg_id,
+        0,
+        {"links": {}, "metadata": {}, "bandlink_help_shown": False, "low_links_hint_shown": False},
+    )
+    await message.answer(
+        "Пришли ссылку на релиз: BandLink / Spotify / Apple Music / Яндекс / VK / YouTube.\n"
+        "Я попробую подтянуть площадки и данные автоматически.\n"
+        "Если BandLink не отдаст ссылки — подскажу, как скопировать одну кнопку платформы.\n\n"
+        "Отмена: /cancel",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
 
 
 # -------------------- Forms --------------------
@@ -1063,6 +1132,137 @@ def build_links_kb() -> InlineKeyboardMarkup:
     ])
 
 
+SMARTLINKS_PAGE_SIZE = 5
+
+
+def smartlinks_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать смарт-линк", callback_data="smartlinks:create")],
+            [InlineKeyboardButton(text="📂 Мои смарт-линки", callback_data="smartlinks:list:0")],
+            [InlineKeyboardButton(text="✏️ Редактировать смарт-линк", callback_data="smartlinks:list:0")],
+            [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data="smartlinks:list:0")],
+            [InlineKeyboardButton(text="❓ Помощь по смарт-линкам", callback_data="smartlinks:help")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_focus")],
+        ]
+    )
+
+
+def smartlinks_help_text() -> str:
+    return (
+        "🔗 Смарт-линки\n\n"
+        "• Создавай ссылку по BandLink или площадке — подтяну остальные автоматически.\n"
+        "• Можно обновлять обложку, описание и ссылки точечно через меню редактирования.\n"
+        "• В карточке есть кнопка 📋 для быстрого копирования всех ссылок."
+    )
+
+
+def build_smartlink_list_text(items: list[dict], page: int, total_pages: int) -> str:
+    if not items:
+        return "Пока нет смарт-линков. Нажми «➕ Создать смарт-линк»."
+
+    lines = [f"📂 Мои смарт-линки (страница {page + 1}/{total_pages})", ""]
+    for idx, item in enumerate(items, start=1):
+        artist = item.get("artist") or "Без артиста"
+        title = item.get("title") or "Без названия"
+        rd = parse_date(item.get("release_date") or "")
+        rd_text = f"📅 {format_date_ru(rd)}" if rd else ""
+        lines.append(f"{idx}. {artist} — {title} {rd_text}")
+    return "\n".join(lines)
+
+
+def build_smartlink_view_text(smartlink: dict) -> str:
+    artist = smartlink.get("artist") or "Без артиста"
+    title = smartlink.get("title") or "Без названия"
+    rd = parse_date(smartlink.get("release_date") or "")
+    lines = [f"{artist} — {title}"]
+    if rd:
+        lines.append(f"📅 {format_date_ru(rd)}")
+    return "\n".join(lines)
+
+
+def smartlink_view_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_id}:{page}")],
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")],
+            [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink_id}")],
+            [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"smartlinks:delete:{smartlink_id}:{page}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:list:{page}")],
+        ]
+    )
+
+
+def smartlink_edit_menu_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Артист/Название", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:title")],
+            [InlineKeyboardButton(text="Дата релиза", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:date")],
+            [InlineKeyboardButton(text="Описание", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:caption")],
+            [InlineKeyboardButton(text="Обложка", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:cover")],
+            [InlineKeyboardButton(text="Ссылки", callback_data=f"smartlinks:edit_links:{smartlink_id}:{page}")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:view:{smartlink_id}:{page}")],
+        ]
+    )
+
+
+def smartlink_links_menu_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for key, label in SMARTLINK_BUTTON_ORDER:
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlinks:edit_link:{smartlink_id}:{page}:{key}")])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_smartlink_list(message: Message, tg_id: int, page: int = 0):
+    total = await count_smartlinks(tg_id)
+    total_pages = max(1, (total + SMARTLINKS_PAGE_SIZE - 1) // SMARTLINKS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    items = await list_smartlinks(tg_id, limit=SMARTLINKS_PAGE_SIZE, offset=page * SMARTLINKS_PAGE_SIZE)
+    text = build_smartlink_list_text(items, page, total_pages)
+
+    inline: list[list[InlineKeyboardButton]] = []
+    for idx, item in enumerate(items, start=1):
+        inline.append(
+            [
+                InlineKeyboardButton(text=f"{idx}. {item.get('artist') or 'Без артиста'} — {item.get('title') or 'Без названия'}", callback_data=f"smartlinks:view:{item.get('id')}:{page}")
+            ]
+        )
+
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"smartlinks:list:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"smartlinks:list:{page + 1}"))
+    if nav_row:
+        inline.append(nav_row)
+
+    inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="smartlinks:menu")])
+
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=inline))
+
+
+async def show_smartlink_view(message: Message, tg_id: int, smartlink_id: int, page: int):
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
+        await message.answer("Смартлинк не найден.", reply_markup=smartlinks_menu_kb())
+        return
+    text = build_smartlink_view_text(smartlink)
+    await message.answer(text, reply_markup=smartlink_view_kb(smartlink_id, page))
+
+
+async def resend_smartlink_card(message: Message, tg_id: int, smartlink: dict, page: int):
+    allow_remind = smartlink_can_remind(smartlink)
+    subscribed = await is_smartlink_subscribed(smartlink.get("id"), tg_id) if allow_remind else False
+    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+    await message.answer("Выбери действие:", reply_markup=smartlink_view_kb(smartlink.get("id"), page))
+
+
+async def get_owned_smartlink(tg_id: int, smartlink_id: int) -> dict | None:
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
+        return None
+    return smartlink
 async def get_spotify_access_token() -> str | None:
     global _SPOTIFY_ACCESS_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
 
@@ -2472,6 +2672,12 @@ async def rb_set_date_hint(message: Message):
 async def rb_links(message: Message):
     await message.answer("🔗 Быстрые ссылки:", reply_markup=build_links_kb())
 
+
+@dp.message(F.text == "🔗 Смарт-линки")
+async def rb_smartlinks(message: Message):
+    await message.answer("🔗 Смарт-линки — выбери действие:", reply_markup=smartlinks_menu_kb())
+
+
 @dp.message(F.text == "🧠 Ожидания")
 async def rb_expectations(message: Message):
     await message.answer(expectations_text(), reply_markup=await user_menu_keyboard(message.from_user.id))
@@ -2744,6 +2950,198 @@ async def links_cb(callback):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "smartlinks:menu")
+async def smartlinks_menu_cb(callback):
+    await callback.message.answer("🔗 Смарт-линки — выбери действие:", reply_markup=smartlinks_menu_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlinks:create")
+async def smartlinks_create_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await start_smartlink_import(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlinks:help")
+async def smartlinks_help_cb(callback):
+    await callback.message.answer(smartlinks_help_text(), reply_markup=smartlinks_menu_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:list:"))
+async def smartlinks_list_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    try:
+        page = int(callback.data.split(":")[-1])
+    except ValueError:
+        page = 0
+    await send_smartlink_list(callback.message, tg_id, page=page)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:view:"))
+async def smartlinks_view_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    await show_smartlink_view(callback.message, tg_id, smartlink_id, page)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:open:"))
+async def smartlinks_open_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    await resend_smartlink_card(callback.message, tg_id, smartlink, page)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:delete:"))
+async def smartlinks_delete_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    await delete_smartlink(smartlink_id, tg_id)
+    await callback.answer("Удалено")
+    await send_smartlink_list(callback.message, tg_id, page=page)
+
+
+@dp.callback_query(F.data.startswith("smartlinks:edit_menu:"))
+async def smartlinks_edit_menu_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    text = build_smartlink_view_text(smartlink)
+    await callback.message.answer(text + "\n\nВыбери, что обновить:", reply_markup=smartlink_edit_menu_kb(smartlink_id, page))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:edit_field:"))
+async def smartlinks_edit_field_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 5:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    field = parts[4]
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    await form_start(tg_id, "smartlink_edit")
+    await form_set(tg_id, 0, {"smartlink_id": smartlink_id, "page": page, "field": field, "data": {}})
+
+    if field == "title":
+        await callback.message.answer(
+            "Обновляем артиста и название.\nПришли артиста (минимум 2 символа).\n\n(Отмена: /cancel)",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
+    elif field == "date":
+        await callback.message.answer(
+            "Пришли дату релиза в формате ДД.ММ.ГГГГ или напиши «нет».\n\n(Отмена: /cancel)",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
+    elif field == "caption":
+        await callback.message.answer(
+            "Пришли новое описание (до 600 символов) или напиши «пропустить», чтобы очистить.\n\n(Отмена: /cancel)",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
+    elif field == "cover":
+        await callback.message.answer(
+            "Пришли новую обложку (фото). Чтобы оставить без изменений — /cancel.",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
+    else:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:edit_links:"))
+async def smartlinks_edit_links_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    await callback.message.answer("Выбери платформу для обновления:", reply_markup=smartlink_links_menu_kb(smartlink_id, page))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:edit_link:"))
+async def smartlinks_edit_link_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 5:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    platform = parts[4]
+    if platform not in {k for k, _ in SMARTLINK_BUTTON_ORDER}:
+        await callback.answer("Платформа не поддерживается", show_alert=True)
+        return
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    await form_start(tg_id, "smartlink_edit")
+    await form_set(
+        tg_id,
+        0,
+        {"smartlink_id": smartlink_id, "page": page, "field": "link", "platform": platform, "data": {}},
+    )
+    label = platform_label(platform)
+    await callback.message.answer(
+        f"Пришли ссылку на {label}. Чтобы удалить площадку — напиши «удалить».\n\n(Отмена: /cancel)",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
+    await callback.answer()
 @dp.callback_query(F.data == "smartlink:open")
 async def smartlink_open_cb(callback):
     tg_id = callback.from_user.id
@@ -2810,19 +3208,7 @@ async def smartlink_upc_cb(callback):
 async def smartlink_import_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
-    await form_start(tg_id, "smartlink_import")
-    await form_set(
-        tg_id,
-        0,
-        {"links": {}, "metadata": {}, "bandlink_help_shown": False, "low_links_hint_shown": False},
-    )
-    await callback.message.answer(
-        "Пришли ссылку на релиз: BandLink / Spotify / Apple Music / Яндекс / VK / YouTube.\n"
-        "Я попробую подтянуть площадки и данные автоматически.\n"
-        "Если BandLink не отдаст ссылки — подскажу, как скопировать одну кнопку платформы.\n\n"
-        "Отмена: /cancel",
-        reply_markup=await user_menu_keyboard(tg_id),
-    )
+    await start_smartlink_import(callback.message, tg_id)
     await callback.answer()
 
 
@@ -3636,6 +4022,108 @@ async def any_message_router(message: Message):
                 return
             caption_text = txt
         await apply_caption_update(message, tg_id, smartlink_id, caption_text)
+        return
+
+    if form_name == "smartlink_edit":
+        info = form.get("data") or {}
+        smartlink_id = info.get("smartlink_id")
+        page = int(info.get("page") or 0)
+        field = info.get("field")
+        smartlink = await get_owned_smartlink(tg_id, smartlink_id) if smartlink_id else None
+        if not smartlink or not field:
+            await form_clear(tg_id)
+            await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
+            return
+
+        step = int(form.get("step", 0))
+        updates: dict = {}
+
+        if field == "title":
+            if step == 0:
+                if len(txt) < 2:
+                    await message.answer(
+                        "Минимум 2 символа. Пришли артиста ещё раз.\n\n(Отмена: /cancel)",
+                        reply_markup=await user_menu_keyboard(tg_id),
+                    )
+                    return
+                info_data = info.get("data") or {}
+                info_data["artist"] = txt
+                info["data"] = info_data
+                await form_set(tg_id, 1, info)
+                await message.answer(
+                    "Теперь пришли название релиза.\n\n(Отмена: /cancel)",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
+            info_data = info.get("data") or {}
+            artist = info_data.get("artist") or smartlink.get("artist")
+            if len(txt) < 1:
+                await message.answer(
+                    "Нужно название релиза.\n\n(Отмена: /cancel)",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
+            updates["artist"] = artist
+            updates["title"] = txt
+        elif field == "date":
+            if txt.lower() in {"нет", "пропустить", "skip"}:
+                updates["release_date"] = ""
+            else:
+                d = parse_date(txt)
+                if not d:
+                    await message.answer(
+                        "Не понял дату. Формат: ДД.ММ.ГГГГ или напиши «нет».\n\n(Отмена: /cancel)",
+                        reply_markup=await user_menu_keyboard(tg_id),
+                    )
+                    return
+                updates["release_date"] = d.isoformat()
+        elif field == "caption":
+            if txt.lower() in {"пропустить", "skip"}:
+                updates["caption_text"] = ""
+            else:
+                if len(txt) > 600:
+                    await message.answer(
+                        "Максимум 600 символов. Сократи текст.\n\n(Отмена: /cancel)",
+                        reply_markup=await user_menu_keyboard(tg_id),
+                    )
+                    return
+                updates["caption_text"] = txt
+        elif field == "cover":
+            if not message.photo:
+                await message.answer(
+                    "Пришли фото для обложки.\n\n(Отмена: /cancel)",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
+            updates["cover_file_id"] = message.photo[-1].file_id
+        elif field == "link":
+            platform = info.get("platform")
+            links = smartlink.get("links") or {}
+            lower = txt.lower()
+            if lower in {"удалить", "delete", "remove", "пропустить", "skip"}:
+                links.pop(platform, None)
+            else:
+                if not re.match(r"https?://", txt):
+                    await message.answer(
+                        "Нужна ссылка вида https://... или слово «удалить».\n\n(Отмена: /cancel)",
+                        reply_markup=await user_menu_keyboard(tg_id),
+                    )
+                    return
+                links[platform] = txt
+            updates["links"] = links
+        else:
+            await form_clear(tg_id)
+            await message.answer("Не понял запрос.", reply_markup=await user_menu_keyboard(tg_id))
+            return
+
+        if updates:
+            await update_smartlink_data(smartlink_id, tg_id, updates)
+        await form_clear(tg_id)
+        updated = await get_smartlink_by_id(smartlink_id)
+        if updated:
+            await resend_smartlink_card(message, tg_id, updated, page)
+        else:
+            await message.answer("Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
         return
 
     if not txt or txt.startswith("/"):
