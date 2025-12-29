@@ -4,6 +4,9 @@ import json
 import datetime as dt
 import re
 import html
+from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
+
+import aiohttp
 import aiosqlite
 import smtplib
 from email.mime.text import MIMEText
@@ -51,6 +54,11 @@ def smartlink_step_prompt(step: int) -> str:
         label = SMARTLINK_PLATFORMS[idx][1]
         return f"Шаг {step + 1}/{total}: ссылка на {label}? (можно «Пропустить»)."
     return ""
+
+BANDLINK_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 # -------------------- CONFIG --------------------
 
@@ -716,9 +724,9 @@ async def is_smartlink_subscribed(smartlink_id: int, subscriber_tg_id: int) -> b
         return row is not None
 
 
-async def start_smartlink_form(message: Message, tg_id: int):
+async def start_smartlink_form(message: Message, tg_id: int, initial_links: dict[str, str] | None = None):
     await form_start(tg_id, "smartlink")
-    await form_set(tg_id, 0, {"links": {}})
+    await form_set(tg_id, 0, {"links": initial_links or {}})
     await message.answer(smartlink_step_prompt(0) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
 
 
@@ -961,23 +969,88 @@ def build_links_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def _normalize_music_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    cleaned_query = [
+        (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith("utm_")
+    ]
+    return urlunparse(parsed._replace(query=urlencode(cleaned_query), fragment=""))
+
+
+def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
+    links: dict[str, str] = {}
+    for href in re.findall(r"href=['\"]([^'\"]+)", html_content):
+        normalized = _normalize_music_url(href)
+        if not normalized:
+            continue
+        parsed = urlparse(normalized)
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+
+        platform: str | None = None
+        if netloc == "open.spotify.com":
+            platform = "spotify"
+        elif netloc == "music.apple.com":
+            platform = "apple"
+        elif netloc.startswith("music.yandex."):
+            platform = "yandex"
+        elif netloc == "vk.com" and parsed.path.startswith("/music"):
+            platform = "vk"
+        elif netloc == "zvuk.com":
+            platform = "zvuk"
+        elif netloc in {"music.youtube.com", "youtube.com"}:
+            platform = "youtube"
+
+        if platform and platform not in links:
+            links[platform] = normalized
+    return links
+
+
+async def fetch_bandlink_html(url: str) -> str | None:
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
+            async with session.get(url) as resp:
+                if resp.status >= 400:
+                    return None
+                return await resp.text()
+    except Exception:
+        return None
+
+
+def skip_prefilled_smartlink_steps(step: int, links: dict[str, str]) -> int:
+    total_steps = 4 + len(SMARTLINK_PLATFORMS)
+    while 4 <= step < total_steps:
+        idx = step - 4
+        platform_key = SMARTLINK_PLATFORMS[idx][0]
+        if links.get(platform_key):
+            step += 1
+            continue
+        break
+    return step
+
+
 def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str:
     artist = html.escape(smartlink.get("artist") or "")
     title = html.escape(smartlink.get("title") or "")
     release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
     if release_today:
         return "\n".join([
-            f"🎉 Сегодня релиз: {artist} — {title}. Слушать 👇",
+            f"🎉 Сегодня релиз: {artist} — {title}.",
+            "🎧 Слушать 👇",
             "",
-            'Сделано с помощью <a href="https://t.me/iskramusic_bot">ИСКРА</a>',
+            "Сделано с помощью ИСКРЫ — @iskramusic_bot",
         ])
 
     lines = [f"{artist} — {title}"]
     if release_date:
-        lines.append(f"Релиз: {format_date_ru(release_date)}")
-    lines.append("Слушать 👇")
+        lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
+    lines.append("🎧 Слушать 👇")
     lines.append("")
-    lines.append('Сделано с помощью <a href="https://t.me/iskramusic_bot">ИСКРА</a>')
+    lines.append("Сделано с помощью ИСКРЫ — @iskramusic_bot")
     return "\n".join(lines)
 
 
@@ -1839,7 +1912,14 @@ async def smartlink_open_cb(callback):
     await ensure_user(tg_id)
     existing = await get_latest_smartlink(tg_id)
     if not existing:
-        await start_smartlink_form(callback.message, tg_id)
+        actions_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
+                [InlineKeyboardButton(text="✏️ Создать вручную", callback_data="smartlink:new")],
+                [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
+            ]
+        )
+        await callback.message.answer("Смартлинк не найден. Выбери действие:", reply_markup=actions_kb)
         await callback.answer()
         return
 
@@ -1849,6 +1929,7 @@ async def smartlink_open_cb(callback):
 
     manage_kb = InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
             [InlineKeyboardButton(text="✏️ Обновить", callback_data="smartlink:new")],
             [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
         ]
@@ -1862,6 +1943,18 @@ async def smartlink_new_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     await start_smartlink_form(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlink:import")
+async def smartlink_import_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await form_start(tg_id, "smartlink_import")
+    await callback.message.answer(
+        "Пришли ссылку BandLink. Постараюсь вытащить ссылки на площадки автоматически.\n\nОтмена: /cancel",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
     await callback.answer()
 
 
@@ -2091,6 +2184,62 @@ async def any_message_router(message: Message):
         return
 
     form_name = form.get("form_name")
+    if form_name == "smartlink_import":
+        if not re.match(r"https?://", txt):
+            await message.answer(
+                "Нужна ссылка BandLink (http/https).\n\nОтмена: /cancel",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+
+        html_content = await fetch_bandlink_html(txt)
+        links = extract_links_from_bandlink(html_content or "") if html_content else {}
+
+        if len(links) >= 2:
+            latest = await get_latest_smartlink(tg_id)
+            if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
+                smartlink_id = await save_smartlink(
+                    tg_id,
+                    latest.get("artist", ""),
+                    latest.get("title", ""),
+                    latest.get("release_date") or "",
+                    latest.get("cover_file_id", ""),
+                    links,
+                )
+                smartlink = {
+                    "id": smartlink_id,
+                    "owner_tg_id": tg_id,
+                    "artist": latest.get("artist", ""),
+                    "title": latest.get("title", ""),
+                    "release_date": latest.get("release_date") or "",
+                    "cover_file_id": latest.get("cover_file_id", ""),
+                    "links": links,
+                    "created_at": dt.datetime.utcnow().isoformat(),
+                }
+                allow_remind = smartlink_can_remind(smartlink)
+                subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+                await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+                await message.answer(
+                    "Импортировал ссылки из BandLink. Смартлинк обновлён.",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                await form_clear(tg_id)
+                return
+
+            await message.answer(
+                "Нашёл ссылки в BandLink. Давай заполним карточку и обложку — ссылки уже подставлены.",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            await start_smartlink_form(message, tg_id, initial_links=links)
+            return
+
+        await message.answer(
+            "Не удалось извлечь ссылки, добавь вручную.",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
+        await start_smartlink_form(message, tg_id)
+        return
+
     if form_name == "smartlink":
         step = int(form.get("step", 0))
         data = form.get("data") or {}
@@ -2136,6 +2285,7 @@ async def any_message_router(message: Message):
                 links[SMARTLINK_PLATFORMS[idx][0]] = txt
 
         step += 1
+        step = skip_prefilled_smartlink_steps(step, links)
         if step < total_steps:
             await form_set(tg_id, step, data)
             await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
