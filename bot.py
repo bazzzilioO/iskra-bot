@@ -24,6 +24,33 @@ REMINDER_INTERVAL_SECONDS = 300
 REMINDER_CLEAN_DAYS = 60
 REMINDER_LAST_CLEAN: dt.date | None = None
 
+SMARTLINK_PLATFORMS = [
+    ("spotify", "Spotify"),
+    ("yandex", "Яндекс Музыка"),
+    ("apple", "Apple Music"),
+    ("vk", "VK Музыка"),
+    ("zvuk", "Звук"),
+    ("youtube", "YouTube Music"),
+    ("deezer", "Deezer"),
+]
+
+
+def smartlink_step_prompt(step: int) -> str:
+    total = 4 + len(SMARTLINK_PLATFORMS)
+    if step == 0:
+        return f"🔗 Смартлинк. Шаг 1/{total}: артист?"
+    if step == 1:
+        return f"Шаг 2/{total}: название трека?"
+    if step == 2:
+        return f"Шаг 3/{total}: дата релиза (ДД.ММ.ГГГГ)?"
+    if step == 3:
+        return f"Шаг 4/{total}: пришли обложку (фото)."
+    idx = step - 4
+    if 0 <= idx < len(SMARTLINK_PLATFORMS):
+        label = SMARTLINK_PLATFORMS[idx][1]
+        return f"Шаг {step + 1}/{total}: ссылка на {label}? (можно «Пропустить»)."
+    return ""
+
 # -------------------- CONFIG --------------------
 
 LINKS = {
@@ -371,6 +398,26 @@ async def init_db():
         )
         """)
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS smartlinks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_tg_id INTEGER,
+            artist TEXT,
+            title TEXT,
+            release_date TEXT,
+            cover_file_id TEXT,
+            links_json TEXT,
+            created_at TEXT
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS smartlink_subscriptions (
+            smartlink_id INTEGER,
+            subscriber_tg_id INTEGER,
+            notified INTEGER DEFAULT 0,
+            PRIMARY KEY(smartlink_id, subscriber_tg_id)
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS important_tasks (
             tg_id INTEGER,
             task_id INTEGER,
@@ -579,12 +626,100 @@ async def reset_all_data(tg_id: int):
         await db.execute("DELETE FROM important_tasks WHERE tg_id=?", (tg_id,))
         await db.execute("DELETE FROM qc_checks WHERE tg_id=?", (tg_id,))
         await db.execute("DELETE FROM reminder_log WHERE tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM smartlink_subscriptions WHERE subscriber_tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM smartlinks WHERE owner_tg_id=?", (tg_id,))
         await db.execute(
             "UPDATE users SET release_date=NULL, reminders_enabled=1 WHERE tg_id=?",
             (tg_id,)
         )
         await db.execute("DELETE FROM user_forms WHERE tg_id=?", (tg_id,))
         await db.commit()
+
+def _smartlink_row_to_dict(row) -> dict:
+    if not row:
+        return {}
+    return {
+        "id": row[0],
+        "owner_tg_id": row[1],
+        "artist": row[2] or "",
+        "title": row[3] or "",
+        "release_date": row[4],
+        "cover_file_id": row[5] or "",
+        "links": json.loads(row[6] or "{}"),
+        "created_at": row[7],
+    }
+
+
+async def save_smartlink(
+    owner_tg_id: int,
+    artist: str,
+    title: str,
+    release_date_iso: str,
+    cover_file_id: str,
+    links: dict,
+) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (owner_tg_id, artist, title, release_date_iso, cover_file_id, json.dumps(links, ensure_ascii=False), dt.datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
+            (owner_tg_id,),
+        )
+        row = await cur.fetchone()
+        return _smartlink_row_to_dict(row) if row else None
+
+
+async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at FROM smartlinks WHERE id=?",
+            (smartlink_id,),
+        )
+        row = await cur.fetchone()
+        return _smartlink_row_to_dict(row) if row else None
+
+
+async def set_smartlink_subscription(smartlink_id: int, subscriber_tg_id: int, subscribed: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        if subscribed:
+            await db.execute(
+                "INSERT OR REPLACE INTO smartlink_subscriptions (smartlink_id, subscriber_tg_id, notified) VALUES (?, ?, 0)",
+                (smartlink_id, subscriber_tg_id),
+            )
+        else:
+            await db.execute(
+                "DELETE FROM smartlink_subscriptions WHERE smartlink_id=? AND subscriber_tg_id=?",
+                (smartlink_id, subscriber_tg_id),
+            )
+        await db.commit()
+
+
+async def is_smartlink_subscribed(smartlink_id: int, subscriber_tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM smartlink_subscriptions WHERE smartlink_id=? AND subscriber_tg_id=?",
+            (smartlink_id, subscriber_tg_id),
+        )
+        row = await cur.fetchone()
+        return row is not None
+
+
+async def start_smartlink_form(message: Message, tg_id: int):
+    await form_start(tg_id, "smartlink")
+    await form_set(tg_id, 0, {"links": {}})
+    await message.answer(smartlink_step_prompt(0) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
+
 
 # -------------------- Forms --------------------
 
@@ -811,6 +946,7 @@ def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, Inlin
 def build_links_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔥 Важное", callback_data="important:list")],
+        [InlineKeyboardButton(text="🔗 Смартлинк", callback_data="smartlink:open")],
         [InlineKeyboardButton(text="✍️ Тексты", callback_data="texts:start")],
         [InlineKeyboardButton(text="BandLink", url=LINKS["bandlink_home"])],
         [InlineKeyboardButton(text="Spotify for Artists", url=LINKS["spotify_for_artists"])],
@@ -822,6 +958,53 @@ def build_links_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="UGC / Content ID", callback_data="links:ugc")],
         [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]
     ])
+
+
+def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str:
+    artist = smartlink.get("artist") or ""
+    title = smartlink.get("title") or ""
+    release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
+    if release_today:
+        return f"🎉 Сегодня релиз: {artist} — {title}. Слушать 👇"
+
+    lines = [f"{artist} — {title}"]
+    if release_date:
+        lines.append(f"Релиз: {format_date_ru(release_date)}")
+    lines.append("Слушать 👇")
+    return "\n".join(lines)
+
+
+def build_smartlink_buttons(smartlink: dict, subscribed: bool = False, can_remind: bool = False) -> InlineKeyboardMarkup | None:
+    rows: list[list[InlineKeyboardButton]] = []
+    links = smartlink.get("links") or {}
+    for key, label in SMARTLINK_PLATFORMS:
+        url = links.get(key)
+        if url:
+            rows.append([InlineKeyboardButton(text=label, url=url)])
+
+    if can_remind:
+        toggle_text = "✅ Напоминание включено" if subscribed else "🔔 Напомнить о релизе"
+        rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"smartlink:toggle:{smartlink.get('id')}")])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def smartlink_can_remind(smartlink: dict) -> bool:
+    rd = parse_date(smartlink.get("release_date") or "") if smartlink else None
+    return bool(rd and rd > dt.date.today())
+
+
+async def send_smartlink_photo(
+    bot: Bot,
+    chat_id: int,
+    smartlink: dict,
+    release_today: bool = False,
+    subscribed: bool = False,
+    allow_remind: bool = False,
+):
+    caption = build_smartlink_caption(smartlink, release_today=release_today)
+    kb = build_smartlink_buttons(smartlink, subscribed=subscribed, can_remind=allow_remind)
+    return await bot.send_photo(chat_id, photo=smartlink.get("cover_file_id"), caption=caption, reply_markup=kb)
 
 def build_timeline_kb(reminders_enabled: bool, has_date: bool = True) -> InlineKeyboardMarkup:
     toggle_text = "🔔 Напоминания: Вкл" if reminders_enabled else "🔔 Напоминания: Выкл"
@@ -921,6 +1104,18 @@ async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None
             print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
             return None
 
+
+async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMarkup | None) -> Message | None:
+    try:
+        await message.edit_caption(caption=caption, reply_markup=kb)
+        return message
+    except Exception as edit_err:
+        try:
+            return await message.answer_photo(photo=message.photo[-1].file_id if message.photo else None, caption=caption, reply_markup=kb)
+        except Exception as answer_err:
+            print(f"[safe_edit_caption] edit failed: {edit_err}; answer failed: {answer_err}")
+            return None
+
 # -------------------- Reminders --------------------
 
 async def was_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when: str) -> bool:
@@ -990,10 +1185,40 @@ async def process_reminders(bot: Bot):
         await db.commit()
 
 
+async def process_smartlink_notifications(bot: Bot):
+    today_iso = dt.date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at FROM smartlinks WHERE release_date=?",
+            (today_iso,),
+        )
+        smartlinks = [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
+
+        for smartlink in smartlinks:
+            sub_cur = await db.execute(
+                "SELECT subscriber_tg_id FROM smartlink_subscriptions WHERE smartlink_id=? AND notified=0",
+                (smartlink.get("id"),),
+            )
+            subscribers = [row[0] for row in await sub_cur.fetchall()]
+            for subscriber_tg_id in subscribers:
+                try:
+                    await send_smartlink_photo(bot, subscriber_tg_id, smartlink, release_today=True, subscribed=True, allow_remind=False)
+                    await db.execute(
+                        "UPDATE smartlink_subscriptions SET notified=1 WHERE smartlink_id=? AND subscriber_tg_id=?",
+                        (smartlink.get("id"), subscriber_tg_id),
+                    )
+                except TelegramForbiddenError:
+                    continue
+                except Exception:
+                    continue
+        await db.commit()
+
+
 async def reminder_scheduler(bot: Bot):
     while True:
         try:
             await process_reminders(bot)
+            await process_smartlink_notifications(bot)
         except Exception as e:
             print(f"[reminder_scheduler] error: {e}")
         await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
@@ -1566,6 +1791,65 @@ async def links_cb(callback):
     await safe_edit(callback.message, "🔗 Быстрые ссылки:", build_links_kb())
     await callback.answer()
 
+
+@dp.callback_query(F.data == "smartlink:open")
+async def smartlink_open_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    existing = await get_latest_smartlink(tg_id)
+    if not existing:
+        await start_smartlink_form(callback.message, tg_id)
+        await callback.answer()
+        return
+
+    allow_remind = smartlink_can_remind(existing)
+    subscribed = await is_smartlink_subscribed(existing.get("id"), tg_id) if allow_remind else False
+    await send_smartlink_photo(callback.message.bot, tg_id, existing, subscribed=subscribed, allow_remind=allow_remind)
+
+    manage_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Обновить", callback_data="smartlink:new")],
+            [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
+        ]
+    )
+    await callback.message.answer("Можно обновить смартлинк:", reply_markup=manage_kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlink:new")
+async def smartlink_new_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await start_smartlink_form(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlink:toggle:"))
+async def smartlink_toggle_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        await callback.answer("Ссылка не найдена", show_alert=True)
+        return
+    if not smartlink_can_remind(smartlink):
+        await callback.answer("Релиз уже сегодня или прошёл", show_alert=True)
+        return
+
+    current = await is_smartlink_subscribed(smartlink_id, tg_id)
+    await set_smartlink_subscription(smartlink_id, tg_id, not current)
+    allow_remind = smartlink_can_remind(smartlink)
+    kb = build_smartlink_buttons(smartlink, subscribed=not current, can_remind=allow_remind)
+    caption = build_smartlink_caption(smartlink)
+    await safe_edit_caption(callback.message, caption, kb)
+    await callback.answer("Напомню" if not current else "Напоминание выключено")
+
+
 @dp.callback_query(F.data == "links:lyrics")
 async def links_lyrics_cb(callback):
     await safe_edit(callback.message, lyrics_sync_text(), build_links_kb())
@@ -1714,38 +1998,118 @@ async def label_start_cb(callback):
 
 @dp.message()
 async def any_message_router(message: Message):
-    txt = (message.text or "").strip()
-    if not txt or txt.startswith("/"):
-        return
-
     tg_id = message.from_user.id
     await ensure_user(tg_id, message.from_user.username)
 
-    exp = await get_experience(tg_id)
-    if exp == "unknown":
-        lower = txt.lower()
-        inferred: str | None = None
-        if "уже" in lower or "не первый" in lower:
-            inferred = "old"
-        elif "перв" in lower:
-            inferred = "first"
+    form = await form_get(tg_id)
+    txt = (message.text or "").strip()
 
-        if not inferred:
-            text, kb = experience_prompt()
-            await message.answer(text, reply_markup=kb)
+    if not form:
+        if not txt or txt.startswith("/"):
             return
 
-        await set_experience(tg_id, inferred)
-        await message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=await user_menu_keyboard(tg_id))
-        focus_text, kb = await build_focus_for_user(tg_id, inferred)
-        await message.answer(focus_text, reply_markup=kb)
-        return
+        exp = await get_experience(tg_id)
+        if exp == "unknown":
+            lower = txt.lower()
+            inferred: str | None = None
+            if "уже" in lower or "не первый" in lower:
+                inferred = "old"
+            elif "перв" in lower:
+                inferred = "first"
 
-    form = await form_get(tg_id)
-    if not form:
+            if not inferred:
+                text, kb = experience_prompt()
+                await message.answer(text, reply_markup=kb)
+                return
+
+            await set_experience(tg_id, inferred)
+            await message.answer("Ок. Меню снизу, держу фокус здесь:", reply_markup=await user_menu_keyboard(tg_id))
+            focus_text, kb = await build_focus_for_user(tg_id, inferred)
+            await message.answer(focus_text, reply_markup=kb)
+            return
         return
 
     form_name = form.get("form_name")
+    if form_name == "smartlink":
+        step = int(form.get("step", 0))
+        data = form.get("data") or {}
+        links = data.get("links") or {}
+        data["links"] = links
+        total_steps = 4 + len(SMARTLINK_PLATFORMS)
+
+        if step == 0:
+            if len(txt) < 2:
+                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
+                return
+            data["artist"] = txt
+        elif step == 1:
+            if len(txt) < 1:
+                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
+                return
+            data["title"] = txt
+        elif step == 2:
+            d = parse_date(txt)
+            if not d:
+                await message.answer("Не понял дату. Формат: ДД.ММ.ГГГГ\n\n" + smartlink_step_prompt(step), reply_markup=await user_menu_keyboard(tg_id))
+                return
+            data["release_date"] = d.isoformat()
+        elif step == 3:
+            if not message.photo:
+                await message.answer("Пришли фото для обложки.\n\n" + smartlink_step_prompt(step), reply_markup=await user_menu_keyboard(tg_id))
+                return
+            data["cover_file_id"] = message.photo[-1].file_id
+        else:
+            idx = step - 4
+            if idx < 0 or idx >= len(SMARTLINK_PLATFORMS):
+                await form_clear(tg_id)
+                return
+            if not txt:
+                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
+                return
+            if txt.lower() in {"пропустить", "skip"}:
+                links[SMARTLINK_PLATFORMS[idx][0]] = ""
+            else:
+                if not re.match(r"https?://", txt):
+                    await message.answer("Нужна ссылка или «Пропустить».", reply_markup=await user_menu_keyboard(tg_id))
+                    return
+                links[SMARTLINK_PLATFORMS[idx][0]] = txt
+
+        step += 1
+        if step < total_steps:
+            await form_set(tg_id, step, data)
+            await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
+            return
+
+        links_clean = {k: v for k, v in links.items() if v}
+        release_iso = data.get("release_date")
+        smartlink_id = await save_smartlink(
+            tg_id,
+            data.get("artist", ""),
+            data.get("title", ""),
+            release_iso or "",
+            data.get("cover_file_id", ""),
+            links_clean,
+        )
+        smartlink = {
+            "id": smartlink_id,
+            "owner_tg_id": tg_id,
+            "artist": data.get("artist", ""),
+            "title": data.get("title", ""),
+            "release_date": release_iso,
+            "cover_file_id": data.get("cover_file_id", ""),
+            "links": links_clean,
+            "created_at": dt.datetime.utcnow().isoformat(),
+        }
+        allow_remind = smartlink_can_remind(smartlink)
+        subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+        await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+        await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
+        await form_clear(tg_id)
+        return
+
+    if not txt or txt.startswith("/"):
+        return
+
     if form_name == "release_date":
         d = parse_date(txt)
         if not d:
