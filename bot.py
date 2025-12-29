@@ -1104,7 +1104,7 @@ def _normalize_music_url(url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(cleaned_query), fragment=""))
 
 
-async def resolve_links(url: str) -> dict[str, str]:
+async def resolve_links(url: str) -> tuple[dict[str, str], dict[str, str]]:
     timeout = aiohttp.ClientTimeout(total=10)
 
     platform_aliases = {
@@ -1132,20 +1132,37 @@ async def resolve_links(url: str) -> dict[str, str]:
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
             async with session.get(SONGLINK_API_URL, params={"url": url}) as resp:
                 if resp.status != 200:
-                    return {}
+                    return {}, {}
                 data = await resp.json()
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        return {}
+        return {}, {}
     except Exception:
-        return {}
+        return {}, {}
 
     links: dict[str, str] = {}
     collect(data.get("linksByPlatform") or {}, links)
 
-    for entity in (data.get("entitiesByUniqueId") or {}).values():
+    metadata: dict[str, str] = {}
+    entities = data.get("entitiesByUniqueId") or {}
+    primary_entity_id = data.get("entityUniqueId")
+    primary = entities.get(primary_entity_id) if primary_entity_id else None
+    candidates = [primary] if primary else []
+    candidates.extend([entity for entity in entities.values() if entity is not primary])
+
+    for entity in candidates:
         collect((entity or {}).get("linksByPlatform") or {}, links)
 
-    return links
+        artist_name = (entity or {}).get("artistName") or (entity or {}).get("artistNamePrimary")
+        title = (entity or {}).get("title")
+        cover_url = (entity or {}).get("thumbnailUrl") or (entity or {}).get("thumbnailUrlLarge")
+        if artist_name and not metadata.get("artist"):
+            metadata["artist"] = artist_name
+        if title and not metadata.get("title"):
+            metadata["title"] = title
+        if cover_url and not metadata.get("cover_url"):
+            metadata["cover_url"] = cover_url
+
+    return links, metadata
 
 
 def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
@@ -1238,6 +1255,69 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
     await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
     await form_clear(tg_id)
+
+
+async def show_import_confirmation(
+    message: Message,
+    tg_id: int,
+    links: dict[str, str],
+    metadata: dict[str, str],
+    latest: dict | None = None,
+):
+    artist = metadata.get("artist") or (latest.get("artist") if latest else "")
+    title = metadata.get("title") or (latest.get("title") if latest else "")
+    release_date = (latest.get("release_date") or "") if latest else ""
+    caption_text = (latest.get("caption_text") or "") if latest else ""
+    cover_file_id = (latest.get("cover_file_id") or "") if latest else ""
+
+    platforms_text = ", ".join(sorted(links.keys())) if links else "—"
+    caption_lines = [
+        "Нашёл ссылки на релиз.",
+        f"{artist or 'Без артиста'} — {title or 'Без названия'}",
+        "",
+        f"Площадки: {platforms_text}",
+        "",
+        "Подтверди данные или измени вручную.",
+    ]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:import_confirm")],
+            [InlineKeyboardButton(text="✏️ Изменить вручную", callback_data="smartlink:import_edit")],
+            [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
+        ]
+    )
+
+    cover_source = metadata.get("cover_url") or cover_file_id
+    preview_message: Message | None = None
+    if cover_source:
+        try:
+            preview_message = await message.answer_photo(
+                photo=cover_source,
+                caption="\n".join(caption_lines),
+                reply_markup=kb,
+            )
+        except Exception:
+            preview_message = None
+
+    if not preview_message:
+        preview_message = await message.answer("\n".join(caption_lines), reply_markup=kb)
+
+    if preview_message.photo:
+        cover_file_id = preview_message.photo[-1].file_id
+
+    await form_start(tg_id, "smartlink_import_review")
+    await form_set(
+        tg_id,
+        0,
+        {
+            "artist": artist,
+            "title": title,
+            "release_date": release_date,
+            "cover_file_id": cover_file_id,
+            "links": links,
+            "caption_text": caption_text,
+        },
+    )
 
 
 async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: dict):
@@ -2255,6 +2335,38 @@ async def smartlink_import_cb(callback):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "smartlink:import_confirm")
+async def smartlink_import_confirm_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") != "smartlink_import_review":
+        await callback.answer("Нет данных для сохранения", show_alert=True)
+        return
+    data = form.get("data") or {}
+    await finalize_smartlink_form(callback.message, tg_id, data)
+    await callback.answer("Сохранил")
+
+
+@dp.callback_query(F.data == "smartlink:import_edit")
+async def smartlink_import_edit_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    form = await form_get(tg_id)
+    links = (form or {}).get("data", {}).get("links") if form else None
+    await start_smartlink_form(callback.message, tg_id, initial_links=links or {})
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlink:import_cancel")
+async def smartlink_import_cancel_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await form_clear(tg_id)
+    await callback.message.answer("Ок, отменил импорт.", reply_markup=await user_menu_keyboard(tg_id))
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "smartlink:caption_edit")
 async def smartlink_caption_edit_cb(callback):
     tg_id = callback.from_user.id
@@ -2626,46 +2738,11 @@ async def any_message_router(message: Message):
             )
             return
 
-        links = await resolve_links(txt)
+        links, metadata = await resolve_links(txt)
 
         if len(links) >= 2:
             latest = await get_latest_smartlink(tg_id)
-            if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
-                smartlink_id = await save_smartlink(
-                    tg_id,
-                    latest.get("artist", ""),
-                    latest.get("title", ""),
-                    latest.get("release_date") or "",
-                    latest.get("cover_file_id", ""),
-                    links,
-                    latest.get("caption_text", "") or "",
-                )
-                smartlink = {
-                    "id": smartlink_id,
-                    "owner_tg_id": tg_id,
-                    "artist": latest.get("artist", ""),
-                    "title": latest.get("title", ""),
-                    "release_date": latest.get("release_date") or "",
-                    "cover_file_id": latest.get("cover_file_id", ""),
-                    "links": links,
-                    "caption_text": latest.get("caption_text", "") or "",
-                    "created_at": dt.datetime.utcnow().isoformat(),
-                }
-                allow_remind = smartlink_can_remind(smartlink)
-                subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
-                await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
-                await message.answer(
-                    "Импортировал ссылки по ссылке. Смартлинк обновлён.",
-                    reply_markup=await user_menu_keyboard(tg_id),
-                )
-                await form_clear(tg_id)
-                return
-
-            await message.answer(
-                "Нашёл ссылки. Давай заполним карточку и обложку — ссылки уже подставлены.",
-                reply_markup=await user_menu_keyboard(tg_id),
-            )
-            await start_smartlink_form(message, tg_id, initial_links=links)
+            await show_import_confirmation(message, tg_id, links, metadata, latest)
             return
 
         await message.answer(
