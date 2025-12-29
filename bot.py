@@ -30,19 +30,23 @@ REMINDER_CLEAN_DAYS = 60
 REMINDER_LAST_CLEAN: dt.date | None = None
 
 SMARTLINK_PLATFORMS = [
-    ("spotify", "Spotify"),
     ("yandex", "Яндекс Музыка"),
-    ("apple", "Apple Music"),
     ("vk", "VK Музыка"),
+    ("apple", "Apple Music"),
+    ("spotify", "Spotify"),
+    ("itunes", "iTunes"),
     ("zvuk", "Звук"),
-    ("youtube", "YouTube Music"),
+    ("youtubemusic", "YouTube Music"),
+    ("youtube", "YouTube"),
     ("deezer", "Deezer"),
 ]
 
 EXTRA_SMARTLINK_PLATFORMS = [
-    ("itunes", "iTunes"),
     ("kion", "MTS Music / КИОН"),
 ]
+
+SMARTLINK_BUTTON_ORDER = [*SMARTLINK_PLATFORMS, *EXTRA_SMARTLINK_PLATFORMS]
+KEY_PLATFORM_SET = {"yandex", "vk", "apple", "spotify"}
 
 PLATFORM_LABELS = {
     **{k: v for k, v in SMARTLINK_PLATFORMS},
@@ -1858,22 +1862,21 @@ def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str
     caption_text = html.escape(smartlink.get("caption_text") or "")
     release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
     if release_today:
-        lines = [f"🎉 Сегодня релиз: {artist} — {title}."]
+        lines = [f"{artist} — {title}"]
+        lines.append("🎉 Сегодня релиз!")
+        if release_date:
+            lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
         if caption_text:
             lines.append(caption_text)
-        lines.extend([
-            "🎧 Слушать 👇",
-            "",
-            "Сделано с помощью ИСКРЫ — @iskramusic_bot",
-        ])
+        lines.append("")
+        lines.append("Сделано с помощью ИСКРЫ — @iskramusic_bot")
         return "\n".join(lines)
 
     lines = [f"{artist} — {title}"]
-    if caption_text:
-        lines.append(caption_text)
     if release_date:
         lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
-    lines.append("🎧 Слушать 👇")
+    if caption_text:
+        lines.append(caption_text)
     lines.append("")
     lines.append("Сделано с помощью ИСКРЫ — @iskramusic_bot")
     return "\n".join(lines)
@@ -1882,10 +1885,20 @@ def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str
 def build_smartlink_buttons(smartlink: dict, subscribed: bool = False, can_remind: bool = False) -> InlineKeyboardMarkup | None:
     rows: list[list[InlineKeyboardButton]] = []
     links = smartlink.get("links") or {}
-    for key, label in [*SMARTLINK_PLATFORMS, *EXTRA_SMARTLINK_PLATFORMS]:
+
+    platform_rows: list[list[InlineKeyboardButton]] = []
+    for key, label in SMARTLINK_BUTTON_ORDER:
         url = links.get(key)
         if url:
-            rows.append([InlineKeyboardButton(text=label, url=url)])
+            platform_rows.append([InlineKeyboardButton(text=label, url=url)])
+
+    if platform_rows:
+        rows.append([InlineKeyboardButton(text="▶️ Слушать:", callback_data="smartlink:listen_label")])
+        rows.extend(platform_rows)
+
+    bandlink_url = links.get("bandlink")
+    if bandlink_url:
+        rows.append([InlineKeyboardButton(text="Открыть BandLink", url=bandlink_url)])
 
     if can_remind:
         toggle_text = "✅ Напоминание включено" if subscribed else "🔔 Напомнить о релизе"
@@ -1904,7 +1917,7 @@ def build_copy_links_text(smartlink: dict) -> str:
     lines = [f"{artist} — {title}"]
 
     link_lines: list[str] = []
-    for key, label in [*SMARTLINK_PLATFORMS, *EXTRA_SMARTLINK_PLATFORMS]:
+    for key, label in SMARTLINK_BUTTON_ORDER:
         url = links.get(key)
         if url:
             display_label = "YouTube" if key == "youtube" else label
@@ -2798,7 +2811,11 @@ async def smartlink_import_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     await form_start(tg_id, "smartlink_import")
-    await form_set(tg_id, 0, {"links": {}, "metadata": {}, "bandlink_help_shown": False})
+    await form_set(
+        tg_id,
+        0,
+        {"links": {}, "metadata": {}, "bandlink_help_shown": False, "low_links_hint_shown": False},
+    )
     await callback.message.answer(
         "Пришли ссылку на релиз: BandLink / Spotify / Apple Music / Яндекс / VK / YouTube.\n"
         "Я попробую подтянуть площадки и данные автоматически.\n"
@@ -3002,6 +3019,11 @@ async def smartlink_toggle_cb(callback):
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Напомню" if not current else "Напоминание выключено")
+
+
+@dp.callback_query(F.data == "smartlink:listen_label")
+async def smartlink_listen_label_cb(callback):
+    await callback.answer()
 
 
 @dp.callback_query(F.data.in_({"smartlink:caption_skip", "smartlink:skip"}))
@@ -3333,6 +3355,7 @@ async def any_message_router(message: Message):
         existing_links = data.get("links") or {}
         existing_metadata = data.get("metadata") or {}
         bandlink_help_shown = bool(data.get("bandlink_help_shown"))
+        low_links_hint_shown = bool(data.get("low_links_hint_shown"))
 
         detected_platform = detect_platform(txt) or ""
         if detected_platform and detected_platform != "bandlink":
@@ -3348,6 +3371,8 @@ async def any_message_router(message: Message):
                 added_platforms.append(platform_key)
 
         merged_metadata = merge_metadata(existing_metadata, metadata)
+
+        key_links_count = sum(1 for p in KEY_PLATFORM_SET if merged_links.get(p))
 
         if added_platforms:
             added_labels = [platform_label(p) for p in added_platforms]
@@ -3418,6 +3443,14 @@ async def any_message_router(message: Message):
 
         meta_complete = bool((merged_metadata or {}).get("artist") and (merged_metadata or {}).get("title"))
 
+        if key_links_count < 3 and not low_links_hint_shown:
+            data["low_links_hint_shown"] = True
+            await form_set(tg_id, form.get("step", 0) or 0, data)
+            await message.answer(
+                "Ссылок мало. Можешь прислать Яндекс или VK — доберу остальные.",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+
         if total >= 2 and meta_complete:
             await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
             return
@@ -3434,6 +3467,7 @@ async def any_message_router(message: Message):
             "links": merged_links,
             "metadata": merged_metadata,
             "bandlink_help_shown": bandlink_help_shown,
+            "low_links_hint_shown": data.get("low_links_hint_shown", False),
         })
         await form_set(tg_id, form.get("step", 0) or 0, data)
 
