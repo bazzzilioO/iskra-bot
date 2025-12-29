@@ -48,6 +48,7 @@ PLATFORM_LABELS = {
     **{k: v for k, v in SMARTLINK_PLATFORMS},
     **{k: v for k, v in EXTRA_SMARTLINK_PLATFORMS},
     "youtube": "YouTube",
+    "youtubemusic": "YouTube Music",
     "bandlink": "BandLink",
 }
 
@@ -79,8 +80,10 @@ SONGLINK_API_URL = "https://api.song.link/v1-alpha.1/links"
 SONGLINK_PLATFORM_ALIASES = {
     "spotify": "spotify",
     "applemusic": "apple",
+    "applemusicapp": "apple",
+    "apple": "apple",
     "itunes": "itunes",
-    "youtubemusic": "youtube",
+    "youtubemusic": "youtubemusic",
     "youtube": "youtube",
     "yandex": "yandex",
     "yandexmusic": "yandex",
@@ -1150,6 +1153,11 @@ def detect_platform(url: str) -> str | None:
 
     if "band.link" in netloc:
         return "bandlink"
+    if netloc.startswith("music.yandex."):
+        qs = {k.lower(): v for k, v in parse_qsl(parsed.query)}
+        if qs.get("utm_source", "").lower() == "bandlink":
+            return "bandlink"
+        return "yandex"
     if netloc == "open.spotify.com":
         return "spotify"
     if netloc == "music.apple.com":
@@ -1158,8 +1166,6 @@ def detect_platform(url: str) -> str | None:
         return "itunes"
     if netloc in {"youtube.com", "music.youtube.com", "youtu.be"}:
         return "youtube"
-    if netloc.startswith("music.yandex."):
-        return "yandex"
     if netloc == "vk.com" and parsed.path.startswith("/music"):
         return "vk"
     if netloc == "zvuk.com":
@@ -1171,96 +1177,252 @@ def platform_label(platform: str) -> str:
     return PLATFORM_LABELS.get(platform, platform)
 
 
+def _normalize_platform_key(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^a-zA-Z]", "", value).lower()
+    if not cleaned:
+        return None
+    if cleaned in {"youtubemusic", "ytmusic"}:
+        cleaned = "youtubemusic"
+    return SONGLINK_PLATFORM_ALIASES.get(cleaned, cleaned)
+
+
+def _collect_metadata_fields(candidate: dict, meta_acc: dict[str, set[str]]):
+    for key, val in candidate.items():
+        if not isinstance(val, str):
+            continue
+        lowered_key = key.lower()
+        if lowered_key in {"artist", "artistname", "artist_name"} or lowered_key.endswith("artist"):
+            if val.strip():
+                meta_acc.setdefault("artist", set()).add(val.strip())
+        if lowered_key in {"title", "track", "song", "name"} and not lowered_key.endswith("url"):
+            if val.strip():
+                meta_acc.setdefault("title", set()).add(val.strip())
+        if "cover" in lowered_key or "image" in lowered_key or "thumbnail" in lowered_key or "artwork" in lowered_key:
+            if val.strip().startswith("http"):
+                meta_acc.setdefault("cover_url", set()).add(val.strip())
+
+
+def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
+    links: dict[str, str] = {}
+    meta: dict | None = None
+    meta_candidates: dict[str, set[str]] = {}
+
+    next_data_match = re.search(
+        r"<script[^>]+id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>",
+        html_content,
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    if next_data_match:
+        try:
+            next_data_raw = html.unescape(next_data_match.group(1))
+            next_data = json.loads(next_data_raw)
+            print("[bandlink] __NEXT_DATA__ found")
+        except Exception as e:
+            print(f"[bandlink] failed to parse __NEXT_DATA__: {e}")
+            next_data = None
+    else:
+        print("[bandlink] __NEXT_DATA__ not found")
+        next_data = None
+
+    def add_link(url: str | None, platform_hint: str | None = None):
+        if not url:
+            return
+        normalized_url = _normalize_music_url(url)
+        if not normalized_url:
+            return
+        platform = _normalize_platform_key(platform_hint) or detect_platform(normalized_url)
+        if platform and platform not in links:
+            links[platform] = normalized_url
+
+    def process_service(service: dict):
+        if not isinstance(service, dict):
+            return
+        add_link(
+            service.get("href")
+            or service.get("url")
+            or service.get("link")
+            or (service.get("action") or {}).get("url"),
+            service.get("platform")
+            or service.get("service")
+            or service.get("type")
+            or service.get("id")
+            or service.get("name"),
+        )
+        _collect_metadata_fields(service, meta_candidates)
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                lowered = key.lower()
+                if isinstance(value, list) and lowered in {"services", "links", "platforms", "buttons"}:
+                    for item in value:
+                        if isinstance(item, dict):
+                            process_service(item)
+                elif isinstance(value, dict):
+                    process_service(value)
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    if next_data:
+        walk(next_data.get("props") or next_data.get("pageProps") or next_data)
+
+    if not links:
+        legacy_links = extract_links_from_bandlink(html_content)
+        if legacy_links:
+            print(f"[bandlink] legacy href parser extracted {len(legacy_links)} platforms")
+            links.update(legacy_links)
+
+    og_title_match = re.search(r'<meta[^>]+property=\"og:title\"[^>]+content=\"([^\"]+)\"', html_content, re.IGNORECASE)
+    og_image_match = re.search(r'<meta[^>]+property=\"og:image\"[^>]+content=\"([^\"]+)\"', html_content, re.IGNORECASE)
+    if og_title_match:
+        title_raw = html.unescape(og_title_match.group(1)).strip()
+        if " - " in title_raw and not meta_candidates.get("artist"):
+            artist_val, title_val = title_raw.split(" - ", 1)
+            meta_candidates.setdefault("artist", set()).add(artist_val.strip())
+            meta_candidates.setdefault("title", set()).add(title_val.strip())
+        else:
+            meta_candidates.setdefault("title", set()).add(title_raw)
+    if og_image_match:
+        image_val = html.unescape(og_image_match.group(1)).strip()
+        meta_candidates.setdefault("cover_url", set()).add(image_val)
+
+    artist = next(iter(meta_candidates.get("artist", [])), "")
+    title = next(iter(meta_candidates.get("title", [])), "")
+    cover_url = next(iter(meta_candidates.get("cover_url", [])), "")
+
+    if artist or title or cover_url:
+        meta = {
+            "artist": artist,
+            "title": title,
+            "cover_url": cover_url,
+            "source_platform": "bandlink",
+            "preferred_source": "bandlink",
+            "sources": {"bandlink": {"artist": artist, "title": title, "cover_url": cover_url}},
+            "conflict": False,
+        }
+
+    print(f"[bandlink] extracted {len(links)} platforms; meta={'yes' if meta else 'no'}")
+    return links, meta
+
+
 async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     timeout = aiohttp.ClientTimeout(total=10)
 
-    def collect(platforms: dict, acc: dict[str, str]):
-        for platform_key, info in (platforms or {}).items():
-            normalized_platform = SONGLINK_PLATFORM_ALIASES.get(platform_key.lower())
-            normalized_url = _normalize_music_url((info or {}).get("url") or "")
-            if normalized_platform and normalized_url and normalized_platform not in acc:
-                acc[normalized_platform] = normalized_url
+    async def resolve_via_songlink() -> tuple[dict[str, str], dict | None]:
+        def collect(platforms: dict, acc: dict[str, str]):
+            for platform_key, info in (platforms or {}).items():
+                normalized_platform = SONGLINK_PLATFORM_ALIASES.get(platform_key.lower())
+                normalized_url = _normalize_music_url((info or {}).get("url") or "")
+                if normalized_platform and normalized_url and normalized_platform not in acc:
+                    acc[normalized_platform] = normalized_url
 
-    def extract_platform(entity_id: str | None, entity: dict | None) -> str | None:
-        if not entity_id:
-            return None
-        parts = entity_id.split(":")
-        if parts:
-            candidate = parts[0].lower()
-            return SONGLINK_PLATFORM_ALIASES.get(candidate, candidate)
-        platform = (entity or {}).get("platform")
-        return SONGLINK_PLATFORM_ALIASES.get(platform.lower()) if platform else None
+        def extract_platform(entity_id: str | None, entity: dict | None) -> str | None:
+            if not entity_id:
+                return None
+            parts = entity_id.split(":")
+            if parts:
+                candidate = parts[0].lower()
+                return SONGLINK_PLATFORM_ALIASES.get(candidate, candidate)
+            platform = (entity or {}).get("platform")
+            return SONGLINK_PLATFORM_ALIASES.get(platform.lower()) if platform else None
 
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
-            async with session.get(SONGLINK_API_URL, params={"url": url}) as resp:
-                if resp.status != 200:
-                    return {}, {}
-                data = await resp.json()
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        return {}, {}
-    except Exception:
-        return {}, {}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
+                async with session.get(SONGLINK_API_URL, params={"url": url}) as resp:
+                    if resp.status != 200:
+                        return {}, {}
+                    data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return {}, {}
+        except Exception:
+            return {}, {}
 
+        links: dict[str, str] = {}
+        entities = data.get("entitiesByUniqueId") or {}
+        if not entities:
+            print("[songlink] empty entities from resolver")
+            return {}, {}
+
+        collect(data.get("linksByPlatform") or {}, links)
+        primary_entity_id = data.get("entityUniqueId")
+        primary = entities.get(primary_entity_id) if primary_entity_id else None
+        candidates = [primary] if primary else []
+        candidates.extend([entity for entity in entities.values() if entity is not primary])
+
+        meta_candidates: dict[str, dict[str, str]] = {}
+
+        for entity in candidates:
+            collect((entity or {}).get("linksByPlatform") or {}, links)
+
+            artist_name = (entity or {}).get("artistName") or (entity or {}).get("artistNamePrimary")
+            title = (entity or {}).get("title")
+            cover_url = (entity or {}).get("thumbnailUrl") or (entity or {}).get("thumbnailUrlLarge")
+            entity_platform = extract_platform((entity or {}).get("id") or (entity or {}).get("uniqueId"), entity)
+
+            if entity_platform:
+                meta_candidates[entity_platform] = {
+                    "artist": artist_name or "",
+                    "title": title or "",
+                    "cover_url": cover_url or "",
+                }
+
+        if not meta_candidates:
+            print("[songlink] no metadata from entities")
+            return links, None
+
+        priority = ["apple", "itunes", "spotify", "yandex", "vk", "zvuk", "youtube", "deezer", "kion", "youtubemusic"]
+        preferred = None
+        for p in priority:
+            if p in meta_candidates:
+                preferred = p
+                break
+        if not preferred:
+            preferred = next(iter(meta_candidates.keys()))
+
+        artists = {m.get("artist") for m in meta_candidates.values() if m.get("artist")}
+        titles = {m.get("title") for m in meta_candidates.values() if m.get("title")}
+        conflict = len(artists) > 1 or len(titles) > 1
+
+        meta = {
+            "artist": meta_candidates.get(preferred, {}).get("artist", ""),
+            "title": meta_candidates.get(preferred, {}).get("title", ""),
+            "cover_url": meta_candidates.get(preferred, {}).get("cover_url", ""),
+            "source_platform": preferred,
+            "preferred_source": preferred,
+            "sources": meta_candidates,
+            "conflict": conflict,
+        }
+
+        print(f"[songlink] meta source={preferred} conflict={conflict} candidates={list(meta_candidates.keys())}")
+        print(f"[songlink] extracted {len(links)} platforms")
+
+        return links, meta
+
+    detected = detect_platform(url) or ""
     links: dict[str, str] = {}
-    entities = data.get("entitiesByUniqueId") or {}
-    if not entities:
-        print("[songlink] empty entities from resolver")
-        return {}, {}
+    metadata: dict | None = None
 
-    collect(data.get("linksByPlatform") or {}, links)
-    primary_entity_id = data.get("entityUniqueId")
-    primary = entities.get(primary_entity_id) if primary_entity_id else None
-    candidates = [primary] if primary else []
-    candidates.extend([entity for entity in entities.values() if entity is not primary])
+    if detected == "bandlink":
+        html_content = await fetch_bandlink_html(url) or ""
+        band_links, band_meta = parse_bandlink(html_content)
+        links.update(band_links)
+        metadata = merge_metadata(metadata, band_meta)
 
-    meta_candidates: dict[str, dict[str, str]] = {}
+        if len(links) < 2 or not ((metadata or {}).get("artist") and (metadata or {}).get("title")):
+            song_links, song_meta = await resolve_via_songlink()
+            links.update(song_links)
+            metadata = merge_metadata(metadata, song_meta)
+    else:
+        song_links, song_meta = await resolve_via_songlink()
+        links.update(song_links)
+        metadata = merge_metadata(metadata, song_meta)
 
-    for entity in candidates:
-        collect((entity or {}).get("linksByPlatform") or {}, links)
-
-        artist_name = (entity or {}).get("artistName") or (entity or {}).get("artistNamePrimary")
-        title = (entity or {}).get("title")
-        cover_url = (entity or {}).get("thumbnailUrl") or (entity or {}).get("thumbnailUrlLarge")
-        entity_platform = extract_platform((entity or {}).get("id") or (entity or {}).get("uniqueId"), entity)
-
-        if entity_platform:
-            meta_candidates[entity_platform] = {
-                "artist": artist_name or "",
-                "title": title or "",
-                "cover_url": cover_url or "",
-            }
-
-    if not meta_candidates:
-        print("[songlink] no metadata from entities")
-        return links, None
-
-    priority = ["apple", "itunes", "spotify", "yandex", "vk", "zvuk", "youtube", "deezer", "kion"]
-    preferred = None
-    for p in priority:
-        if p in meta_candidates:
-            preferred = p
-            break
-    if not preferred:
-        preferred = next(iter(meta_candidates.keys()))
-
-    artists = {m.get("artist") for m in meta_candidates.values() if m.get("artist")}
-    titles = {m.get("title") for m in meta_candidates.values() if m.get("title")}
-    conflict = len(artists) > 1 or len(titles) > 1
-
-    meta = {
-        "artist": meta_candidates.get(preferred, {}).get("artist", ""),
-        "title": meta_candidates.get(preferred, {}).get("title", ""),
-        "cover_url": meta_candidates.get(preferred, {}).get("cover_url", ""),
-        "source_platform": preferred,
-        "preferred_source": preferred,
-        "sources": meta_candidates,
-        "conflict": conflict,
-    }
-
-    print(f"[songlink] meta source={preferred} conflict={conflict} candidates={list(meta_candidates.keys())}")
-
-    return links, meta
+    return links, metadata or {}
 
 
 def merge_metadata(existing: dict | None, new: dict | None) -> dict:
@@ -1448,8 +1610,8 @@ async def show_import_confirmation(
     ]
     if metadata and metadata.get("conflict"):
         caption_lines.append("⚠️ Название/артист отличаются на площадках. Выбери источник или подтверди по умолчанию.")
-    if preferred_source:
-        caption_lines.append(f"Источник метаданных: {preferred_source}")
+    if len(links) < 2:
+        caption_lines.append("Можно прислать ссылку другой платформы, чтобы добавить остальные площадки.")
     caption_lines.append("")
     caption_lines.append("Подтверди данные или измени вручную.")
     kb = InlineKeyboardMarkup(
@@ -3097,6 +3259,18 @@ async def any_message_router(message: Message):
             )
 
         total = len(merged_links)
+        meta_complete = bool((merged_metadata or {}).get("artist") and (merged_metadata or {}).get("title"))
+
+        if total >= 2 and meta_complete:
+            latest = await get_latest_smartlink(tg_id)
+            await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
+            return
+
+        if meta_complete:
+            latest = await get_latest_smartlink(tg_id)
+            await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
+            return
+
         if total >= 2:
             latest = await get_latest_smartlink(tg_id)
             await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
@@ -3109,7 +3283,8 @@ async def any_message_router(message: Message):
         })
         await form_set(tg_id, form.get("step", 0) or 0, data)
 
-        if detected_platform == "bandlink" and not bandlink_help_shown:
+        failure = total <= 1 and not meta_complete
+        if detected_platform == "bandlink" and not bandlink_help_shown and failure:
             data["bandlink_help_shown"] = True
             await form_set(tg_id, form.get("step", 0) or 0, data)
             await message.answer(
