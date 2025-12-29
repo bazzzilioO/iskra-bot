@@ -40,7 +40,7 @@ SMARTLINK_PLATFORMS = [
 
 
 def smartlink_step_prompt(step: int) -> str:
-    total = 4 + len(SMARTLINK_PLATFORMS)
+    total = 5 + len(SMARTLINK_PLATFORMS)
     if step == 0:
         return f"🔗 Смартлинк. Шаг 1/{total}: артист?"
     if step == 1:
@@ -49,7 +49,9 @@ def smartlink_step_prompt(step: int) -> str:
         return f"Шаг 3/{total}: дата релиза (ДД.ММ.ГГГГ)?"
     if step == 3:
         return f"Шаг 4/{total}: пришли обложку (фото)."
-    idx = step - 4
+    if step == 4:
+        return "✍️ Добавь короткий текст (необязательно). Отправь сообщением. Или нажми «Пропустить»."
+    idx = step - 5
     if 0 <= idx < len(SMARTLINK_PLATFORMS):
         label = SMARTLINK_PLATFORMS[idx][1]
         return f"Шаг {step + 1}/{total}: ссылка на {label}? (можно «Пропустить»)."
@@ -415,9 +417,14 @@ async def init_db():
             release_date TEXT,
             cover_file_id TEXT,
             links_json TEXT,
+            caption_text TEXT,
             created_at TEXT
         )
         """)
+        try:
+            await db.execute("ALTER TABLE smartlinks ADD COLUMN caption_text TEXT")
+        except Exception:
+            pass
         await db.execute("""
         CREATE TABLE IF NOT EXISTS smartlink_subscriptions (
             smartlink_id INTEGER,
@@ -655,7 +662,8 @@ def _smartlink_row_to_dict(row) -> dict:
         "release_date": row[4],
         "cover_file_id": row[5] or "",
         "links": json.loads(row[6] or "{}"),
-        "created_at": row[7],
+        "caption_text": row[7] or "",
+        "created_at": row[8],
     }
 
 
@@ -666,23 +674,42 @@ async def save_smartlink(
     release_date_iso: str,
     cover_file_id: str,
     links: dict,
+    caption_text: str,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (owner_tg_id, artist, title, release_date_iso, cover_file_id, json.dumps(links, ensure_ascii=False), dt.datetime.utcnow().isoformat()),
+            (
+                owner_tg_id,
+                artist,
+                title,
+                release_date_iso,
+                cover_file_id,
+                json.dumps(links, ensure_ascii=False),
+                caption_text,
+                dt.datetime.utcnow().isoformat(),
+            ),
         )
         await db.commit()
         return cur.lastrowid
 
 
+async def update_smartlink_caption(smartlink_id: int, caption_text: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE smartlinks SET caption_text=? WHERE id=?",
+            (caption_text, smartlink_id),
+        )
+        await db.commit()
+
+
 async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
             (owner_tg_id,),
         )
         row = await cur.fetchone()
@@ -692,7 +719,7 @@ async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
 async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at FROM smartlinks WHERE id=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE id=?",
             (smartlink_id,),
         )
         row = await cur.fetchone()
@@ -726,7 +753,7 @@ async def is_smartlink_subscribed(smartlink_id: int, subscriber_tg_id: int) -> b
 
 async def start_smartlink_form(message: Message, tg_id: int, initial_links: dict[str, str] | None = None):
     await form_start(tg_id, "smartlink")
-    await form_set(tg_id, 0, {"links": initial_links or {}})
+    await form_set(tg_id, 0, {"links": initial_links or {}, "caption_text": ""})
     await message.answer(smartlink_step_prompt(0) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
 
 
@@ -1022,9 +1049,9 @@ async def fetch_bandlink_html(url: str) -> str | None:
 
 
 def skip_prefilled_smartlink_steps(step: int, links: dict[str, str]) -> int:
-    total_steps = 4 + len(SMARTLINK_PLATFORMS)
-    while 4 <= step < total_steps:
-        idx = step - 4
+    total_steps = 5 + len(SMARTLINK_PLATFORMS)
+    while 5 <= step < total_steps:
+        idx = step - 5
         platform_key = SMARTLINK_PLATFORMS[idx][0]
         if links.get(platform_key):
             step += 1
@@ -1033,19 +1060,77 @@ def skip_prefilled_smartlink_steps(step: int, links: dict[str, str]) -> int:
     return step
 
 
+def smartlink_caption_skip_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Пропустить", callback_data="smartlink:caption_skip")]]
+    )
+
+
+async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
+    links = data.get("links") or {}
+    links_clean = {k: v for k, v in links.items() if v}
+    release_iso = data.get("release_date")
+    caption_text = data.get("caption_text", "") or ""
+    smartlink_id = await save_smartlink(
+        tg_id,
+        data.get("artist", ""),
+        data.get("title", ""),
+        release_iso or "",
+        data.get("cover_file_id", ""),
+        links_clean,
+        caption_text,
+    )
+    smartlink = {
+        "id": smartlink_id,
+        "owner_tg_id": tg_id,
+        "artist": data.get("artist", ""),
+        "title": data.get("title", ""),
+        "release_date": release_iso,
+        "cover_file_id": data.get("cover_file_id", ""),
+        "links": links_clean,
+        "caption_text": caption_text,
+        "created_at": dt.datetime.utcnow().isoformat(),
+    }
+    allow_remind = smartlink_can_remind(smartlink)
+    subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+    await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
+    await form_clear(tg_id)
+
+
+async def apply_caption_update(message: Message, tg_id: int, smartlink_id: int, caption_text: str):
+    await update_smartlink_caption(smartlink_id, caption_text)
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
+        await form_clear(tg_id)
+        return
+    allow_remind = smartlink_can_remind(smartlink)
+    subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+    await message.answer("Текст обновлён.", reply_markup=await user_menu_keyboard(tg_id))
+    await form_clear(tg_id)
+
+
 def build_smartlink_caption(smartlink: dict, release_today: bool = False) -> str:
     artist = html.escape(smartlink.get("artist") or "")
     title = html.escape(smartlink.get("title") or "")
+    caption_text = html.escape(smartlink.get("caption_text") or "")
     release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
     if release_today:
-        return "\n".join([
-            f"🎉 Сегодня релиз: {artist} — {title}.",
+        lines = [f"🎉 Сегодня релиз: {artist} — {title}."]
+        if caption_text:
+            lines.append(caption_text)
+        lines.extend([
             "🎧 Слушать 👇",
             "",
             "Сделано с помощью ИСКРЫ — @iskramusic_bot",
         ])
+        return "\n".join(lines)
 
     lines = [f"{artist} — {title}"]
+    if caption_text:
+        lines.append(caption_text)
     if release_date:
         lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
     lines.append("🎧 Слушать 👇")
@@ -1303,7 +1388,7 @@ async def process_smartlink_notifications(bot: Bot):
     today_iso = dt.date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, created_at FROM smartlinks WHERE release_date=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE release_date=?",
             (today_iso,),
         )
         smartlinks = [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -1931,6 +2016,7 @@ async def smartlink_open_cb(callback):
         inline_keyboard=[
             [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
             [InlineKeyboardButton(text="✏️ Обновить", callback_data="smartlink:new")],
+            [InlineKeyboardButton(text="✍️ Изменить текст", callback_data="smartlink:caption_edit")],
             [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
         ]
     )
@@ -1954,6 +2040,23 @@ async def smartlink_import_cb(callback):
     await callback.message.answer(
         "Пришли ссылку BandLink. Постараюсь вытащить ссылки на площадки автоматически.\n\nОтмена: /cancel",
         reply_markup=await user_menu_keyboard(tg_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlink:caption_edit")
+async def smartlink_caption_edit_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    existing = await get_latest_smartlink(tg_id)
+    if not existing:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    await form_start(tg_id, "smartlink_caption_edit")
+    await form_set(tg_id, 0, {"smartlink_id": existing.get("id"), "caption_text": existing.get("caption_text", "")})
+    await callback.message.answer(
+        smartlink_step_prompt(4) + "\n\n(Отмена: /cancel)",
+        reply_markup=smartlink_caption_skip_kb(),
     )
     await callback.answer()
 
@@ -1982,6 +2085,46 @@ async def smartlink_toggle_cb(callback):
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Напомню" if not current else "Напоминание выключено")
+
+
+@dp.callback_query(F.data == "smartlink:caption_skip")
+async def smartlink_caption_skip_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    form = await form_get(tg_id)
+    if not form:
+        await callback.answer("Нет шага", show_alert=True)
+        return
+    form_name = form.get("form_name")
+    data = form.get("data") or {}
+    if form_name == "smartlink":
+        if int(form.get("step", 0)) != 4:
+            await callback.answer("Можно пропустить на шаге текста", show_alert=True)
+            return
+        data["links"] = data.get("links") or {}
+        data["caption_text"] = ""
+        next_step = skip_prefilled_smartlink_steps(5, data["links"])
+        total_steps = 5 + len(SMARTLINK_PLATFORMS)
+        if next_step < total_steps:
+            await form_set(tg_id, next_step, data)
+            reply_markup = await user_menu_keyboard(tg_id)
+            await callback.message.answer(smartlink_step_prompt(next_step) + "\n\n(Отмена: /cancel)", reply_markup=reply_markup)
+        else:
+            await finalize_smartlink_form(callback.message, tg_id, data)
+        await callback.answer("Пропустил")
+        return
+
+    if form_name == "smartlink_caption_edit":
+        smartlink_id = data.get("smartlink_id")
+        if not smartlink_id:
+            await callback.answer("Смартлинк не найден", show_alert=True)
+            await form_clear(tg_id)
+            return
+        await apply_caption_update(callback.message, tg_id, smartlink_id, "")
+        await callback.answer("Пропустил")
+        return
+
+    await callback.answer("Нет шага", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("smartlinks:copy:"))
@@ -2205,6 +2348,7 @@ async def any_message_router(message: Message):
                     latest.get("release_date") or "",
                     latest.get("cover_file_id", ""),
                     links,
+                    latest.get("caption_text", "") or "",
                 )
                 smartlink = {
                     "id": smartlink_id,
@@ -2214,6 +2358,7 @@ async def any_message_router(message: Message):
                     "release_date": latest.get("release_date") or "",
                     "cover_file_id": latest.get("cover_file_id", ""),
                     "links": links,
+                    "caption_text": latest.get("caption_text", "") or "",
                     "created_at": dt.datetime.utcnow().isoformat(),
                 }
                 allow_remind = smartlink_can_remind(smartlink)
@@ -2245,7 +2390,7 @@ async def any_message_router(message: Message):
         data = form.get("data") or {}
         links = data.get("links") or {}
         data["links"] = links
-        total_steps = 4 + len(SMARTLINK_PLATFORMS)
+        total_steps = 5 + len(SMARTLINK_PLATFORMS)
 
         if step == 0:
             if len(txt) < 2:
@@ -2268,8 +2413,22 @@ async def any_message_router(message: Message):
                 await message.answer("Пришли фото для обложки.\n\n" + smartlink_step_prompt(step), reply_markup=await user_menu_keyboard(tg_id))
                 return
             data["cover_file_id"] = message.photo[-1].file_id
+        elif step == 4:
+            if not txt:
+                await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_caption_skip_kb())
+                return
+            if txt.lower() in {"пропустить", "skip"}:
+                data["caption_text"] = ""
+            else:
+                if len(txt) > 600:
+                    await message.answer(
+                        "Максимум 600 символов. Сократи текст и отправь снова.\n\n" + smartlink_step_prompt(step),
+                        reply_markup=smartlink_caption_skip_kb(),
+                    )
+                    return
+                data["caption_text"] = txt
         else:
-            idx = step - 4
+            idx = step - 5
             if idx < 0 or idx >= len(SMARTLINK_PLATFORMS):
                 await form_clear(tg_id)
                 return
@@ -2288,34 +2447,36 @@ async def any_message_router(message: Message):
         step = skip_prefilled_smartlink_steps(step, links)
         if step < total_steps:
             await form_set(tg_id, step, data)
-            await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
+            reply_markup = await user_menu_keyboard(tg_id)
+            if step == 4:
+                reply_markup = smartlink_caption_skip_kb()
+            await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=reply_markup)
             return
 
-        links_clean = {k: v for k, v in links.items() if v}
-        release_iso = data.get("release_date")
-        smartlink_id = await save_smartlink(
-            tg_id,
-            data.get("artist", ""),
-            data.get("title", ""),
-            release_iso or "",
-            data.get("cover_file_id", ""),
-            links_clean,
-        )
-        smartlink = {
-            "id": smartlink_id,
-            "owner_tg_id": tg_id,
-            "artist": data.get("artist", ""),
-            "title": data.get("title", ""),
-            "release_date": release_iso,
-            "cover_file_id": data.get("cover_file_id", ""),
-            "links": links_clean,
-            "created_at": dt.datetime.utcnow().isoformat(),
-        }
-        allow_remind = smartlink_can_remind(smartlink)
-        subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
-        await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
-        await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
-        await form_clear(tg_id)
+        await finalize_smartlink_form(message, tg_id, data)
+        return
+
+    if form_name == "smartlink_caption_edit":
+        data = form.get("data") or {}
+        smartlink_id = data.get("smartlink_id")
+        if not smartlink_id:
+            await form_clear(tg_id)
+            await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
+            return
+        if not txt:
+            await message.answer(smartlink_step_prompt(4) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_caption_skip_kb())
+            return
+        if txt.lower() in {"пропустить", "skip"}:
+            caption_text = ""
+        else:
+            if len(txt) > 600:
+                await message.answer(
+                    "Максимум 600 символов. Сократи текст и отправь снова.\n\n" + smartlink_step_prompt(4),
+                    reply_markup=smartlink_caption_skip_kb(),
+                )
+                return
+            caption_text = txt
+        await apply_caption_update(message, tg_id, smartlink_id, caption_text)
         return
 
     if not txt or txt.startswith("/"):
