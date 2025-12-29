@@ -1164,12 +1164,18 @@ def detect_platform(url: str) -> str | None:
         return "apple"
     if netloc == "itunes.apple.com":
         return "itunes"
-    if netloc in {"youtube.com", "music.youtube.com", "youtu.be"}:
+    if netloc in {"music.vk.com", "music.vk.ru"}:
+        return "vk"
+    if netloc in {"youtube.com", "youtu.be"}:
         return "youtube"
-    if netloc == "vk.com" and parsed.path.startswith("/music"):
+    if netloc == "music.youtube.com":
+        return "youtubemusic"
+    if netloc == "vk.com" and (parsed.path.startswith("/music") or parsed.path.startswith("/link")):
         return "vk"
     if netloc == "zvuk.com":
         return "zvuk"
+    if netloc.startswith("kion.") or netloc == "kion.ru" or netloc.startswith("music.kion."):
+        return "kion"
     return None
 
 
@@ -1271,6 +1277,18 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
     if next_data:
         walk(next_data.get("props") or next_data.get("pageProps") or next_data)
 
+    if not links or len(links) < 3:
+        for match in re.finditer(r"<a[^>]+class=\"([^\"]*el-link[^\"]*)\"[^>]+href=\"([^\"]+)\"", html_content, re.IGNORECASE):
+            class_attr = match.group(1)
+            href = html.unescape(match.group(2))
+            class_tokens = {token.strip().lower() for token in class_attr.split() if token.strip()}
+            platform_hint = None
+            for token in class_tokens:
+                if token in {"yandex", "vk", "spotify", "apple", "itunes", "zvuk", "kion", "youtube", "youtubemusic"}:
+                    platform_hint = token
+                    break
+            add_link(href, platform_hint)
+
     if not links:
         legacy_links = extract_links_from_bandlink(html_content)
         if legacy_links:
@@ -1312,6 +1330,7 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
 
 async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     timeout = aiohttp.ClientTimeout(total=10)
+    normalized_input_url = _normalize_music_url(url)
 
     async def resolve_via_songlink() -> tuple[dict[str, str], dict | None]:
         def collect(platforms: dict, acc: dict[str, str]):
@@ -1422,6 +1441,11 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
         links.update(song_links)
         metadata = merge_metadata(metadata, song_meta)
 
+    if detected and normalized_input_url:
+        platform_key = SONGLINK_PLATFORM_ALIASES.get(detected, detected)
+        if platform_key not in links:
+            links[platform_key] = normalized_input_url
+
     return links, metadata or {}
 
 
@@ -1475,13 +1499,21 @@ def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
             platform = "spotify"
         elif netloc == "music.apple.com":
             platform = "apple"
+        elif netloc == "itunes.apple.com":
+            platform = "itunes"
         elif netloc.startswith("music.yandex."):
             platform = "yandex"
-        elif netloc == "vk.com" and parsed.path.startswith("/music"):
+        elif netloc in {"music.vk.com", "music.vk.ru"}:
+            platform = "vk"
+        elif netloc == "vk.com" and (parsed.path.startswith("/music") or parsed.path.startswith("/link")):
             platform = "vk"
         elif netloc == "zvuk.com":
             platform = "zvuk"
-        elif netloc in {"music.youtube.com", "youtube.com"}:
+        elif netloc.startswith("kion.") or netloc == "kion.ru" or netloc.startswith("music.kion."):
+            platform = "kion"
+        elif netloc == "music.youtube.com":
+            platform = "youtubemusic"
+        elif netloc in {"youtube.com", "youtu.be"}:
             platform = "youtube"
 
         if platform and platform not in links:
@@ -1490,10 +1522,16 @@ def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
 
 
 async def fetch_bandlink_html(url: str) -> str | None:
-    timeout = aiohttp.ClientTimeout(total=10)
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {
+        "User-Agent": BANDLINK_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+    }
     try:
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
-            async with session.get(url) as resp:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
                 if resp.status >= 400:
                     return None
                 return await resp.text()
@@ -1608,6 +1646,9 @@ async def show_import_confirmation(
         "",
         f"Площадки: {platforms_text}",
     ]
+    if metadata and sources:
+        label = platform_label(preferred_source) if preferred_source else "—"
+        caption_lines.append(f"Источник метаданных: {label}")
     if metadata and metadata.get("conflict"):
         caption_lines.append("⚠️ Название/артист отличаются на площадках. Выбери источник или подтверди по умолчанию.")
     if len(links) < 2:
@@ -2731,8 +2772,8 @@ async def smartlink_import_cb(callback):
     await form_start(tg_id, "smartlink_import")
     await form_set(tg_id, 0, {"links": {}, "metadata": {}, "bandlink_help_shown": False})
     await callback.message.answer(
-        "Пришли ссылку на трек: BandLink / Spotify / Apple Music / YouTube.\n"
-        "Я попробую подтянуть все площадки автоматически.\n"
+        "Пришли ссылку на релиз: BandLink / Spotify / Apple Music / Яндекс / VK / YouTube.\n"
+        "Я попробую подтянуть площадки и данные автоматически.\n"
         "Если BandLink не отдаст ссылки — подскажу, как скопировать одну кнопку платформы.\n\n"
         "Отмена: /cancel",
         reply_markup=await user_menu_keyboard(tg_id),
@@ -3259,20 +3300,75 @@ async def any_message_router(message: Message):
             )
 
         total = len(merged_links)
+        latest = await get_latest_smartlink(tg_id)
+        temp_data = {"metadata": merged_metadata, "preferred_source": merged_metadata.get("preferred_source")}
+        selected_meta = pick_selected_metadata(temp_data)
+        cover_source = selected_meta.get("cover_url") or (merged_metadata or {}).get("cover_url") or ""
+        cover_file_id = ""
+        if cover_source:
+            try:
+                input_file = await fetch_cover_file(cover_source)
+                if input_file:
+                    preview = await message.answer_photo(photo=input_file, caption="Загрузил обложку…")
+                    cover_file_id = preview.photo[-1].file_id if preview.photo else ""
+                    await preview.delete()
+            except Exception as e:
+                print(f"[cover] failed to auto download: {e}")
+
+        ready_for_autofill = (
+            not (merged_metadata or {}).get("conflict")
+            and bool(selected_meta.get("artist"))
+            and bool(selected_meta.get("title"))
+            and bool(cover_file_id)
+            and total >= 2
+        )
+
+        if ready_for_autofill:
+            data.update(
+                {
+                    "artist": selected_meta.get("artist", ""),
+                    "title": selected_meta.get("title", ""),
+                    "cover_file_id": cover_file_id,
+                    "links": merged_links,
+                    "metadata": merged_metadata,
+                    "preferred_source": merged_metadata.get("preferred_source"),
+                    "release_date": (latest or {}).get("release_date", ""),
+                    "caption_text": (latest or {}).get("caption_text", ""),
+                }
+            )
+            await form_start(tg_id, "smartlink_prefill_edit")
+            await form_set(tg_id, 0, data)
+            platforms_text = ", ".join(sorted(merged_links.keys())) if merged_links else "—"
+            summary_lines = [
+                "Нашёл ссылки и данные релиза:",
+                f"{data.get('artist') or 'Без артиста'} — {data.get('title') or 'Без названия'}",
+                f"Площадки: {platforms_text}",
+                "Карточку заполнил автоматически.",
+            ]
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="Продолжить", callback_data="smartlink:prefill_continue")],
+                    [InlineKeyboardButton(text="✏️ Изменить данные", callback_data="smartlink:import_edit")],
+                    [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
+                ]
+            )
+            try:
+                await message.answer_photo(photo=cover_file_id, caption="\n".join(summary_lines), reply_markup=kb)
+            except Exception:
+                await message.answer("\n".join(summary_lines), reply_markup=kb)
+            return
+
         meta_complete = bool((merged_metadata or {}).get("artist") and (merged_metadata or {}).get("title"))
 
         if total >= 2 and meta_complete:
-            latest = await get_latest_smartlink(tg_id)
             await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
             return
 
         if meta_complete:
-            latest = await get_latest_smartlink(tg_id)
             await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
             return
 
         if total >= 2:
-            latest = await get_latest_smartlink(tg_id)
             await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
             return
 
