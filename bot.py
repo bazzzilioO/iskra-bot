@@ -326,6 +326,12 @@ ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
 SMTP_TO = os.getenv("SMTP_TO") or LABEL_EMAIL
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_UPC_ENABLED = bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)
+
+_SPOTIFY_ACCESS_TOKEN: str | None = None
+_SPOTIFY_TOKEN_EXPIRES_AT: dt.datetime | None = None
 
 dp = Dispatcher()
 
@@ -996,6 +1002,81 @@ def build_links_kb() -> InlineKeyboardMarkup:
     ])
 
 
+async def get_spotify_access_token() -> str | None:
+    global _SPOTIFY_ACCESS_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
+
+    if not SPOTIFY_UPC_ENABLED:
+        return None
+
+    now = dt.datetime.utcnow()
+    if _SPOTIFY_ACCESS_TOKEN and _SPOTIFY_TOKEN_EXPIRES_AT and _SPOTIFY_TOKEN_EXPIRES_AT > now:
+        return _SPOTIFY_ACCESS_TOKEN
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://accounts.spotify.com/api/token",
+                data={"grant_type": "client_credentials"},
+                auth=aiohttp.BasicAuth(SPOTIFY_CLIENT_ID or "", SPOTIFY_CLIENT_SECRET or ""),
+            ) as resp:
+                if resp.status >= 400:
+                    return None
+                payload = await resp.json()
+                token = payload.get("access_token")
+                expires_in = int(payload.get("expires_in", 3600))
+                if not token:
+                    return None
+                _SPOTIFY_ACCESS_TOKEN = token
+                _SPOTIFY_TOKEN_EXPIRES_AT = now + dt.timedelta(seconds=max(expires_in - 30, 0))
+                return token
+    except Exception:
+        return None
+
+    return None
+
+
+async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
+    token = await get_spotify_access_token()
+    if not token:
+        return []
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"q": f"upc:{upc}", "type": "album,track", "limit": 5}
+    candidates: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    def add_candidate(title: str, artists: list[dict] | list[str], url: str | None):
+        if not url or url in seen_urls:
+            return
+        artist_names_list: list[str] = []
+        for a in artists:
+            name = a.get("name") if isinstance(a, dict) else str(a)
+            if name:
+                artist_names_list.append(name)
+        artist_names = ", ".join(artist_names_list)
+        candidates.append({"artist": artist_names, "title": title, "spotify_url": url})
+        seen_urls.add(url)
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get("https://api.spotify.com/v1/search", headers=headers, params=params) as resp:
+                if resp.status >= 400:
+                    return []
+                data = await resp.json()
+    except Exception:
+        return []
+
+    for item in data.get("albums", {}).get("items", []) or []:
+        add_candidate(item.get("name", ""), item.get("artists", []), (item.get("external_urls") or {}).get("spotify"))
+
+    for item in data.get("tracks", {}).get("items", []) or []:
+        add_candidate(item.get("name", ""), item.get("artists", []), (item.get("external_urls") or {}).get("spotify"))
+
+    return candidates
+
+
 def _normalize_music_url(url: str) -> str:
     parsed = urlparse(url.strip())
     if parsed.scheme not in {"http", "https"}:
@@ -1096,6 +1177,51 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
     await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
     await form_clear(tg_id)
+
+
+async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: dict):
+    await form_clear(tg_id)
+
+    spotify_url = candidate.get("spotify_url")
+    if not spotify_url:
+        await message.answer("Не нашёл ссылку Spotify для этого UPC.", reply_markup=await user_menu_keyboard(tg_id))
+        return
+
+    latest = await get_latest_smartlink(tg_id)
+    if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
+        links = latest.get("links") or {}
+        links["spotify"] = spotify_url
+        smartlink_id = await save_smartlink(
+            tg_id,
+            latest.get("artist", ""),
+            latest.get("title", ""),
+            latest.get("release_date") or "",
+            latest.get("cover_file_id", ""),
+            links,
+            latest.get("caption_text", "") or "",
+        )
+        smartlink = {
+            "id": smartlink_id,
+            "owner_tg_id": tg_id,
+            "artist": latest.get("artist", ""),
+            "title": latest.get("title", ""),
+            "release_date": latest.get("release_date") or "",
+            "cover_file_id": latest.get("cover_file_id", ""),
+            "links": links,
+            "caption_text": latest.get("caption_text", "") or "",
+            "created_at": dt.datetime.utcnow().isoformat(),
+        }
+        allow_remind = smartlink_can_remind(smartlink)
+        subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+        await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+        await message.answer("Добавил Spotify по UPC. Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
+        return
+
+    await message.answer(
+        "Нашёл Spotify. Давай заполним смартлинк: ссылка на Spotify уже подставлена.",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
+    await start_smartlink_form(message, tg_id, initial_links={"spotify": spotify_url})
 
 
 async def apply_caption_update(message: Message, tg_id: int, smartlink_id: int, caption_text: str):
@@ -1997,13 +2123,15 @@ async def smartlink_open_cb(callback):
     await ensure_user(tg_id)
     existing = await get_latest_smartlink(tg_id)
     if not existing:
-        actions_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
-                [InlineKeyboardButton(text="✏️ Создать вручную", callback_data="smartlink:new")],
-                [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
-            ]
-        )
+        inline_keyboard = []
+        if SPOTIFY_UPC_ENABLED:
+            inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
+        inline_keyboard.extend([
+            [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
+            [InlineKeyboardButton(text="✏️ Создать вручную", callback_data="smartlink:new")],
+            [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
+        ])
+        actions_kb = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
         await callback.message.answer("Смартлинк не найден. Выбери действие:", reply_markup=actions_kb)
         await callback.answer()
         return
@@ -2012,14 +2140,16 @@ async def smartlink_open_cb(callback):
     subscribed = await is_smartlink_subscribed(existing.get("id"), tg_id) if allow_remind else False
     await send_smartlink_photo(callback.message.bot, tg_id, existing, subscribed=subscribed, allow_remind=allow_remind)
 
-    manage_kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
-            [InlineKeyboardButton(text="✏️ Обновить", callback_data="smartlink:new")],
-            [InlineKeyboardButton(text="✍️ Изменить текст", callback_data="smartlink:caption_edit")],
-            [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
-        ]
-    )
+    inline_keyboard = []
+    if SPOTIFY_UPC_ENABLED:
+        inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
+    inline_keyboard.extend([
+        [InlineKeyboardButton(text="⚡ Импорт из BandLink", callback_data="smartlink:import")],
+        [InlineKeyboardButton(text="✏️ Обновить", callback_data="smartlink:new")],
+        [InlineKeyboardButton(text="✍️ Изменить текст", callback_data="smartlink:caption_edit")],
+        [InlineKeyboardButton(text="↩️ В фокус", callback_data="back_to_focus")],
+    ])
+    manage_kb = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
     await callback.message.answer("Можно обновить смартлинк:", reply_markup=manage_kb)
     await callback.answer()
 
@@ -2029,6 +2159,23 @@ async def smartlink_new_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     await start_smartlink_form(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlink:upc")
+async def smartlink_upc_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+
+    if not SPOTIFY_UPC_ENABLED:
+        await callback.answer("Не задан SPOTIFY_CLIENT_ID/SECRET", show_alert=True)
+        return
+
+    await form_start(tg_id, "smartlink_upc")
+    await callback.message.answer(
+        "⚡ Автозаполнение по UPC. Пришли UPC (12–14 цифр).\n\n(Отмена: /cancel)",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
     await callback.answer()
 
 
@@ -2058,6 +2205,39 @@ async def smartlink_caption_edit_cb(callback):
         smartlink_step_prompt(4) + "\n\n(Отмена: /cancel)",
         reply_markup=smartlink_caption_skip_kb(),
     )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlink:upc_pick:"))
+async def smartlink_upc_pick_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer("Не понял выбор", show_alert=True)
+        return
+
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") != "smartlink_upc":
+        await callback.answer("Запрос устарел, пришли UPC снова", show_alert=True)
+        return
+
+    candidates = (form.get("data") or {}).get("candidates") or []
+    idx = int(parts[2])
+    if idx < 0 or idx >= len(candidates):
+        await callback.answer("Запрос устарел, пришли UPC снова", show_alert=True)
+        return
+
+    await apply_spotify_upc_selection(callback.message, tg_id, candidates[idx])
+    await callback.answer("Готово")
+
+
+@dp.callback_query(F.data == "smartlink:upc_cancel")
+async def smartlink_upc_cancel_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await form_clear(tg_id)
+    await callback.message.answer("Ок, не сохраняю.", reply_markup=await user_menu_keyboard(tg_id))
     await callback.answer()
 
 
@@ -2327,6 +2507,53 @@ async def any_message_router(message: Message):
         return
 
     form_name = form.get("form_name")
+    if form_name == "smartlink_upc":
+        digits = re.sub(r"\D", "", txt)
+        if not re.fullmatch(r"\d{12,14}", digits):
+            await message.answer(
+                "Нужен UPC: 12–14 цифр. Пришли номер ещё раз.\n\n(Отмена: /cancel)",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+
+        results = await spotify_search_upc(digits)
+        if not results:
+            await message.answer(
+                "Не нашёл, попробуй BandLink или вставь ссылки вручную. Можешь прислать другой UPC.",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+
+        await form_set(tg_id, 1, {"upc": digits, "candidates": results})
+        if len(results) == 1:
+            candidate = results[0]
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:upc_pick:0")],
+                    [InlineKeyboardButton(text="Отмена", callback_data="smartlink:upc_cancel")],
+                ]
+            )
+            await message.answer(
+                f"Нашёл: {candidate.get('artist') or 'Без артиста'} — {candidate.get('title') or ''}\n"
+                f"{candidate.get('spotify_url', '')}\n\nПодтверждаешь?",
+                reply_markup=kb,
+            )
+        else:
+            rows = []
+            for idx, candidate in enumerate(results):
+                label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}".strip(" —")
+                if len(label) > 60:
+                    label = label[:57] + "…"
+                if not label:
+                    label = f"Вариант {idx + 1}"
+                rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlink:upc_pick:{idx}")])
+            rows.append([InlineKeyboardButton(text="Отмена", callback_data="smartlink:upc_cancel")])
+            await message.answer(
+                "Выбери релиз по UPC:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        return
+
     if form_name == "smartlink_import":
         if not re.match(r"https?://", txt):
             await message.answer(
