@@ -18,7 +18,8 @@ from aiogram.types import (
     Message,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    LabeledPrice, PreCheckoutQuery
+    LabeledPrice, PreCheckoutQuery,
+    BufferedInputFile,
 )
 from dotenv import load_dotenv
 
@@ -68,6 +69,19 @@ BANDLINK_USER_AGENT = (
 )
 
 SONGLINK_API_URL = "https://api.song.link/v1-alpha.1/links"
+SONGLINK_PLATFORM_ALIASES = {
+    "spotify": "spotify",
+    "applemusic": "apple",
+    "itunes": "itunes",
+    "youtubemusic": "youtube",
+    "youtube": "youtube",
+    "yandex": "yandex",
+    "yandexmusic": "yandex",
+    "vk": "vk",
+    "zvuk": "zvuk",
+    "kion": "kion",
+    "mts": "kion",
+}
 
 RESOLVER_FALLBACK_TEXT = (
     "BandLink открывается через JS, поэтому бот иногда не видит кнопки.\n"
@@ -774,10 +788,28 @@ async def is_smartlink_subscribed(smartlink_id: int, subscriber_tg_id: int) -> b
         return row is not None
 
 
-async def start_smartlink_form(message: Message, tg_id: int, initial_links: dict[str, str] | None = None):
+async def start_smartlink_form(
+    message: Message,
+    tg_id: int,
+    initial_links: dict[str, str] | None = None,
+    prefill: dict | None = None,
+):
+    data = {"links": initial_links or {}, "caption_text": ""}
+    if prefill:
+        data.update(prefill)
+    step = skip_prefilled_smartlink_steps(0, data)
     await form_start(tg_id, "smartlink")
-    await form_set(tg_id, 0, {"links": initial_links or {}, "caption_text": ""})
-    await message.answer(smartlink_step_prompt(0) + "\n\n(Отмена: /cancel)", reply_markup=await user_menu_keyboard(tg_id))
+    await form_set(tg_id, step, data)
+
+    total_steps = 5 + len(SMARTLINK_PLATFORMS)
+    if step >= total_steps:
+        await finalize_smartlink_form(message, tg_id, data)
+        return
+
+    reply_markup = await user_menu_keyboard(tg_id)
+    if step == 4:
+        reply_markup = smartlink_caption_skip_kb()
+    await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=reply_markup)
 
 
 # -------------------- Forms --------------------
@@ -1104,29 +1136,25 @@ def _normalize_music_url(url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(cleaned_query), fragment=""))
 
 
-async def resolve_links(url: str) -> tuple[dict[str, str], dict[str, str]]:
+async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     timeout = aiohttp.ClientTimeout(total=10)
-
-    platform_aliases = {
-        "spotify": "spotify",
-        "applemusic": "apple",
-        "itunes": "itunes",
-        "youtubemusic": "youtube",
-        "youtube": "youtube",
-        "yandex": "yandex",
-        "yandexmusic": "yandex",
-        "vk": "vk",
-        "zvuk": "zvuk",
-        "kion": "kion",
-        "mts": "kion",
-    }
 
     def collect(platforms: dict, acc: dict[str, str]):
         for platform_key, info in (platforms or {}).items():
-            normalized_platform = platform_aliases.get(platform_key.lower())
+            normalized_platform = SONGLINK_PLATFORM_ALIASES.get(platform_key.lower())
             normalized_url = _normalize_music_url((info or {}).get("url") or "")
             if normalized_platform and normalized_url and normalized_platform not in acc:
                 acc[normalized_platform] = normalized_url
+
+    def extract_platform(entity_id: str | None, entity: dict | None) -> str | None:
+        if not entity_id:
+            return None
+        parts = entity_id.split(":")
+        if parts:
+            candidate = parts[0].lower()
+            return SONGLINK_PLATFORM_ALIASES.get(candidate, candidate)
+        platform = (entity or {}).get("platform")
+        return SONGLINK_PLATFORM_ALIASES.get(platform.lower()) if platform else None
 
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
@@ -1142,12 +1170,13 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict[str, str]]:
     links: dict[str, str] = {}
     collect(data.get("linksByPlatform") or {}, links)
 
-    metadata: dict[str, str] = {}
     entities = data.get("entitiesByUniqueId") or {}
     primary_entity_id = data.get("entityUniqueId")
     primary = entities.get(primary_entity_id) if primary_entity_id else None
     candidates = [primary] if primary else []
     candidates.extend([entity for entity in entities.values() if entity is not primary])
+
+    meta_candidates: dict[str, dict[str, str]] = {}
 
     for entity in candidates:
         collect((entity or {}).get("linksByPlatform") or {}, links)
@@ -1155,14 +1184,45 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict[str, str]]:
         artist_name = (entity or {}).get("artistName") or (entity or {}).get("artistNamePrimary")
         title = (entity or {}).get("title")
         cover_url = (entity or {}).get("thumbnailUrl") or (entity or {}).get("thumbnailUrlLarge")
-        if artist_name and not metadata.get("artist"):
-            metadata["artist"] = artist_name
-        if title and not metadata.get("title"):
-            metadata["title"] = title
-        if cover_url and not metadata.get("cover_url"):
-            metadata["cover_url"] = cover_url
+        entity_platform = extract_platform((entity or {}).get("id") or (entity or {}).get("uniqueId"), entity)
 
-    return links, metadata
+        if entity_platform:
+            meta_candidates[entity_platform] = {
+                "artist": artist_name or "",
+                "title": title or "",
+                "cover_url": cover_url or "",
+            }
+
+    if not meta_candidates:
+        print("[songlink] no metadata from entities")
+        return links, None
+
+    priority = ["apple", "itunes", "spotify", "yandex", "vk", "zvuk", "youtube", "deezer", "kion"]
+    preferred = None
+    for p in priority:
+        if p in meta_candidates:
+            preferred = p
+            break
+    if not preferred:
+        preferred = next(iter(meta_candidates.keys()))
+
+    artists = {m.get("artist") for m in meta_candidates.values() if m.get("artist")}
+    titles = {m.get("title") for m in meta_candidates.values() if m.get("title")}
+    conflict = len(artists) > 1 or len(titles) > 1
+
+    meta = {
+        "artist": meta_candidates.get(preferred, {}).get("artist", ""),
+        "title": meta_candidates.get(preferred, {}).get("title", ""),
+        "cover_url": meta_candidates.get(preferred, {}).get("cover_url", ""),
+        "source_platform": preferred,
+        "preferred_source": preferred,
+        "sources": meta_candidates,
+        "conflict": conflict,
+    }
+
+    print(f"[songlink] meta source={preferred} conflict={conflict} candidates={list(meta_candidates.keys())}")
+
+    return links, meta
 
 
 def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
@@ -1207,14 +1267,25 @@ async def fetch_bandlink_html(url: str) -> str | None:
         return None
 
 
-def skip_prefilled_smartlink_steps(step: int, links: dict[str, str]) -> int:
+def skip_prefilled_smartlink_steps(step: int, data: dict) -> int:
     total_steps = 5 + len(SMARTLINK_PLATFORMS)
-    while 5 <= step < total_steps:
-        idx = step - 5
-        platform_key = SMARTLINK_PLATFORMS[idx][0]
-        if links.get(platform_key):
+    links = data.get("links") or {}
+    while step < total_steps:
+        if step == 0 and data.get("artist"):
             step += 1
             continue
+        if step == 1 and data.get("title"):
+            step += 1
+            continue
+        if step == 3 and data.get("cover_file_id"):
+            step += 1
+            continue
+        if step >= 5:
+            idx = step - 5
+            platform_key = SMARTLINK_PLATFORMS[idx][0]
+            if links.get(platform_key):
+                step += 1
+                continue
         break
     return step
 
@@ -1257,15 +1328,41 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     await form_clear(tg_id)
 
 
+async def fetch_cover_file(cover_url: str) -> BufferedInputFile | None:
+    if not cover_url:
+        return None
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(cover_url) as resp:
+                if resp.status >= 400:
+                    print(f"[cover] failed to fetch {cover_url}: status {resp.status}")
+                    return None
+                data = await resp.read()
+                if not data:
+                    return None
+                filename = cover_url.split("/")[-1] or "cover.jpg"
+                return BufferedInputFile(data, filename=filename)
+    except Exception as e:
+        print(f"[cover] error fetching {cover_url}: {e}")
+        return None
+
+
 async def show_import_confirmation(
     message: Message,
     tg_id: int,
     links: dict[str, str],
-    metadata: dict[str, str],
+    metadata: dict | None,
     latest: dict | None = None,
 ):
-    artist = metadata.get("artist") or (latest.get("artist") if latest else "")
-    title = metadata.get("title") or (latest.get("title") if latest else "")
+    sources = (metadata or {}).get("sources") or {}
+    preferred_source = (metadata or {}).get("preferred_source") or (metadata or {}).get("source_platform")
+    if preferred_source not in sources and sources:
+        preferred_source = next(iter(sources.keys()))
+    selected_meta = sources.get(preferred_source, metadata or {}) if metadata else {}
+
+    artist = selected_meta.get("artist") or (latest.get("artist") if latest else "")
+    title = selected_meta.get("title") or (latest.get("title") if latest else "")
     release_date = (latest.get("release_date") or "") if latest else ""
     caption_text = (latest.get("caption_text") or "") if latest else ""
     cover_file_id = (latest.get("cover_file_id") or "") if latest else ""
@@ -1276,27 +1373,46 @@ async def show_import_confirmation(
         f"{artist or 'Без артиста'} — {title or 'Без названия'}",
         "",
         f"Площадки: {platforms_text}",
-        "",
-        "Подтверди данные или измени вручную.",
     ]
+    if metadata and metadata.get("conflict"):
+        caption_lines.append("⚠️ Название/артист отличаются на площадках. Выбери источник или подтверди по умолчанию.")
+    if preferred_source:
+        caption_lines.append(f"Источник метаданных: {preferred_source}")
+    caption_lines.append("")
+    caption_lines.append("Подтверди данные или измени вручную.")
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:import_confirm")],
-            [InlineKeyboardButton(text="✏️ Изменить вручную", callback_data="smartlink:import_edit")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="smartlink:import_edit")],
             [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
         ]
     )
 
-    cover_source = metadata.get("cover_url") or cover_file_id
+    if metadata and len(sources) > 1:
+        source_row = []
+        for platform_key in sorted(sources.keys()):
+            label = SONGLINK_PLATFORM_ALIASES.get(platform_key, platform_key)
+            mark = "✅ " if platform_key == preferred_source else ""
+            source_row.append(InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"smartlink:import_source:{platform_key}"))
+        kb.inline_keyboard.insert(0, source_row)
+
+    cover_source = selected_meta.get("cover_url") or cover_file_id
     preview_message: Message | None = None
     if cover_source:
         try:
+            input_file = await fetch_cover_file(cover_source)
+        except Exception:
+            input_file = None
+        try:
             preview_message = await message.answer_photo(
-                photo=cover_source,
+                photo=input_file or cover_source,
                 caption="\n".join(caption_lines),
                 reply_markup=kb,
             )
-        except Exception:
+            if input_file:
+                print(f"[cover] downloaded cover from {cover_source}")
+        except Exception as e:
+            print(f"[cover] failed to show preview: {e}")
             preview_message = None
 
     if not preview_message:
@@ -1316,8 +1432,62 @@ async def show_import_confirmation(
             "cover_file_id": cover_file_id,
             "links": links,
             "caption_text": caption_text,
+            "metadata": metadata or {},
+            "preferred_source": preferred_source,
         },
     )
+
+
+def pick_selected_metadata(data: dict) -> dict:
+    metadata = data.get("metadata") or {}
+    sources = metadata.get("sources") or {}
+    preferred = data.get("preferred_source") or metadata.get("preferred_source") or metadata.get("source_platform")
+    if preferred and preferred in sources:
+        return sources.get(preferred) or {}
+    if sources:
+        first_key = next(iter(sources.keys()))
+        return sources.get(first_key) or {}
+    return metadata
+
+
+async def start_prefill_editor(message: Message, tg_id: int, data: dict):
+    selected_meta = pick_selected_metadata(data)
+    artist = data.get("artist") or selected_meta.get("artist") or ""
+    title = data.get("title") or selected_meta.get("title") or ""
+    cover_file_id = data.get("cover_file_id") or selected_meta.get("cover_file_id") or ""
+
+    display_lines = [
+        "Проверь данные перед сохранением:",
+        f"Артист: {artist or '—'}",
+        f"Релиз: {title or '—'}",
+        f"Площадки: {', '.join(sorted((data.get('links') or {}).keys())) or '—'}",
+        "",
+        "Можно поправить нужное поле и продолжить.",
+    ]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Изменить артиста", callback_data="smartlink:prefill_edit:artist")],
+            [InlineKeyboardButton(text="Изменить релиз", callback_data="smartlink:prefill_edit:title")],
+            [InlineKeyboardButton(text="Заменить обложку", callback_data="smartlink:prefill_edit:cover")],
+            [InlineKeyboardButton(text="Продолжить", callback_data="smartlink:prefill_continue")],
+            [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
+        ]
+    )
+
+    if cover_file_id:
+        try:
+            await message.answer_photo(photo=cover_file_id, caption="\n".join(display_lines), reply_markup=kb)
+        except Exception:
+            await message.answer("\n".join(display_lines), reply_markup=kb)
+    else:
+        await message.answer("\n".join(display_lines), reply_markup=kb)
+
+    data["artist"] = artist
+    data["title"] = title
+    data["cover_file_id"] = cover_file_id
+    data.pop("pending", None)
+    await form_start(tg_id, "smartlink_prefill_edit")
+    await form_set(tg_id, 0, data)
 
 
 async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: dict):
@@ -2344,8 +2514,46 @@ async def smartlink_import_confirm_cb(callback):
         await callback.answer("Нет данных для сохранения", show_alert=True)
         return
     data = form.get("data") or {}
-    await finalize_smartlink_form(callback.message, tg_id, data)
-    await callback.answer("Сохранил")
+    prefill = {
+        "artist": data.get("artist") or pick_selected_metadata(data).get("artist"),
+        "title": data.get("title") or pick_selected_metadata(data).get("title"),
+        "cover_file_id": data.get("cover_file_id") or pick_selected_metadata(data).get("cover_file_id"),
+        "release_date": data.get("release_date") or "",
+        "caption_text": data.get("caption_text") or "",
+    }
+    links = data.get("links") or {}
+    await start_smartlink_form(callback.message, tg_id, initial_links=links, prefill=prefill)
+    await callback.answer("Проверь данные")
+
+
+@dp.callback_query(F.data.startswith("smartlink:import_source:"))
+async def smartlink_import_source_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    platform = callback.data.split(":")[-1]
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") != "smartlink_import_review":
+        await callback.answer("Нет данных", show_alert=True)
+        return
+    data = form.get("data") or {}
+    metadata = data.get("metadata") or {}
+    sources = metadata.get("sources") or {}
+    if platform not in sources:
+        await callback.answer("Нет такого источника", show_alert=True)
+        return
+    metadata["preferred_source"] = platform
+    data["metadata"] = metadata
+    data["preferred_source"] = platform
+    await form_set(tg_id, 0, data)
+    latest_stub = {
+        "artist": data.get("artist", ""),
+        "title": data.get("title", ""),
+        "release_date": data.get("release_date", ""),
+        "caption_text": data.get("caption_text", ""),
+        "cover_file_id": data.get("cover_file_id", ""),
+    }
+    await show_import_confirmation(callback.message, tg_id, data.get("links") or {}, metadata, latest=latest_stub)
+    await callback.answer("Источник обновлён")
 
 
 @dp.callback_query(F.data == "smartlink:import_edit")
@@ -2353,8 +2561,12 @@ async def smartlink_import_edit_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     form = await form_get(tg_id)
-    links = (form or {}).get("data", {}).get("links") if form else None
-    await start_smartlink_form(callback.message, tg_id, initial_links=links or {})
+    data = (form or {}).get("data") or {}
+    if not data:
+        await start_smartlink_form(callback.message, tg_id, initial_links={})
+        await callback.answer()
+        return
+    await start_prefill_editor(callback.message, tg_id, data)
     await callback.answer()
 
 
@@ -2365,6 +2577,51 @@ async def smartlink_import_cancel_cb(callback):
     await form_clear(tg_id)
     await callback.message.answer("Ок, отменил импорт.", reply_markup=await user_menu_keyboard(tg_id))
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlink:prefill_edit:"))
+async def smartlink_prefill_field_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") != "smartlink_prefill_edit":
+        await callback.answer("Нет данных", show_alert=True)
+        return
+    field = callback.data.split(":")[-1]
+    data = form.get("data") or {}
+    if field not in {"artist", "title", "cover"}:
+        await callback.answer("Неизвестно", show_alert=True)
+        return
+    data["pending"] = field
+    await form_set(tg_id, 1, data)
+    if field == "cover":
+        await callback.message.answer("Пришли новую обложку фото.", reply_markup=await user_menu_keyboard(tg_id))
+    elif field == "artist":
+        await callback.message.answer("Введи артиста:", reply_markup=await user_menu_keyboard(tg_id))
+    elif field == "title":
+        await callback.message.answer("Введи название релиза:", reply_markup=await user_menu_keyboard(tg_id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlink:prefill_continue")
+async def smartlink_prefill_continue_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") not in {"smartlink_prefill_edit", "smartlink_import_review"}:
+        await callback.answer("Нет данных", show_alert=True)
+        return
+    data = form.get("data") or {}
+    selected_meta = pick_selected_metadata(data)
+    prefill = {
+        "artist": data.get("artist") or selected_meta.get("artist"),
+        "title": data.get("title") or selected_meta.get("title"),
+        "cover_file_id": data.get("cover_file_id") or selected_meta.get("cover_file_id"),
+        "release_date": data.get("release_date") or "",
+        "caption_text": data.get("caption_text") or "",
+    }
+    await start_smartlink_form(callback.message, tg_id, initial_links=data.get("links") or {}, prefill=prefill)
+    await callback.answer("Давай сохраним")
 
 
 @dp.callback_query(F.data == "smartlink:caption_edit")
@@ -2459,7 +2716,7 @@ async def smartlink_caption_skip_cb(callback):
             return
         data["links"] = data.get("links") or {}
         data["caption_text"] = ""
-        next_step = skip_prefilled_smartlink_steps(5, data["links"])
+        next_step = skip_prefilled_smartlink_steps(5, data)
         total_steps = 5 + len(SMARTLINK_PLATFORMS)
         if next_step < total_steps:
             await form_set(tg_id, next_step, data)
@@ -2810,7 +3067,7 @@ async def any_message_router(message: Message):
                 links[SMARTLINK_PLATFORMS[idx][0]] = txt
 
         step += 1
-        step = skip_prefilled_smartlink_steps(step, links)
+        step = skip_prefilled_smartlink_steps(step, data)
         if step < total_steps:
             await form_set(tg_id, step, data)
             reply_markup = await user_menu_keyboard(tg_id)
@@ -2820,6 +3077,32 @@ async def any_message_router(message: Message):
             return
 
         await finalize_smartlink_form(message, tg_id, data)
+        return
+
+    if form_name == "smartlink_prefill_edit":
+        data = form.get("data") or {}
+        pending = data.get("pending")
+        if pending == "artist":
+            if len(txt) < 2:
+                await message.answer("Минимум 2 символа. Попробуй ещё раз.", reply_markup=await user_menu_keyboard(tg_id))
+                return
+            data["artist"] = txt
+        elif pending == "title":
+            if len(txt) < 1:
+                await message.answer("Нужно название релиза.", reply_markup=await user_menu_keyboard(tg_id))
+                return
+            data["title"] = txt
+        elif pending == "cover":
+            if not message.photo:
+                await message.answer("Пришли фото.", reply_markup=await user_menu_keyboard(tg_id))
+                return
+            data["cover_file_id"] = message.photo[-1].file_id
+        else:
+            await start_prefill_editor(message, tg_id, data)
+            return
+        data.pop("pending", None)
+        await form_set(tg_id, 0, data)
+        await start_prefill_editor(message, tg_id, data)
         return
 
     if form_name == "smartlink_caption_edit":
