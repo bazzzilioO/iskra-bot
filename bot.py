@@ -44,6 +44,13 @@ EXTRA_SMARTLINK_PLATFORMS = [
     ("kion", "MTS Music / КИОН"),
 ]
 
+PLATFORM_LABELS = {
+    **{k: v for k, v in SMARTLINK_PLATFORMS},
+    **{k: v for k, v in EXTRA_SMARTLINK_PLATFORMS},
+    "youtube": "YouTube",
+    "bandlink": "BandLink",
+}
+
 
 def smartlink_step_prompt(step: int) -> str:
     total = 5 + len(SMARTLINK_PLATFORMS)
@@ -87,10 +94,9 @@ RESOLVER_FALLBACK_TEXT = (
     "BandLink открывается через JS, поэтому бот иногда не видит кнопки.\n"
     "Сделай так:\n"
     "1) Открой BandLink в браузере\n"
-    "2) Зажми кнопку ‘Слушать’ нужной платформы (Spotify/Apple/Яндекс)\n"
-    "3) Нажми ‘Копировать адрес ссылки’\n"
-    "4) Пришли эту ссылку сюда — я подтяну остальные.\n\n"
-    "Если не получится, добавь ссылки вручную."
+    "2) Нажми кнопку 'Слушать' нужной платформы (Spotify / Apple / Яндекс)\n"
+    "3) Нажми 'Копировать адрес ссылки'\n"
+    "4) Пришли эту ссылку сюда — я подтяну остальные."
 )
 
 # -------------------- CONFIG --------------------
@@ -1136,6 +1142,35 @@ def _normalize_music_url(url: str) -> str:
     return urlunparse(parsed._replace(query=urlencode(cleaned_query), fragment=""))
 
 
+def detect_platform(url: str) -> str | None:
+    parsed = urlparse(url)
+    netloc = parsed.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+
+    if "band.link" in netloc:
+        return "bandlink"
+    if netloc == "open.spotify.com":
+        return "spotify"
+    if netloc == "music.apple.com":
+        return "apple"
+    if netloc == "itunes.apple.com":
+        return "itunes"
+    if netloc in {"youtube.com", "music.youtube.com", "youtu.be"}:
+        return "youtube"
+    if netloc.startswith("music.yandex."):
+        return "yandex"
+    if netloc == "vk.com" and parsed.path.startswith("/music"):
+        return "vk"
+    if netloc == "zvuk.com":
+        return "zvuk"
+    return None
+
+
+def platform_label(platform: str) -> str:
+    return PLATFORM_LABELS.get(platform, platform)
+
+
 async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     timeout = aiohttp.ClientTimeout(total=10)
 
@@ -1168,9 +1203,12 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
         return {}, {}
 
     links: dict[str, str] = {}
-    collect(data.get("linksByPlatform") or {}, links)
-
     entities = data.get("entitiesByUniqueId") or {}
+    if not entities:
+        print("[songlink] empty entities from resolver")
+        return {}, {}
+
+    collect(data.get("linksByPlatform") or {}, links)
     primary_entity_id = data.get("entityUniqueId")
     primary = entities.get(primary_entity_id) if primary_entity_id else None
     candidates = [primary] if primary else []
@@ -1223,6 +1261,40 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     print(f"[songlink] meta source={preferred} conflict={conflict} candidates={list(meta_candidates.keys())}")
 
     return links, meta
+
+
+def merge_metadata(existing: dict | None, new: dict | None) -> dict:
+    merged = dict(existing or {})
+    if not new:
+        return merged
+
+    sources = merged.get("sources") or {}
+    sources.update((new or {}).get("sources") or {})
+    merged["sources"] = sources
+
+    preferred = new.get("preferred_source") or merged.get("preferred_source")
+    if preferred and preferred not in sources and sources:
+        preferred = next(iter(sources.keys()))
+    if not preferred and sources:
+        preferred = next(iter(sources.keys()))
+
+    merged["preferred_source"] = preferred
+    merged["source_platform"] = preferred or merged.get("source_platform")
+
+    artists = {s.get("artist") for s in sources.values() if s.get("artist")}
+    titles = {s.get("title") for s in sources.values() if s.get("title")}
+    merged["conflict"] = len(artists) > 1 or len(titles) > 1
+
+    def value_from_sources(field: str) -> str:
+        if preferred and preferred in sources:
+            return sources.get(preferred, {}).get(field, "")
+        return merged.get(field, "") or ""
+
+    merged["artist"] = new.get("artist") or value_from_sources("artist")
+    merged["title"] = new.get("title") or value_from_sources("title")
+    merged["cover_url"] = new.get("cover_url") or value_from_sources("cover_url")
+
+    return merged
 
 
 def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
@@ -2495,6 +2567,7 @@ async def smartlink_import_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     await form_start(tg_id, "smartlink_import")
+    await form_set(tg_id, 0, {"links": {}, "metadata": {}, "bandlink_help_shown": False})
     await callback.message.answer(
         "Пришли ссылку на трек: BandLink / Spotify / Apple Music / YouTube.\n"
         "Я попробую подтянуть все площадки автоматически.\n"
@@ -2995,15 +3068,58 @@ async def any_message_router(message: Message):
             )
             return
 
+        data = form.get("data") or {}
+        existing_links = data.get("links") or {}
+        existing_metadata = data.get("metadata") or {}
+        bandlink_help_shown = bool(data.get("bandlink_help_shown"))
+
+        detected_platform = detect_platform(txt) or ""
+        if detected_platform and detected_platform != "bandlink":
+            await message.answer("Принял ссылку, пытаюсь найти релиз…", reply_markup=await user_menu_keyboard(tg_id))
+
         links, metadata = await resolve_links(txt)
 
-        if len(links) >= 2:
+        merged_links = dict(existing_links)
+        added_platforms: list[str] = []
+        for platform_key, url in links.items():
+            if platform_key not in merged_links or merged_links[platform_key] != url:
+                merged_links[platform_key] = url
+                added_platforms.append(platform_key)
+
+        merged_metadata = merge_metadata(existing_metadata, metadata)
+
+        running_total = len(existing_links)
+        for platform_key in added_platforms:
+            running_total += 1
+            await message.answer(
+                f"Добавил площадку: {platform_label(platform_key)}. Всего: {running_total}",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+
+        total = len(merged_links)
+        if total >= 2:
             latest = await get_latest_smartlink(tg_id)
-            await show_import_confirmation(message, tg_id, links, metadata, latest)
+            await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
+            return
+
+        data.update({
+            "links": merged_links,
+            "metadata": merged_metadata,
+            "bandlink_help_shown": bandlink_help_shown,
+        })
+        await form_set(tg_id, form.get("step", 0) or 0, data)
+
+        if detected_platform == "bandlink" and not bandlink_help_shown:
+            data["bandlink_help_shown"] = True
+            await form_set(tg_id, form.get("step", 0) or 0, data)
+            await message.answer(
+                RESOLVER_FALLBACK_TEXT,
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
             return
 
         await message.answer(
-            RESOLVER_FALLBACK_TEXT,
+            "Не нашёл остальные площадки, пришли ссылку другой платформы.",
             reply_markup=await user_menu_keyboard(tg_id),
         )
         return
