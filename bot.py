@@ -56,6 +56,20 @@ PLATFORM_LABELS = {
     "bandlink": "BandLink",
 }
 
+EXPORT_LABELS: dict[str, tuple[str, str, str, str]] = {
+    "yandex": ("Яндекс Музыка", "Яндекс Музыка", "Yandex Music", "Yandex"),
+    "vk": ("VK Музыка", "VK Музыка", "VK Music", "VK"),
+    "apple": ("Apple Music", "Apple Music", "Apple Music", "Apple"),
+    "spotify": ("Spotify", "Spotify", "Spotify", "Spotify"),
+    "itunes": ("iTunes", "iTunes", "iTunes", "iTunes"),
+    "zvuk": ("Звук", "Звук", "Zvuk", "Zvuk"),
+    "youtubemusic": ("YouTube Music", "YouTube Music", "YouTube Music", "YouTube Music"),
+    "youtube": ("YouTube", "YouTube", "YouTube", "YouTube"),
+    "deezer": ("Deezer", "Deezer", "Deezer", "Deezer"),
+    "kion": ("MTS Music / КИОН", "MTS Music / КИОН", "MTS Music", "MTS Music"),
+    "bandlink": ("BandLink", "BandLink", "BandLink", "BandLink"),
+}
+
 HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
 
 
@@ -472,11 +486,18 @@ async def init_db():
             cover_file_id TEXT,
             links_json TEXT,
             caption_text TEXT,
+            branding_disabled INTEGER DEFAULT 0,
             created_at TEXT
         )
         """)
         try:
             await db.execute("ALTER TABLE smartlinks ADD COLUMN caption_text TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE smartlinks ADD COLUMN branding_disabled INTEGER DEFAULT 0"
+            )
         except Exception:
             pass
         await db.execute("""
@@ -717,7 +738,8 @@ def _smartlink_row_to_dict(row) -> dict:
         "cover_file_id": row[5] or "",
         "links": json.loads(row[6] or "{}"),
         "caption_text": row[7] or "",
-        "created_at": row[8],
+        "branding_disabled": bool(row[8]) if len(row) > 8 else False,
+        "created_at": row[9] if len(row) > 9 else None,
     }
 
 
@@ -729,12 +751,13 @@ async def save_smartlink(
     cover_file_id: str,
     links: dict,
     caption_text: str,
+    branding_disabled: bool = False,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 owner_tg_id,
@@ -744,6 +767,7 @@ async def save_smartlink(
                 cover_file_id,
                 json.dumps(links, ensure_ascii=False),
                 caption_text,
+                1 if branding_disabled else 0,
                 dt.datetime.utcnow().isoformat(),
             ),
         )
@@ -763,7 +787,7 @@ async def update_smartlink_caption(smartlink_id: int, caption_text: str):
 async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
             (owner_tg_id,),
         )
         row = await cur.fetchone()
@@ -773,7 +797,7 @@ async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
 async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE id=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE id=?",
             (smartlink_id,),
         )
         row = await cur.fetchone()
@@ -783,7 +807,7 @@ async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
             (owner_tg_id, limit, offset),
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -797,7 +821,7 @@ async def count_smartlinks(owner_tg_id: int) -> int:
 
 
 async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: dict) -> bool:
-    allowed = {"artist", "title", "release_date", "cover_file_id", "links", "caption_text"}
+    allowed = {"artist", "title", "release_date", "cover_file_id", "links", "caption_text", "branding_disabled"}
     fields: list[str] = []
     params: list = []
 
@@ -807,6 +831,9 @@ async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: di
         if key == "links":
             fields.append("links_json=?")
             params.append(json.dumps(value or {}, ensure_ascii=False))
+        elif key == "branding_disabled":
+            fields.append("branding_disabled=?")
+            params.append(1 if value else 0)
         else:
             fields.append(f"{key}=?")
             params.append(value)
@@ -863,7 +890,7 @@ async def start_smartlink_form(
     initial_links: dict[str, str] | None = None,
     prefill: dict | None = None,
 ):
-    data = {"links": initial_links or {}, "caption_text": ""}
+    data = {"links": initial_links or {}, "caption_text": "", "branding_disabled": False}
     if prefill:
         data.update(prefill)
     step = skip_prefilled_smartlink_steps(0, data)
@@ -1134,6 +1161,7 @@ def build_links_kb() -> InlineKeyboardMarkup:
 
 
 SMARTLINKS_PAGE_SIZE = 5
+BRANDING_DISABLE_PRICE = 10
 
 
 def smartlinks_menu_kb() -> InlineKeyboardMarkup:
@@ -1188,13 +1216,15 @@ def smartlink_view_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink_id}")],
+            [InlineKeyboardButton(text="📤 Экспорт", callback_data=f"smartlinks:export:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"smartlinks:delete:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:list:{page}")],
         ]
     )
 
 
-def smartlink_edit_menu_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
+def smartlink_edit_menu_kb(smartlink_id: int, page: int, branding_disabled: bool = False) -> InlineKeyboardMarkup:
+    branding_text = "🏷 Брендинг ИСКРЫ: Выкл" if branding_disabled else "🏷 Брендинг ИСКРЫ: Вкл"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Артист/Название", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:title")],
@@ -1202,6 +1232,7 @@ def smartlink_edit_menu_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup
             [InlineKeyboardButton(text="Описание", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:caption")],
             [InlineKeyboardButton(text="Обложка", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:cover")],
             [InlineKeyboardButton(text="Ссылки", callback_data=f"smartlinks:edit_links:{smartlink_id}:{page}")],
+            [InlineKeyboardButton(text=branding_text, callback_data=f"smartlinks:branding_toggle:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:view:{smartlink_id}:{page}")],
         ]
     )
@@ -1213,6 +1244,33 @@ def smartlink_links_menu_kb(smartlink_id: int, page: int) -> InlineKeyboardMarku
         rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlinks:edit_link:{smartlink_id}:{page}:{key}")])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def smartlink_export_kb(smartlink_id: int, page: int | None = None) -> InlineKeyboardMarkup:
+    page_marker = page if page is not None else -1
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Текст для Telegram", callback_data=f"smartlinks:exportfmt:{smartlink_id}:{page_marker}:tg")],
+            [InlineKeyboardButton(text="🧱 Текст для VK", callback_data=f"smartlinks:exportfmt:{smartlink_id}:{page_marker}:vk")],
+            [InlineKeyboardButton(text="🌐 Универсальный текст", callback_data=f"smartlinks:exportfmt:{smartlink_id}:{page_marker}:universal")],
+            [InlineKeyboardButton(text="🔗 Только ссылки", callback_data=f"smartlinks:exportfmt:{smartlink_id}:{page_marker}:links")],
+            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:export_back:{smartlink_id}:{page_marker}")],
+        ]
+    )
+
+
+def smartlink_branding_confirm_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"⭐ Оплатить {BRANDING_DISABLE_PRICE} Stars",
+                    callback_data=f"smartlinks:branding_pay:{smartlink_id}:{page}",
+                )
+            ],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"smartlinks:branding_cancel:{smartlink_id}:{page}")],
+        ]
+    )
 
 
 async def send_smartlink_list(message: Message, tg_id: int, page: int = 0):
@@ -1227,6 +1285,13 @@ async def send_smartlink_list(message: Message, tg_id: int, page: int = 0):
         inline.append(
             [
                 InlineKeyboardButton(text=f"{idx}. {item.get('artist') or 'Без артиста'} — {item.get('title') or 'Без названия'}", callback_data=f"smartlinks:view:{item.get('id')}:{page}")
+            ]
+        )
+        inline.append(
+            [
+                InlineKeyboardButton(
+                    text="📤 Экспорт", callback_data=f"smartlinks:export:{item.get('id')}:{page}"
+                )
             ]
         )
 
@@ -1255,7 +1320,7 @@ async def show_smartlink_view(message: Message, tg_id: int, smartlink_id: int, p
 async def resend_smartlink_card(message: Message, tg_id: int, smartlink: dict, page: int):
     allow_remind = smartlink_can_remind(smartlink)
     subscribed = await is_smartlink_subscribed(smartlink.get("id"), tg_id) if allow_remind else False
-    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind, page=page)
     await message.answer("Выбери действие:", reply_markup=smartlink_view_kb(smartlink.get("id"), page))
 
 
@@ -1818,6 +1883,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         data.get("cover_file_id", ""),
         links_clean,
         caption_text,
+        bool(data.get("branding_disabled")),
     )
     smartlink = {
         "id": smartlink_id,
@@ -1828,6 +1894,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         "cover_file_id": data.get("cover_file_id", ""),
         "links": links_clean,
         "caption_text": caption_text,
+        "branding_disabled": bool(data.get("branding_disabled")),
         "created_at": dt.datetime.utcnow().isoformat(),
     }
     allow_remind = smartlink_can_remind(smartlink)
@@ -2024,6 +2091,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             latest.get("cover_file_id", ""),
             links,
             latest.get("caption_text", "") or "",
+            bool(latest.get("branding_disabled")),
         )
         smartlink = {
             "id": smartlink_id,
@@ -2034,6 +2102,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "cover_file_id": latest.get("cover_file_id", ""),
             "links": links,
             "caption_text": latest.get("caption_text", "") or "",
+            "branding_disabled": bool(latest.get("branding_disabled")),
             "created_at": dt.datetime.utcnow().isoformat(),
         }
         allow_remind = smartlink_can_remind(smartlink)
@@ -2073,6 +2142,7 @@ def build_smartlink_caption(
     title = html.escape(smartlink.get("title") or "")
     caption_text = html.escape(smartlink.get("caption_text") or "")
     release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
+    show_branding = not smartlink.get("branding_disabled")
 
     links = smartlink.get("links") or {}
     has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
@@ -2085,10 +2155,12 @@ def build_smartlink_caption(
             lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
         if caption_text:
             lines.append(caption_text)
-        lines.append("")
-        lines.append(ATTRIBUTION_HTML)
-        if include_listen:
+        if show_branding:
             lines.append("")
+            lines.append(ATTRIBUTION_HTML)
+        if include_listen:
+            if lines and lines[-1] != "":
+                lines.append("")
             lines.append("▶️ Слушать:")
         return "\n".join(lines)
 
@@ -2097,17 +2169,25 @@ def build_smartlink_caption(
         lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
     if caption_text:
         lines.append(caption_text)
-    lines.append("")
-    lines.append(ATTRIBUTION_HTML)
-    if include_listen:
+    if show_branding:
         lines.append("")
+        lines.append(ATTRIBUTION_HTML)
+    if include_listen:
+        if lines and lines[-1] != "":
+            lines.append("")
         lines.append("▶️ Слушать:")
     return "\n".join(lines)
 
 
-def build_smartlink_buttons(smartlink: dict, subscribed: bool = False, can_remind: bool = False) -> InlineKeyboardMarkup | None:
+def build_smartlink_buttons(
+    smartlink: dict,
+    subscribed: bool = False,
+    can_remind: bool = False,
+    page: int | None = None,
+) -> InlineKeyboardMarkup | None:
     rows: list[list[InlineKeyboardButton]] = []
     links = smartlink.get("links") or {}
+    page_marker = page if page is not None else -1
 
     platform_rows: list[list[InlineKeyboardButton]] = []
     for key, label in SMARTLINK_BUTTON_ORDER:
@@ -2127,6 +2207,7 @@ def build_smartlink_buttons(smartlink: dict, subscribed: bool = False, can_remin
         rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"smartlink:toggle:{smartlink.get('id')}")])
 
     rows.append([InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink.get('id')}")])
+    rows.append([InlineKeyboardButton(text="📤 Экспорт", callback_data=f"smartlinks:export:{smartlink.get('id')}:{page_marker}")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
@@ -2152,6 +2233,56 @@ def build_copy_links_text(smartlink: dict) -> str:
     return "\n".join(lines)
 
 
+def _iter_smartlink_links(smartlink: dict) -> list[tuple[str, str]]:
+    links = smartlink.get("links") or {}
+    items: list[tuple[str, str]] = []
+    for key, _ in SMARTLINK_BUTTON_ORDER:
+        url = links.get(key)
+        if url:
+            items.append((key, url))
+    return items
+
+
+def _export_label(platform: str, variant: str) -> str:
+    order = {"tg": 0, "vk": 1, "universal": 2, "links": 3}
+    labels = EXPORT_LABELS.get(platform)
+    if labels and variant in order:
+        return labels[order[variant]]
+    return platform_label(platform)
+
+
+def build_smartlink_export_text(smartlink: dict, variant: str) -> str:
+    artist = smartlink.get("artist") or "Без артиста"
+    title = smartlink.get("title") or "Без названия"
+    items = [(platform, url, _export_label(platform, variant)) for platform, url in _iter_smartlink_links(smartlink)]
+
+    if variant == "tg":
+        lines = [f"{artist} — {title}"]
+        if items:
+            lines.append("▶️ Слушать:")
+            for _platform, url, label in items:
+                lines.append(f"{label} — {url}")
+        return "\n".join(lines)
+
+    if variant == "vk":
+        lines = [f"{artist} — {title}", "Новый релиз уже доступен 👇"]
+        for _platform, url, label in items:
+            lines.append(f"{label}: {url}")
+        return "\n".join(lines)
+
+    if variant == "universal":
+        lines = [f"{artist} — {title}", "Release links:"]
+        for _platform, url, label in items:
+            lines.append(f"- {label}: {url}")
+        return "\n".join(lines)
+
+    if variant == "links":
+        lines = [f"{label}: {url}" for _platform, url, label in items]
+        return "\n".join(lines) if lines else "Ссылок пока нет"
+
+    return ""
+
+
 def smartlink_can_remind(smartlink: dict) -> bool:
     rd = parse_date(smartlink.get("release_date") or "") if smartlink else None
     return bool(rd and rd > dt.date.today())
@@ -2164,9 +2295,10 @@ async def send_smartlink_photo(
     release_today: bool = False,
     subscribed: bool = False,
     allow_remind: bool = False,
+    page: int | None = None,
 ):
     caption = build_smartlink_caption(smartlink, release_today=release_today)
-    kb = build_smartlink_buttons(smartlink, subscribed=subscribed, can_remind=allow_remind)
+    kb = build_smartlink_buttons(smartlink, subscribed=subscribed, can_remind=allow_remind, page=page)
     return await bot.send_photo(
         chat_id,
         photo=smartlink.get("cover_file_id"),
@@ -2363,7 +2495,7 @@ async def process_smartlink_notifications(bot: Bot):
     today_iso = dt.date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, created_at FROM smartlinks WHERE release_date=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE release_date=?",
             (today_iso,),
         )
         smartlinks = [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -2805,6 +2937,20 @@ async def successful_payment(message: Message):
         await ensure_user(tg_id)
         tasks_state = await get_tasks_state(tg_id)
         await message.answer(build_export_text(tasks_state), reply_markup=await user_menu_keyboard(tg_id))
+    elif (sp.invoice_payload or "").startswith("smartlink_branding_"):
+        tg_id = message.from_user.id
+        await ensure_user(tg_id)
+        payload = sp.invoice_payload or ""
+        try:
+            smartlink_id = int(payload.split("_")[-1])
+        except Exception:
+            smartlink_id = None
+        if smartlink_id is not None:
+            await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": True})
+        await message.answer(
+            "Готово! Брендинг ИСКРЫ отключён для этого смарт-линка. Если нужно — его можно снова включить бесплатно.",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
 
 # -------------------- Inline callbacks --------------------
 
@@ -3066,7 +3212,10 @@ async def smartlinks_edit_menu_cb(callback):
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
     text = build_smartlink_view_text(smartlink)
-    await callback.message.answer(text + "\n\nВыбери, что обновить:", reply_markup=smartlink_edit_menu_kb(smartlink_id, page))
+    await callback.message.answer(
+        text + "\n\nВыбери, что обновить:",
+        reply_markup=smartlink_edit_menu_kb(smartlink_id, page, smartlink.get("branding_disabled")),
+    )
     await callback.answer()
 
 
@@ -3131,6 +3280,92 @@ async def smartlinks_edit_links_cb(callback):
         return
     await callback.message.answer("Выбери платформу для обновления:", reply_markup=smartlink_links_menu_kb(smartlink_id, page))
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:branding_toggle:"))
+async def smartlinks_branding_toggle_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    if smartlink.get("branding_disabled"):
+        await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": False})
+        updated = await get_smartlink_by_id(smartlink_id)
+        if updated:
+            text = build_smartlink_view_text(updated)
+            await callback.message.answer(
+                text + "\n\nВыбери, что обновить:",
+                reply_markup=smartlink_edit_menu_kb(smartlink_id, page, updated.get("branding_disabled")),
+            )
+        await callback.answer("Брендинг включён")
+        return
+
+    await callback.message.answer(
+        f"Отключить брендинг ИСКРЫ для этого смарт-линка?\nСтоимость: ⭐ {BRANDING_DISABLE_PRICE} Telegram Stars",
+        reply_markup=smartlink_branding_confirm_kb(smartlink_id, page),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:branding_cancel:"))
+async def smartlinks_branding_cancel_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    text = build_smartlink_view_text(smartlink)
+    await callback.message.answer(
+        text + "\n\nВыбери, что обновить:",
+        reply_markup=smartlink_edit_menu_kb(smartlink_id, page, smartlink.get("branding_disabled")),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:branding_pay:"))
+async def smartlinks_branding_pay_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    if smartlink.get("branding_disabled"):
+        await callback.answer("Брендинг уже отключён", show_alert=True)
+        return
+
+    prices = [LabeledPrice(label="Отключение брендинга ИСКРЫ", amount=BRANDING_DISABLE_PRICE)]
+    await callback.message.answer_invoice(
+        title="Отключить брендинг ИСКРЫ",
+        description="Брендинг уберётся только у этого смарт-линка.",
+        payload=f"smartlink_branding_{smartlink_id}",
+        provider_token="",
+        currency="XTR",
+        prices=prices,
+    )
+    await callback.answer("Счёт на оплату")
 
 
 @dp.callback_query(F.data.startswith("smartlinks:edit_link:"))
@@ -3517,6 +3752,77 @@ async def smartlinks_copy_cb(callback):
     text = build_copy_links_text(smartlink)
     await callback.message.answer(text)
     await callback.answer("Готово")
+
+
+@dp.callback_query(F.data.startswith("smartlinks:exportfmt:"))
+async def smartlinks_export_format_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 5:
+        await callback.answer("Не понял", show_alert=True)
+        return
+
+    smartlink_id = int(parts[2])
+    page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
+    variant = parts[4]
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    export_text = build_smartlink_export_text(smartlink, variant)
+    if not export_text.strip():
+        await callback.message.answer("Нет данных для экспорта.")
+        await callback.answer()
+        return
+
+    await callback.message.answer(export_text)
+    await callback.answer("Готово")
+
+
+@dp.callback_query(F.data.startswith("smartlinks:export_back:"))
+async def smartlinks_export_back_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer()
+        return
+
+    smartlink_id = int(parts[2])
+    page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+
+    if page >= 0:
+        await show_smartlink_view(callback.message, tg_id, smartlink_id, page)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:export:"))
+async def smartlinks_export_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) not in {3, 4}:
+        await callback.answer("Не понял", show_alert=True)
+        return
+
+    smartlink_id = int(parts[2])
+    page = int(parts[3]) if len(parts) == 4 and parts[3].lstrip("-").isdigit() else -1
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    header = build_smartlink_view_text(smartlink)
+    await callback.message.answer(
+        header + "\n\nВыбери формат:", reply_markup=smartlink_export_kb(smartlink_id, page)
+    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "links:lyrics")
