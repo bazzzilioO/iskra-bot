@@ -719,9 +719,25 @@ async def get_last_update_notified(tg_id: int) -> str | None:
         row = await cur.fetchone()
         return row[0] if row and row[0] else None
 
-async def set_last_update_notified(tg_id: int, value: str | None, db: aiosqlite.Connection | None = None):
+async def set_last_update_notified(
+    tg_id: int,
+    value: str | None,
+    db: aiosqlite.Connection | None = None,
+    *,
+    commit: bool = True,
+):
+    """Update the last notified update URL for a user.
+
+    Args:
+        tg_id: Telegram user identifier.
+        value: URL string or ``None`` to reset the marker.
+        db: Optional existing DB connection to reuse.
+        commit: Whether to commit the transaction when ``db`` is provided.
+    """
     if db:
         await db.execute("UPDATE users SET last_update_notified=? WHERE tg_id=?", (value, tg_id))
+        if commit:
+            await db.commit()
         return
     async with aiosqlite.connect(DB_PATH) as db_conn:
         await db_conn.execute("UPDATE users SET last_update_notified=? WHERE tg_id=?", (value, tg_id))
@@ -3031,7 +3047,7 @@ async def broadcast_update(message: Message, bot: Bot):
                 continue
             try:
                 await bot.send_message(tg_id, f"⚡️ Есть обновление ИСКРЫ. Подробнее: {url}")
-                await set_last_update_notified(tg_id, url, db)
+                await set_last_update_notified(tg_id, url, db, commit=False)
                 sent += 1
             except TelegramForbiddenError:
                 skipped += 1
