@@ -412,7 +412,8 @@ async def init_db():
             experience TEXT DEFAULT 'unknown',
             username TEXT,
             release_date TEXT DEFAULT NULL,
-            reminders_enabled INTEGER DEFAULT 1
+            reminders_enabled INTEGER DEFAULT 1,
+            export_unlocked INTEGER DEFAULT 0
         )
         """)
         try:
@@ -433,6 +434,10 @@ async def init_db():
             pass
         try:
             await db.execute("ALTER TABLE users ADD COLUMN last_update_notified TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN export_unlocked INTEGER DEFAULT 0")
         except Exception:
             pass
         await db.execute("""
@@ -487,6 +492,7 @@ async def init_db():
             links_json TEXT,
             caption_text TEXT,
             branding_disabled INTEGER DEFAULT 0,
+            branding_paid INTEGER DEFAULT 0,
             created_at TEXT
         )
         """)
@@ -497,6 +503,12 @@ async def init_db():
         try:
             await db.execute(
                 "ALTER TABLE smartlinks ADD COLUMN branding_disabled INTEGER DEFAULT 0"
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE smartlinks ADD COLUMN branding_paid INTEGER DEFAULT 0"
             )
         except Exception:
             pass
@@ -594,6 +606,21 @@ async def set_updates_opt_in(tg_id: int, enabled: bool):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET updates_opt_in=? WHERE tg_id=?", (1 if enabled else 0, tg_id))
         await db.commit()
+
+async def set_export_unlocked(tg_id: int, unlocked: bool = True):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET export_unlocked=? WHERE tg_id=?",
+            (1 if unlocked else 0, tg_id),
+        )
+        await db.commit()
+
+
+async def get_export_unlocked(tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT export_unlocked FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        return bool(row[0]) if row and row[0] is not None else False
 
 async def toggle_updates_opt_in(tg_id: int) -> bool:
     enabled = await get_updates_opt_in(tg_id)
@@ -740,6 +767,7 @@ def _smartlink_row_to_dict(row) -> dict:
         "caption_text": row[7] or "",
         "branding_disabled": bool(row[8]) if len(row) > 8 else False,
         "created_at": row[9] if len(row) > 9 else None,
+        "branding_paid": bool(row[10]) if len(row) > 10 else False,
     }
 
 
@@ -787,7 +815,7 @@ async def update_smartlink_caption(smartlink_id: int, caption_text: str):
 async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
             (owner_tg_id,),
         )
         row = await cur.fetchone()
@@ -797,7 +825,7 @@ async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
 async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE id=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE id=?",
             (smartlink_id,),
         )
         row = await cur.fetchone()
@@ -807,7 +835,7 @@ async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
             (owner_tg_id, limit, offset),
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -821,7 +849,16 @@ async def count_smartlinks(owner_tg_id: int) -> int:
 
 
 async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: dict) -> bool:
-    allowed = {"artist", "title", "release_date", "cover_file_id", "links", "caption_text", "branding_disabled"}
+    allowed = {
+        "artist",
+        "title",
+        "release_date",
+        "cover_file_id",
+        "links",
+        "caption_text",
+        "branding_disabled",
+        "branding_paid",
+    }
     fields: list[str] = []
     params: list = []
 
@@ -833,6 +870,9 @@ async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: di
             params.append(json.dumps(value or {}, ensure_ascii=False))
         elif key == "branding_disabled":
             fields.append("branding_disabled=?")
+            params.append(1 if value else 0)
+        elif key == "branding_paid":
+            fields.append("branding_paid=?")
             params.append(1 if value else 0)
         else:
             fields.append(f"{key}=?")
@@ -1162,6 +1202,10 @@ def build_links_kb() -> InlineKeyboardMarkup:
 
 SMARTLINKS_PAGE_SIZE = 5
 BRANDING_DISABLE_PRICE = 10
+EXPORT_UNLOCK_PRICE = 25
+SUPPORT_DONATE_PRICE = 50
+DONATE_MIN_STARS = 10
+DONATE_MAX_STARS = 5000
 
 
 def smartlinks_menu_kb() -> InlineKeyboardMarkup:
@@ -1216,15 +1260,22 @@ def smartlink_view_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink_id}")],
-            [InlineKeyboardButton(text="📤 Экспорт", callback_data=f"smartlinks:export:{smartlink_id}:{page}")],
+            [InlineKeyboardButton(text=f"📤 Экспорт ⭐{EXPORT_UNLOCK_PRICE}", callback_data=f"smartlinks:export:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"smartlinks:delete:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:list:{page}")],
         ]
     )
 
 
-def smartlink_edit_menu_kb(smartlink_id: int, page: int, branding_disabled: bool = False) -> InlineKeyboardMarkup:
-    branding_text = "🏷 Брендинг ИСКРЫ: Выкл" if branding_disabled else "🏷 Брендинг ИСКРЫ: Вкл"
+def smartlink_edit_menu_kb(
+    smartlink_id: int, page: int, branding_disabled: bool = False, branding_paid: bool = False
+) -> InlineKeyboardMarkup:
+    if branding_disabled:
+        branding_text = "🏷 Брендинг ИСКРЫ: Выкл"
+    elif branding_paid:
+        branding_text = "🏷 Брендинг ИСКРЫ: Вкл"
+    else:
+        branding_text = "Убрать брендинг ⭐10"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Артист/Название", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:title")],
@@ -1255,6 +1306,21 @@ def smartlink_export_kb(smartlink_id: int, page: int | None = None) -> InlineKey
             [InlineKeyboardButton(text="🌐 Универсальный текст", callback_data=f"smartlinks:exportfmt:{smartlink_id}:{page_marker}:universal")],
             [InlineKeyboardButton(text="🔗 Только ссылки", callback_data=f"smartlinks:exportfmt:{smartlink_id}:{page_marker}:links")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:export_back:{smartlink_id}:{page_marker}")],
+        ]
+    )
+
+
+def smartlink_export_paywall_kb(smartlink_id: int, page: int | None = None) -> InlineKeyboardMarkup:
+    page_marker = page if page is not None else -1
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"⭐ Оплатить {EXPORT_UNLOCK_PRICE} Stars",
+                    callback_data=f"smartlinks:export_pay:{smartlink_id}:{page_marker}",
+                )
+            ],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"smartlinks:export_cancel:{smartlink_id}:{page_marker}")],
         ]
     )
 
@@ -1290,7 +1356,7 @@ async def send_smartlink_list(message: Message, tg_id: int, page: int = 0):
         inline.append(
             [
                 InlineKeyboardButton(
-                    text="📤 Экспорт", callback_data=f"smartlinks:export:{item.get('id')}:{page}"
+                    text=f"📤 Экспорт ⭐{EXPORT_UNLOCK_PRICE}", callback_data=f"smartlinks:export:{item.get('id')}:{page}"
                 )
             ]
         )
@@ -2388,10 +2454,11 @@ def build_reset_menu_kb() -> InlineKeyboardMarkup:
 
 def build_donate_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ 10", callback_data="donate:10"),
-         InlineKeyboardButton(text="⭐ 25", callback_data="donate:25"),
-         InlineKeyboardButton(text="⭐ 50", callback_data="donate:50")],
-        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")]
+        [InlineKeyboardButton(text="Спасибо ⭐10", callback_data="donate:10")],
+        [InlineKeyboardButton(text="Поддержать ⭐25", callback_data="donate:25")],
+        [InlineKeyboardButton(text="Сильно поддержать ⭐50", callback_data="donate:50")],
+        [InlineKeyboardButton(text="Своя сумма", callback_data="donate:custom")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_focus")]
     ])
 
 async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None) -> Message | None:
@@ -2495,7 +2562,7 @@ async def process_smartlink_notifications(bot: Bot):
     today_iso = dt.date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at FROM smartlinks WHERE release_date=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE release_date=?",
             (today_iso,),
         )
         smartlinks = [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -2878,12 +2945,24 @@ async def rb_label(message: Message):
 
 # -------------------- Stars: DONATE --------------------
 
+
+async def send_donate_invoice(message: Message, stars: int):
+    prices = [LabeledPrice(label=f"Поддержка ИСКРЫ ({stars} ⭐)", amount=stars)]
+    await message.answer_invoice(
+        title="Поддержать ИСКРУ",
+        description="Спасибо! Это помогает развивать бота и добавлять функции.",
+        payload=f"donate_iskra_{stars}",
+        provider_token="",
+        currency="XTR",
+        prices=prices,
+    )
+
 @dp.message(F.text == "💫 Поддержать ИСКРУ")
 async def rb_donate(message: Message):
     await message.answer(
         "💫 Поддержать ИСКРУ звёздами\n\n"
         "Если бот помог — можешь поддержать проект.\n"
-        "Выбери сумму:",
+        "Выбери сумму (минимум 10 ⭐):",
         reply_markup=build_donate_menu_kb()
     )
 
@@ -2891,7 +2970,7 @@ async def rb_donate(message: Message):
 async def donate_menu_cb(callback):
     await safe_edit(
         callback.message,
-        "💫 Поддержать ИСКРУ звёздами\n\nВыбери сумму:",
+        "💫 Поддержать ИСКРУ звёздами\n\nВыбери сумму (минимум 10 ⭐):",
         build_donate_menu_kb()
     )
     await callback.answer()
@@ -2902,24 +2981,26 @@ async def donate_send_invoice_cb(callback):
     await ensure_user(tg_id)
 
     amount_s = callback.data.split(":")[1]
-    if amount_s not in {"10", "25", "50"}:
+    allowed = {BRANDING_DISABLE_PRICE, EXPORT_UNLOCK_PRICE, SUPPORT_DONATE_PRICE}
+    if not amount_s.isdigit() or int(amount_s) not in allowed:
         await callback.answer("Не понял сумму", show_alert=True)
         return
 
     stars = int(amount_s)
-
-    prices = [LabeledPrice(label=f"Поддержка ИСКРЫ ({stars} ⭐)", amount=stars)]
-    # Для цифровых товаров/услуг в Telegram Stars используется валюта XTR.
-    # provider_token для Stars можно передавать пустой строкой. :contentReference[oaicite:1]{index=1}
-    await callback.message.answer_invoice(
-        title="Поддержать ИСКРУ",
-        description="Спасибо! Это помогает развивать бота и добавлять функции.",
-        payload=f"donate_iskra_{stars}",
-        provider_token="",
-        currency="XTR",
-        prices=prices
-    )
+    await send_donate_invoice(callback.message, stars)
     await callback.answer("Ок")
+
+
+@dp.callback_query(F.data == "donate:custom")
+async def donate_custom_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await form_start(tg_id, "donate_custom")
+    await callback.message.answer(
+        f"Введи сумму доната в Stars (целое число от {DONATE_MIN_STARS} до {DONATE_MAX_STARS}).",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
+    await callback.answer()
 
 @dp.pre_checkout_query()
 async def pre_checkout(pre_checkout_q: PreCheckoutQuery, bot: Bot):
@@ -2937,6 +3018,14 @@ async def successful_payment(message: Message):
         await ensure_user(tg_id)
         tasks_state = await get_tasks_state(tg_id)
         await message.answer(build_export_text(tasks_state), reply_markup=await user_menu_keyboard(tg_id))
+    elif sp.invoice_payload == "smartlink_export_unlock":
+        tg_id = message.from_user.id
+        await ensure_user(tg_id)
+        await set_export_unlocked(tg_id, True)
+        await message.answer(
+            "Готово! Экспорт смарт-линков активирован для всех твоих ссылок.",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
     elif (sp.invoice_payload or "").startswith("smartlink_branding_"):
         tg_id = message.from_user.id
         await ensure_user(tg_id)
@@ -2946,7 +3035,9 @@ async def successful_payment(message: Message):
         except Exception:
             smartlink_id = None
         if smartlink_id is not None:
-            await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": True})
+            await update_smartlink_data(
+                smartlink_id, tg_id, {"branding_disabled": True, "branding_paid": True}
+            )
         await message.answer(
             "Готово! Брендинг ИСКРЫ отключён для этого смарт-линка. Если нужно — его можно снова включить бесплатно.",
             reply_markup=await user_menu_keyboard(tg_id),
@@ -3214,7 +3305,9 @@ async def smartlinks_edit_menu_cb(callback):
     text = build_smartlink_view_text(smartlink)
     await callback.message.answer(
         text + "\n\nВыбери, что обновить:",
-        reply_markup=smartlink_edit_menu_kb(smartlink_id, page, smartlink.get("branding_disabled")),
+        reply_markup=smartlink_edit_menu_kb(
+            smartlink_id, page, smartlink.get("branding_disabled"), smartlink.get("branding_paid")
+        ),
     )
     await callback.answer()
 
@@ -3296,6 +3389,7 @@ async def smartlinks_branding_toggle_cb(callback):
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
+    branding_paid = bool(smartlink.get("branding_paid"))
 
     if smartlink.get("branding_disabled"):
         await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": False})
@@ -3304,13 +3398,35 @@ async def smartlinks_branding_toggle_cb(callback):
             text = build_smartlink_view_text(updated)
             await callback.message.answer(
                 text + "\n\nВыбери, что обновить:",
-                reply_markup=smartlink_edit_menu_kb(smartlink_id, page, updated.get("branding_disabled")),
+                reply_markup=smartlink_edit_menu_kb(
+                    smartlink_id,
+                    page,
+                    updated.get("branding_disabled"),
+                    updated.get("branding_paid"),
+                ),
             )
         await callback.answer("Брендинг включён")
         return
 
+    if branding_paid:
+        await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": True})
+        updated = await get_smartlink_by_id(smartlink_id)
+        if updated:
+            text = build_smartlink_view_text(updated)
+            await callback.message.answer(
+                text + "\n\nВыбери, что обновить:",
+                reply_markup=smartlink_edit_menu_kb(
+                    smartlink_id,
+                    page,
+                    updated.get("branding_disabled"),
+                    updated.get("branding_paid"),
+                ),
+            )
+        await callback.answer("Брендинг отключён")
+        return
+
     await callback.message.answer(
-        f"Отключить брендинг ИСКРЫ для этого смарт-линка?\nСтоимость: ⭐ {BRANDING_DISABLE_PRICE} Telegram Stars",
+        f"Отключить брендинг ИСКРЫ для этого смарт-линка?\nСтоимость: ⭐ {BRANDING_DISABLE_PRICE}",
         reply_markup=smartlink_branding_confirm_kb(smartlink_id, page),
     )
     await callback.answer()
@@ -3333,7 +3449,12 @@ async def smartlinks_branding_cancel_cb(callback):
     text = build_smartlink_view_text(smartlink)
     await callback.message.answer(
         text + "\n\nВыбери, что обновить:",
-        reply_markup=smartlink_edit_menu_kb(smartlink_id, page, smartlink.get("branding_disabled")),
+        reply_markup=smartlink_edit_menu_kb(
+            smartlink_id,
+            page,
+            smartlink.get("branding_disabled"),
+            smartlink.get("branding_paid"),
+        ),
     )
     await callback.answer()
 
@@ -3354,6 +3475,22 @@ async def smartlinks_branding_pay_cb(callback):
         return
     if smartlink.get("branding_disabled"):
         await callback.answer("Брендинг уже отключён", show_alert=True)
+        return
+    if smartlink.get("branding_paid"):
+        await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": True})
+        updated = await get_smartlink_by_id(smartlink_id)
+        if updated:
+            text = build_smartlink_view_text(updated)
+            await callback.message.answer(
+                text + "\n\nВыбери, что обновить:",
+                reply_markup=smartlink_edit_menu_kb(
+                    smartlink_id,
+                    page,
+                    updated.get("branding_disabled"),
+                    updated.get("branding_paid"),
+                ),
+            )
+        await callback.answer("Брендинг уже оплачен")
         return
 
     prices = [LabeledPrice(label="Отключение брендинга ИСКРЫ", amount=BRANDING_DISABLE_PRICE)]
@@ -3767,8 +3904,15 @@ async def smartlinks_export_format_cb(callback):
     page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
     variant = parts[4]
     smartlink = await get_smartlink_by_id(smartlink_id)
-    if not smartlink:
+    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
         await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    if not await get_export_unlocked(tg_id):
+        await callback.message.answer(
+            f"Открыть экспорт смарт-линка (Telegram/VK/PR/ссылки)?\nСтоимость: ⭐ {EXPORT_UNLOCK_PRICE}",
+            reply_markup=smartlink_export_paywall_kb(smartlink_id, page),
+        )
+        await callback.answer()
         return
 
     export_text = build_smartlink_export_text(smartlink, variant)
@@ -3802,6 +3946,55 @@ async def smartlinks_export_back_cb(callback):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("smartlinks:export_pay:"))
+async def smartlinks_export_pay_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    if await get_export_unlocked(tg_id):
+        await callback.answer("Экспорт уже активирован", show_alert=True)
+        return
+
+    prices = [LabeledPrice(label="Экспорт смарт-линков", amount=EXPORT_UNLOCK_PRICE)]
+    await callback.message.answer_invoice(
+        title="Экспорт смарт-линка",
+        description="Доступ к экспортам Telegram/VK/PR/ссылки для всех смарт-линков.",
+        payload="smartlink_export_unlock",
+        provider_token="",
+        currency="XTR",
+        prices=prices,
+    )
+    await callback.answer("Счёт на оплату")
+
+
+@dp.callback_query(F.data.startswith("smartlinks:export_cancel:"))
+async def smartlinks_export_cancel_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer()
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
+    try:
+        await callback.message.delete()
+    except Exception:
+        pass
+    if page >= 0:
+        await show_smartlink_view(callback.message, tg_id, smartlink_id, page)
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("smartlinks:export:"))
 async def smartlinks_export_cb(callback):
     tg_id = callback.from_user.id
@@ -3814,8 +4007,15 @@ async def smartlinks_export_cb(callback):
     smartlink_id = int(parts[2])
     page = int(parts[3]) if len(parts) == 4 and parts[3].lstrip("-").isdigit() else -1
     smartlink = await get_smartlink_by_id(smartlink_id)
-    if not smartlink:
+    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
         await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+    if not await get_export_unlocked(tg_id):
+        await callback.message.answer(
+            f"Открыть экспорт смарт-линка (Telegram/VK/PR/ссылки)?\nСтоимость: ⭐ {EXPORT_UNLOCK_PRICE}",
+            reply_markup=smartlink_export_paywall_kb(smartlink_id, page),
+        )
+        await callback.answer()
         return
 
     header = build_smartlink_view_text(smartlink)
@@ -4005,6 +4205,24 @@ async def any_message_router(message: Message):
         return
 
     form_name = form.get("form_name")
+    if form_name == "donate_custom":
+        if not txt.isdigit():
+            await message.answer(
+                "Нужна целая сумма в Stars. Попробуй ещё раз.",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+        stars = int(txt)
+        if stars < DONATE_MIN_STARS or stars > DONATE_MAX_STARS:
+            await message.answer(
+                f"Минимум {DONATE_MIN_STARS} ⭐. Максимум {DONATE_MAX_STARS} ⭐.",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+        await form_clear(tg_id)
+        await send_donate_invoice(message, stars)
+        return
+
     if form_name == "smartlink_upc":
         digits = re.sub(r"\D", "", txt)
         if not re.fullmatch(r"\d{12,14}", digits):
