@@ -12,6 +12,7 @@ import aiosqlite
 from bs4 import BeautifulSoup
 import smtplib
 from email.mime.text import MIMEText
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramForbiddenError
@@ -389,6 +390,8 @@ async def user_menu_keyboard(tg_id: int) -> ReplyKeyboardMarkup:
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")
+APP_VERSION = os.getenv("APP_VERSION", "dev")
+PORT = int(os.getenv("PORT", "8000"))
 
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
@@ -1110,6 +1113,21 @@ async def form_clear(tg_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM user_forms WHERE tg_id=?", (tg_id,))
         await db.commit()
+
+
+async def health_handler(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok", "mode": "polling", "version": APP_VERSION})
+
+
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.add_routes([web.get("/health", health_handler)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    print(f"Health endpoint available on port {PORT} (GET /health)")
+    return runner
 
 # -------------------- UX helpers --------------------
 
@@ -5011,7 +5029,11 @@ async def main():
         raise RuntimeError("BOT_TOKEN не задан.")
     await init_db()
     bot = Bot(token=TOKEN)
+    await start_health_server()
+    print("Launching bot in polling mode. Dropping webhook before start...")
+    await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(reminder_scheduler(bot))
+    print("Webhook cleared. Starting polling now.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
