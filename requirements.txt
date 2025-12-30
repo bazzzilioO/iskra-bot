@@ -2,3 +2,4 @@ aiogram==3.*
 python-dotenv==1.*
 aiosqlite==0.20.*
 aiohttp==3.*
+beautifulsoup4==4.*

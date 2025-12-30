@@ -8,6 +8,7 @@ from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
 
 import aiohttp
 import aiosqlite
+from bs4 import BeautifulSoup
 import smtplib
 from email.mime.text import MIMEText
 
@@ -1470,50 +1471,81 @@ async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
     return candidates
 
 
-def _normalize_music_url(url: str) -> str:
+def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str | None:
+    if "band.link" in host:
+        return "bandlink"
+    if host.startswith("music.yandex.") and ("/track/" in path or "/album/" in path):
+        if query.get("utm_source", "").lower() == "bandlink":
+            return "bandlink"
+        return "yandex"
+    if host == "open.spotify.com":
+        return "spotify"
+    if host == "music.apple.com":
+        return "apple"
+    if host == "itunes.apple.com":
+        return "itunes"
+    if host in {"music.vk.com", "music.vk.ru"}:
+        return "vk"
+    if host == "vk.com" and (
+        path.startswith("/music") or path.startswith("/link/")
+    ) and not any(path.startswith(prefix) for prefix in {"/away", "/share", "/login", "/terms"}):
+        return "vk"
+    if host == "deezer.com" and any(path.startswith(prefix) for prefix in {"/track/", "/album/", "/playlist/", "/artist/"}):
+        return "deezer"
+    if host in {"youtube.com", "m.youtube.com"}:
+        if path.startswith("/watch") and query.get("v"):
+            return "youtube"
+        if path.startswith("/shorts/"):
+            return "youtube"
+    if host == "youtu.be" and path.strip("/"):
+        return "youtube"
+    if host == "music.youtube.com":
+        if path.startswith("/watch") and query.get("v"):
+            return "youtubemusic"
+        if path.startswith("/browse/MPRE"):
+            return "youtubemusic"
+    if host == "zvuk.com" and any(
+        path.startswith(prefix)
+        for prefix in {"/album/", "/artist/", "/track/", "/playlist/", "/release/"}
+    ):
+        return "zvuk"
+    if host.startswith("kion.") or host == "kion.ru" or host.startswith("music.kion."):
+        return "kion"
+    return None
+
+
+def _normalize_music_url(url: str, platform_hint: str | None = None) -> str:
+    normalized, _ = normalize_music_url_with_platform(url, platform_hint)
+    return normalized
+
+
+def normalize_music_url_with_platform(url: str, platform_hint: str | None = None) -> tuple[str, str | None]:
     parsed = urlparse(url.strip())
     if parsed.scheme not in {"http", "https"}:
-        return ""
-    cleaned_query = [
-        (k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True) if not k.lower().startswith("utm_")
+        return "", None
+    cleaned_query_pairs = [
+        (k, v)
+        for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+        if not k.lower().startswith("utm_")
     ]
-    return urlunparse(parsed._replace(query=urlencode(cleaned_query), fragment=""))
+    query_dict = {k: v for k, v in cleaned_query_pairs}
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path or "/"
+
+    platform = _normalize_platform_key(platform_hint) if platform_hint else None
+    platform = platform or _allowed_music_platform(host, path, query_dict)
+    if not platform:
+        return "", None
+
+    normalized_url = urlunparse(parsed._replace(netloc=host, query=urlencode(cleaned_query_pairs), fragment=""))
+    return normalized_url, platform
 
 
 def detect_platform(url: str) -> str | None:
-    parsed = urlparse(url)
-    netloc = parsed.netloc.lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
-
-    if "band.link" in netloc:
-        return "bandlink"
-    if netloc.startswith("music.yandex."):
-        qs = {k.lower(): v for k, v in parse_qsl(parsed.query)}
-        if qs.get("utm_source", "").lower() == "bandlink":
-            return "bandlink"
-        return "yandex"
-    if netloc == "open.spotify.com":
-        return "spotify"
-    if netloc == "music.apple.com":
-        return "apple"
-    if netloc == "itunes.apple.com":
-        return "itunes"
-    if netloc in {"music.vk.com", "music.vk.ru"}:
-        return "vk"
-    if netloc == "deezer.com":
-        return "deezer"
-    if netloc in {"youtube.com", "youtu.be"}:
-        return "youtube"
-    if netloc == "music.youtube.com":
-        return "youtubemusic"
-    if netloc == "vk.com" and (parsed.path.startswith("/music") or parsed.path.startswith("/link")):
-        return "vk"
-    if netloc == "zvuk.com":
-        return "zvuk"
-    if netloc.startswith("kion.") or netloc == "kion.ru" or netloc.startswith("music.kion."):
-        return "kion"
-    return None
+    _, platform = normalize_music_url_with_platform(url)
+    return platform
 
 
 def platform_label(platform: str) -> str:
@@ -1572,15 +1604,12 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
     meta: dict | None = None
     meta_candidates: dict[str, set[str]] = {}
 
-    next_data_match = re.search(
-        r"<script[^>]+id=\"__NEXT_DATA__\"[^>]*>(.*?)</script>",
-        html_content,
-        re.DOTALL | re.IGNORECASE,
-    )
+    soup = BeautifulSoup(html_content or "", "html.parser")
 
-    if next_data_match:
+    next_script = soup.find("script", id="__NEXT_DATA__")
+    if next_script and next_script.string:
         try:
-            next_data_raw = html.unescape(next_data_match.group(1))
+            next_data_raw = html.unescape(next_script.string)
             next_data = json.loads(next_data_raw)
             print("[bandlink] __NEXT_DATA__ found")
         except Exception as e:
@@ -1593,10 +1622,9 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
     def add_link(url: str | None, platform_hint: str | None = None):
         if not url:
             return
-        normalized_url = _normalize_music_url(url)
-        if not normalized_url:
+        normalized_url, platform = normalize_music_url_with_platform(url, platform_hint)
+        if not normalized_url or not platform:
             return
-        platform = _normalize_platform_key(platform_hint) or detect_platform(normalized_url)
         if platform and platform not in links:
             links[platform] = normalized_url
 
@@ -1634,20 +1662,26 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
     if next_data:
         walk(next_data.get("props") or next_data.get("pageProps") or next_data)
 
+    for script in soup.find_all("script"):
+        content_type = (script.get("type") or "").lower()
+        if "json" not in content_type and script.get("id") != "__NEXT_DATA__":
+            continue
+        raw = script.string or ""
+        if not raw.strip():
+            continue
+        try:
+            data_blob = json.loads(raw)
+        except Exception:
+            continue
+        walk(data_blob)
+
     if not links or len(links) < 3:
-        for match in re.finditer(r"<a[^>]+class=\"([^\"]*el-link[^\"]*)\"[^>]+href=\"([^\"]+)\"", html_content, re.IGNORECASE):
-            class_attr = match.group(1)
-            href = html.unescape(match.group(2))
-            class_tokens = {token.strip().lower() for token in class_attr.split() if token.strip()}
-            platform_hint = None
-            for token in class_tokens:
-                if token in {"yandex", "vk", "spotify", "apple", "itunes", "zvuk", "kion", "youtube", "youtubemusic", "deezer"}:
-                    platform_hint = token
-                    break
-            add_link(href, platform_hint)
+        extracted_links = extract_links_from_bandlink(html_content, soup=soup)
+        for platform_key, href in extracted_links.items():
+            add_link(href, platform_key)
 
     if not links:
-        legacy_links = extract_links_from_bandlink(html_content)
+        legacy_links = extract_links_from_bandlink(html_content, soup=soup)
         if legacy_links:
             print(f"[bandlink] legacy href parser extracted {len(legacy_links)} platforms")
             links.update(legacy_links)
@@ -1843,42 +1877,41 @@ def merge_metadata(existing: dict | None, new: dict | None) -> dict:
     return merged
 
 
-def extract_links_from_bandlink(html_content: str) -> dict[str, str]:
+def extract_links_from_bandlink(html_content: str, soup: BeautifulSoup | None = None) -> dict[str, str]:
     links: dict[str, str] = {}
-    for href in re.findall(r"href=['\"]([^'\"]+)", html_content):
-        normalized = _normalize_music_url(href)
-        if not normalized:
+    soup = soup or BeautifulSoup(html_content or "", "html.parser")
+
+    for a_tag in soup.find_all("a"):
+        href = a_tag.get("href") or ""
+        if not href:
             continue
-        parsed = urlparse(normalized)
-        netloc = parsed.netloc.lower()
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-
-        platform: str | None = None
-        if netloc == "open.spotify.com":
-            platform = "spotify"
-        elif netloc == "music.apple.com":
-            platform = "apple"
-        elif netloc == "itunes.apple.com":
-            platform = "itunes"
-        elif netloc.startswith("music.yandex."):
-            platform = "yandex"
-        elif netloc in {"music.vk.com", "music.vk.ru"}:
-            platform = "vk"
-        elif netloc == "vk.com" and (parsed.path.startswith("/music") or parsed.path.startswith("/link")):
-            platform = "vk"
-        elif netloc == "zvuk.com":
-            platform = "zvuk"
-        elif netloc.startswith("kion.") or netloc == "kion.ru" or netloc.startswith("music.kion."):
-            platform = "kion"
-        elif netloc == "music.youtube.com":
-            platform = "youtubemusic"
-        elif netloc in {"youtube.com", "youtu.be"}:
-            platform = "youtube"
-        elif netloc == "deezer.com":
-            platform = "deezer"
-
-        if platform and platform not in links:
+        platform_hint = (
+            a_tag.get("data-platform")
+            or a_tag.get("data-service")
+            or a_tag.get("data-provider")
+            or None
+        )
+        class_tokens = {cls.lower() for cls in (a_tag.get("class") or []) if cls}
+        if not platform_hint:
+            for token in class_tokens:
+                if token in {
+                    "yandex",
+                    "vk",
+                    "spotify",
+                    "apple",
+                    "itunes",
+                    "zvuk",
+                    "kion",
+                    "youtube",
+                    "youtubemusic",
+                    "deezer",
+                }:
+                    platform_hint = token
+                    break
+        normalized, platform = normalize_music_url_with_platform(html.unescape(href), platform_hint)
+        if not normalized or not platform:
+            continue
+        if platform not in links:
             links[platform] = normalized
     return links
 
@@ -2263,10 +2296,6 @@ def build_smartlink_buttons(
 
     if platform_rows:
         rows.extend(platform_rows)
-
-    bandlink_url = links.get("bandlink")
-    if bandlink_url:
-        rows.append([InlineKeyboardButton(text="Открыть BandLink", url=bandlink_url)])
 
     if can_remind:
         toggle_text = "✅ Напоминание включено" if subscribed else "🔔 Напомнить о релизе"
