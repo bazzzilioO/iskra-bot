@@ -2,6 +2,7 @@ import asyncio
 import os
 import json
 import datetime as dt
+from zoneinfo import ZoneInfo
 import re
 import html
 from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
@@ -29,6 +30,9 @@ LABEL_EMAIL = "sreda.records@gmail.com"
 REMINDER_INTERVAL_SECONDS = 300
 REMINDER_CLEAN_DAYS = 60
 REMINDER_LAST_CLEAN: dt.date | None = None
+DEFAULT_TIMEZONE = "Europe/Moscow"
+DEFAULT_REMINDER_OFFSETS = "-7,-1,0,7"
+DEFAULT_REMINDER_TIME = "12:00"
 
 SMARTLINK_PLATFORMS = [
     ("yandex", "Яндекс Музыка"),
@@ -414,11 +418,26 @@ async def init_db():
             username TEXT,
             release_date TEXT DEFAULT NULL,
             reminders_enabled INTEGER DEFAULT 1,
+            reminder_offsets TEXT DEFAULT '-7,-1,0,7',
+            reminder_time TEXT DEFAULT '12:00',
+            timezone TEXT DEFAULT 'Europe/Moscow',
             export_unlocked INTEGER DEFAULT 0
         )
         """)
         try:
             await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN reminder_offsets TEXT DEFAULT '-7,-1,0,7'")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN reminder_time TEXT DEFAULT '12:00'")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'Europe/Moscow'")
         except Exception:
             pass
         try:
@@ -489,6 +508,9 @@ async def init_db():
             artist TEXT,
             title TEXT,
             release_date TEXT,
+            pre_save_enabled INTEGER DEFAULT 1,
+            reminders_enabled INTEGER DEFAULT 1,
+            project_id INTEGER,
             cover_file_id TEXT,
             links_json TEXT,
             caption_text TEXT,
@@ -499,6 +521,18 @@ async def init_db():
         """)
         try:
             await db.execute("ALTER TABLE smartlinks ADD COLUMN caption_text TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE smartlinks ADD COLUMN pre_save_enabled INTEGER DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE smartlinks ADD COLUMN reminders_enabled INTEGER DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE smartlinks ADD COLUMN project_id INTEGER")
         except Exception:
             pass
         try:
@@ -519,6 +553,25 @@ async def init_db():
             subscriber_tg_id INTEGER,
             notified INTEGER DEFAULT 0,
             PRIMARY KEY(smartlink_id, subscriber_tg_id)
+        )
+        """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS smartlink_reminder_log (
+            smartlink_id INTEGER,
+            subscriber_tg_id INTEGER,
+            offset_days INTEGER,
+            sent_on TEXT,
+            PRIMARY KEY (smartlink_id, subscriber_tg_id, offset_days)
+        )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_smartlink_reminder_sent ON smartlink_reminder_log(sent_on)")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_tg_id INTEGER,
+            name TEXT NOT NULL,
+            slug TEXT,
+            created_at TEXT
         )
         """)
         await db.execute("""
@@ -596,6 +649,38 @@ async def get_reminders_enabled(tg_id: int) -> bool:
         cur = await db.execute("SELECT reminders_enabled FROM users WHERE tg_id=?", (tg_id,))
         row = await cur.fetchone()
         return bool(row[0]) if row and row[0] is not None else True
+
+
+def _parse_offsets(raw: str | None) -> list[int]:
+    values: list[int] = []
+    for part in (raw or DEFAULT_REMINDER_OFFSETS).split(","):
+        try:
+            values.append(int(part.strip()))
+        except ValueError:
+            continue
+    return values or [-7, -1, 0, 7]
+
+
+def _parse_reminder_time(raw: str | None) -> dt.time | None:
+    if not raw:
+        return None
+    try:
+        h, m = raw.split(":")
+        return dt.time(int(h), int(m))
+    except Exception:
+        return None
+
+
+async def get_user_reminder_prefs(db: aiosqlite.Connection, tg_id: int) -> tuple[str, list[int], dt.time | None]:
+    cur = await db.execute(
+        "SELECT timezone, reminder_offsets, reminder_time FROM users WHERE tg_id=?",
+        (tg_id,),
+    )
+    row = await cur.fetchone()
+    timezone = row[0] if row and row[0] else DEFAULT_TIMEZONE
+    offsets_raw = row[1] if row else DEFAULT_REMINDER_OFFSETS
+    reminder_time_raw = row[2] if row else DEFAULT_REMINDER_TIME
+    return timezone, _parse_offsets(offsets_raw), _parse_reminder_time(reminder_time_raw) or _parse_reminder_time(DEFAULT_REMINDER_TIME)
 
 async def get_updates_opt_in(tg_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -763,12 +848,15 @@ def _smartlink_row_to_dict(row) -> dict:
         "artist": row[2] or "",
         "title": row[3] or "",
         "release_date": row[4],
-        "cover_file_id": row[5] or "",
-        "links": json.loads(row[6] or "{}"),
-        "caption_text": row[7] or "",
-        "branding_disabled": bool(row[8]) if len(row) > 8 else False,
-        "created_at": row[9] if len(row) > 9 else None,
-        "branding_paid": bool(row[10]) if len(row) > 10 else False,
+        "pre_save_enabled": bool(row[5]) if len(row) > 5 else True,
+        "reminders_enabled": bool(row[6]) if len(row) > 6 else True,
+        "project_id": row[7] if len(row) > 7 else None,
+        "cover_file_id": row[8] if len(row) > 8 else "",
+        "links": json.loads(row[9] or "{}"),
+        "caption_text": row[10] or "",
+        "branding_disabled": bool(row[11]) if len(row) > 11 else False,
+        "created_at": row[12] if len(row) > 12 else None,
+        "branding_paid": bool(row[13]) if len(row) > 13 else False,
     }
 
 
@@ -781,18 +869,24 @@ async def save_smartlink(
     links: dict,
     caption_text: str,
     branding_disabled: bool = False,
+    pre_save_enabled: bool = True,
+    reminders_enabled: bool = True,
+    project_id: int | None = None,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 owner_tg_id,
                 artist,
                 title,
                 release_date_iso,
+                1 if pre_save_enabled else 0,
+                1 if reminders_enabled else 0,
+                project_id,
                 cover_file_id,
                 json.dumps(links, ensure_ascii=False),
                 caption_text,
@@ -816,7 +910,7 @@ async def update_smartlink_caption(smartlink_id: int, caption_text: str):
 async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
             (owner_tg_id,),
         )
         row = await cur.fetchone()
@@ -826,7 +920,7 @@ async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
 async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE id=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE id=?",
             (smartlink_id,),
         )
         row = await cur.fetchone()
@@ -836,7 +930,7 @@ async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
             (owner_tg_id, limit, offset),
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -859,6 +953,9 @@ async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: di
         "caption_text",
         "branding_disabled",
         "branding_paid",
+        "pre_save_enabled",
+        "reminders_enabled",
+        "project_id",
     }
     fields: list[str] = []
     params: list = []
@@ -2242,10 +2339,11 @@ def build_smartlink_caption(
     caption_text = html.escape(smartlink.get("caption_text") or "")
     release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
     show_branding = not smartlink.get("branding_disabled")
+    presave_active = smartlink_pre_save_active(smartlink)
 
     links = smartlink.get("links") or {}
     has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
-    include_listen = show_listen_label if show_listen_label is not None else has_platforms
+    include_listen = False if presave_active else (show_listen_label if show_listen_label is not None else has_platforms)
 
     if release_today:
         lines = [f"{artist} — {title}"]
@@ -2266,6 +2364,8 @@ def build_smartlink_caption(
     lines = [f"{artist} — {title}"]
     if release_date:
         lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
+    if presave_active:
+        lines.append("⏳ Скоро выйдет")
     if caption_text:
         lines.append(caption_text)
     if show_branding:
@@ -2287,15 +2387,17 @@ def build_smartlink_buttons(
     rows: list[list[InlineKeyboardButton]] = []
     links = smartlink.get("links") or {}
     page_marker = page if page is not None else -1
+    presave_active = smartlink_pre_save_active(smartlink)
 
-    platform_rows: list[list[InlineKeyboardButton]] = []
-    for key, label in SMARTLINK_BUTTON_ORDER:
-        url = links.get(key)
-        if url:
-            platform_rows.append([InlineKeyboardButton(text=label, url=url)])
+    if not presave_active:
+        platform_rows: list[list[InlineKeyboardButton]] = []
+        for key, label in SMARTLINK_BUTTON_ORDER:
+            url = links.get(key)
+            if url:
+                platform_rows.append([InlineKeyboardButton(text=label, url=url)])
 
-    if platform_rows:
-        rows.extend(platform_rows)
+        if platform_rows:
+            rows.extend(platform_rows)
 
     if can_remind:
         toggle_text = "✅ Напоминание включено" if subscribed else "🔔 Напомнить о релизе"
@@ -2378,9 +2480,16 @@ def build_smartlink_export_text(smartlink: dict, variant: str) -> str:
     return ""
 
 
+def smartlink_pre_save_active(smartlink: dict) -> bool:
+    if not smartlink:
+        return False
+    rd = parse_date(smartlink.get("release_date") or "")
+    return bool(rd and rd > dt.date.today() and smartlink.get("pre_save_enabled", True))
+
+
 def smartlink_can_remind(smartlink: dict) -> bool:
     rd = parse_date(smartlink.get("release_date") or "") if smartlink else None
-    return bool(rd and rd > dt.date.today())
+    return bool(rd and rd > dt.date.today() and smartlink.get("reminders_enabled", True))
 
 
 async def send_smartlink_photo(
@@ -2536,6 +2645,21 @@ async def mark_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, whe
     )
 
 
+async def was_smartlink_day_sent(db: aiosqlite.Connection, smartlink_id: int, subscriber_tg_id: int, offset_days: int) -> bool:
+    cur = await db.execute(
+        "SELECT 1 FROM smartlink_reminder_log WHERE smartlink_id=? AND subscriber_tg_id=? AND offset_days=?",
+        (smartlink_id, subscriber_tg_id, offset_days),
+    )
+    return await cur.fetchone() is not None
+
+
+async def mark_smartlink_day_sent(db: aiosqlite.Connection, smartlink_id: int, subscriber_tg_id: int, offset_days: int, sent_on: dt.date):
+    await db.execute(
+        "INSERT OR REPLACE INTO smartlink_reminder_log (smartlink_id, subscriber_tg_id, offset_days, sent_on) VALUES (?, ?, ?, ?)",
+        (smartlink_id, subscriber_tg_id, offset_days, sent_on.isoformat()),
+    )
+
+
 async def cleanup_reminder_log(db: aiosqlite.Connection, today: dt.date):
     threshold = today - dt.timedelta(days=REMINDER_CLEAN_DAYS)
     await db.execute(
@@ -2549,6 +2673,19 @@ def build_deadline_messages(release_date: dt.date) -> list[tuple[str, str, dt.da
     for key, title, d in build_deadlines(release_date):
         messages.append((key, title, d))
     return messages
+
+
+def smartlink_reminder_text(offset: int, artist: str, title: str) -> str:
+    label = f"{artist} — {title}".strip(" —")
+    if offset == -7:
+        return f"Через 7 дней релиз: {label}. Проверь смарт-линк и материалы."
+    if offset == -1:
+        return f"Завтра релиз: {label}. Подготовь посты и рассылку."
+    if offset == 0:
+        return f"Сегодня релиз: {label}. Пора постить смарт-линк."
+    if offset == 7:
+        return f"Прошла неделя после релиза: {label}. Самое время допушить в плейлисты/медиа."
+    return ""
 
 
 async def process_reminders(bot: Bot):
@@ -2588,31 +2725,56 @@ async def process_reminders(bot: Bot):
 
 
 async def process_smartlink_notifications(bot: Bot):
-    today_iso = dt.date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE release_date=?",
-            (today_iso,),
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE release_date IS NOT NULL",
         )
         smartlinks = [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
 
         for smartlink in smartlinks:
+            if not smartlink.get("reminders_enabled"):
+                continue
+            rd = parse_date(smartlink.get("release_date") or "")
+            if not rd:
+                continue
             sub_cur = await db.execute(
-                "SELECT subscriber_tg_id FROM smartlink_subscriptions WHERE smartlink_id=? AND notified=0",
+                "SELECT subscriber_tg_id FROM smartlink_subscriptions WHERE smartlink_id=?",
                 (smartlink.get("id"),),
             )
             subscribers = [row[0] for row in await sub_cur.fetchall()]
             for subscriber_tg_id in subscribers:
-                try:
-                    await send_smartlink_photo(bot, subscriber_tg_id, smartlink, release_today=True, subscribed=True, allow_remind=False)
-                    await db.execute(
-                        "UPDATE smartlink_subscriptions SET notified=1 WHERE smartlink_id=? AND subscriber_tg_id=?",
-                        (smartlink.get("id"), subscriber_tg_id),
-                    )
-                except TelegramForbiddenError:
+                tz, offsets, reminder_time = await get_user_reminder_prefs(db, subscriber_tg_id)
+                now_local = dt.datetime.now(ZoneInfo(tz))
+                if reminder_time and (now_local.hour != reminder_time.hour or now_local.minute != reminder_time.minute):
                     continue
-                except Exception:
-                    continue
+                for offset in offsets:
+                    target_date = rd + dt.timedelta(days=offset)
+                    if target_date != now_local.date():
+                        continue
+                    if await was_smartlink_day_sent(db, smartlink.get("id"), subscriber_tg_id, offset):
+                        continue
+                    try:
+                        text = smartlink_reminder_text(offset, smartlink.get("artist") or "", smartlink.get("title") or "")
+                        if text:
+                            await bot.send_message(subscriber_tg_id, text)
+                        await send_smartlink_photo(
+                            bot,
+                            subscriber_tg_id,
+                            smartlink,
+                            release_today=offset == 0,
+                            subscribed=True,
+                            allow_remind=False,
+                        )
+                        await mark_smartlink_day_sent(db, smartlink.get("id"), subscriber_tg_id, offset, now_local.date())
+                        if offset == 0:
+                            await db.execute(
+                                "UPDATE smartlink_subscriptions SET notified=1 WHERE smartlink_id=? AND subscriber_tg_id=?",
+                                (smartlink.get("id"), subscriber_tg_id),
+                            )
+                    except TelegramForbiddenError:
+                        continue
+                    except Exception:
+                        continue
         await db.commit()
 
 
