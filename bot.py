@@ -1,10 +1,14 @@
 import asyncio
-import os
-import json
-import datetime as dt
-from zoneinfo import ZoneInfo
-import re
+import contextlib
+import fcntl
 import html
+import json
+import os
+import re
+import datetime as dt
+import time
+from typing import IO
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
 
 import aiohttp
@@ -15,7 +19,8 @@ from email.mime.text import MIMEText
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -24,6 +29,7 @@ from aiogram.types import (
     LabeledPrice, PreCheckoutQuery,
     BufferedInputFile,
 )
+from aiogram.utils.backoff import Backoff, BackoffConfig
 from dotenv import load_dotenv
 
 DB_PATH = "bot.db"
@@ -392,6 +398,20 @@ TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")
 APP_VERSION = os.getenv("APP_VERSION", "dev")
 PORT = int(os.getenv("PORT", "8000"))
+POLLING_LOCK_FILE = os.getenv("POLLING_LOCK_FILE", "/tmp/iskra_bot_polling.lock")
+POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "60"))
+NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30"))
+HTTP_TIMEOUT = aiohttp.ClientTimeout(
+    total=float(os.getenv("HTTP_TIMEOUT_TOTAL", "90")),
+    connect=float(os.getenv("HTTP_TIMEOUT_CONNECT", "30")),
+    sock_read=float(os.getenv("HTTP_TIMEOUT_SOCK_READ", "90")),
+)
+POLLING_BACKOFF_CONFIG = BackoffConfig(
+    min_delay=float(os.getenv("BACKOFF_MIN_DELAY", "1")),
+    max_delay=float(os.getenv("BACKOFF_MAX_DELAY", "60")),
+    factor=float(os.getenv("BACKOFF_FACTOR", "2")),
+    jitter=float(os.getenv("BACKOFF_JITTER", "0.1")),
+)
 
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
@@ -1128,6 +1148,30 @@ async def start_health_server() -> web.AppRunner:
     await site.start()
     print(f"Health endpoint available on port {PORT} (GET /health)")
     return runner
+
+
+def acquire_single_instance_lock(lock_path: str) -> IO[str] | None:
+    """Try to acquire an exclusive file lock to avoid running multiple polling instances."""
+
+    dir_name = os.path.dirname(lock_path)
+    if dir_name:
+        os.makedirs(dir_name, exist_ok=True)
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return None
+
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
+def release_single_instance_lock(lock_file: IO[str]) -> None:
+    with contextlib.suppress(Exception):
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 # -------------------- UX helpers --------------------
 
@@ -5024,17 +5068,53 @@ async def any_message_router(message: Message):
 
 # -------------------- Runner --------------------
 
+async def run_polling(bot: Bot):
+    backoff = Backoff(POLLING_BACKOFF_CONFIG)
+    last_network_log_at = 0.0
+
+    while True:
+        try:
+            await dp.start_polling(
+                bot,
+                polling_timeout=POLLING_TIMEOUT,
+                backoff_config=POLLING_BACKOFF_CONFIG,
+                allowed_updates=dp.resolve_used_update_types(),
+                close_bot_session=False,
+            )
+            break
+        except TelegramNetworkError as exc:
+            now = time.monotonic()
+            if now - last_network_log_at >= NETWORK_ERROR_LOG_THROTTLE:
+                print(f"Network error during polling: {exc}. Retrying...")
+                last_network_log_at = now
+
+            delay = next(backoff)
+            print(f"Retrying polling in {delay:.1f}s (attempt #{backoff.counter})")
+            await asyncio.sleep(delay)
+
+
 async def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN не задан.")
+    lock_file = acquire_single_instance_lock(POLLING_LOCK_FILE)
+    if lock_file is None:
+        print(f"Another polling instance is already running (lock: {POLLING_LOCK_FILE}). Exiting.")
+        return
+
     await init_db()
-    bot = Bot(token=TOKEN)
+    session = AiohttpSession(timeout=HTTP_TIMEOUT)
+    bot = Bot(token=TOKEN, session=session)
+    me = await bot.get_me()
+    print(f"Starting bot in POLLING mode, bot_id={me.id}, username=@{me.username}")
     await start_health_server()
-    print("Launching bot in polling mode. Dropping webhook before start...")
+    print("Dropping webhook and pending updates before polling...")
     await bot.delete_webhook(drop_pending_updates=True)
     asyncio.create_task(reminder_scheduler(bot))
-    print("Webhook cleared. Starting polling now.")
-    await dp.start_polling(bot)
+    try:
+        await run_polling(bot)
+    finally:
+        release_single_instance_lock(lock_file)
+        await bot.session.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
