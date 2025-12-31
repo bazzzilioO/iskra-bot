@@ -412,6 +412,14 @@ POLLING_BACKOFF_CONFIG = BackoffConfig(
     factor=float(os.getenv("BACKOFF_FACTOR", "2")),
     jitter=float(os.getenv("BACKOFF_JITTER", "0.1")),
 )
+HEALTH_STATE: dict[str, str | int | None] = {
+    "status": "starting",
+    "mode": "polling",
+    "version": APP_VERSION,
+    "bot_id": None,
+    "username": None,
+    "pid": os.getpid(),
+}
 
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
@@ -1136,7 +1144,7 @@ async def form_clear(tg_id: int):
 
 
 async def health_handler(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "mode": "polling", "version": APP_VERSION})
+    return web.json_response(HEALTH_STATE)
 
 
 async def start_health_server() -> web.AppRunner:
@@ -5101,11 +5109,21 @@ async def main():
         print(f"Another polling instance is already running (lock: {POLLING_LOCK_FILE}). Exiting.")
         return
 
+    print(f"Single-instance lock acquired at {POLLING_LOCK_FILE} (pid={os.getpid()})")
+
     await init_db()
     session = AiohttpSession(timeout=HTTP_TIMEOUT)
     bot = Bot(token=TOKEN, session=session)
     me = await bot.get_me()
-    print(f"Starting bot in POLLING mode, bot_id={me.id}, username=@{me.username}")
+    HEALTH_STATE.update({
+        "status": "running",
+        "bot_id": me.id,
+        "username": me.username,
+    })
+    print(
+        "Starting bot in POLLING mode, "
+        f"bot_id={me.id}, username=@{me.username}, pid={os.getpid()}"
+    )
     await start_health_server()
     print("Dropping webhook and pending updates before polling...")
     await bot.delete_webhook(drop_pending_updates=True)
