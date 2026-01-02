@@ -1,10 +1,11 @@
 import datetime as dt
 import json
+import os
 from typing import Iterable
 
 import aiosqlite
 
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_REMINDER_OFFSETS = "-7,-1,0,7"
 DEFAULT_REMINDER_TIME = "12:00"
