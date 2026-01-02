@@ -1,3 +1,15 @@
+# Table of contents
+# CONFIG/ENV
+# CONSTANTS
+# DB
+# HELPERS (core)
+# HELPERS
+# KEYBOARDS
+# FEATURES (focus/smartlink/label/broadcast)
+# SCHEDULER
+# HANDLERS
+# MAIN
+
 import asyncio
 import contextlib
 import fcntl
@@ -20,7 +32,7 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError
+from aiogram.exceptions import MessageNotModified, TelegramForbiddenError, TelegramNetworkError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -31,6 +43,117 @@ from aiogram.types import (
 )
 from aiogram.utils.backoff import Backoff, BackoffConfig
 from dotenv import load_dotenv
+
+# -------------------- HELPERS (core) --------------------
+
+def escape_html(text: str | None) -> str:
+    return html.escape(text or "")
+
+
+def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
+    if isinstance(value, dt.datetime):
+        value = value.date()
+    if isinstance(value, str):
+        parsed = parse_date(value)
+        value = parsed if parsed else None
+    if isinstance(value, dt.date):
+        return value.strftime("%d.%m.%Y")
+    return ""
+
+
+async def safe_edit(target: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> Message | None:
+    try:
+        await target.edit_text(text, reply_markup=reply_markup)
+        return target
+    except MessageNotModified:
+        return target
+    except Exception as edit_err:
+        try:
+            return await target.answer(text, reply_markup=reply_markup)
+        except Exception as answer_err:
+            print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
+            return None
+
+
+def build_focus_caption(
+    tasks_state: dict[int, int],
+    experience: str | None = None,
+    important: set[int] | None = None,
+    focus_task_id: int | None = None,
+) -> str:
+    text, _ = build_focus(tasks_state, experience, important, focus_task_id)
+    return text
+
+
+def build_focus_keyboard(
+    tasks_state: dict[int, int],
+    experience: str | None = None,
+    important: set[int] | None = None,
+    focus_task_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    _, kb = build_focus(tasks_state, experience, important, focus_task_id)
+    return kb
+
+
+def build_smartlink_caption(
+    smartlink: dict, release_today: bool = False, show_listen_label: bool | None = None
+) -> str:
+    artist = escape_html(smartlink.get("artist") or "")
+    title = escape_html(smartlink.get("title") or "")
+    caption_text = escape_html(smartlink.get("caption_text") or "")
+    release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
+    show_branding = not smartlink.get("branding_disabled")
+    presave_active = smartlink_pre_save_active(smartlink)
+
+    links = smartlink.get("links") or {}
+    has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
+    include_listen = False if presave_active else (show_listen_label if show_listen_label is not None else has_platforms)
+
+    if release_today:
+        lines = [f"{artist} — {title}"]
+        lines.append("🎉 Сегодня релиз!")
+        if release_date:
+            lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
+        if caption_text:
+            lines.append(caption_text)
+        if show_branding:
+            lines.append("")
+            lines.append(ATTRIBUTION_HTML)
+        if include_listen:
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append("▶️ Слушать:")
+        return "\n".join(lines)
+
+    lines = [f"{artist} — {title}"]
+    if release_date:
+        lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
+    if presave_active:
+        lines.append("⏳ Скоро выйдет")
+    if caption_text:
+        lines.append(caption_text)
+    if show_branding:
+        lines.append("")
+        lines.append(ATTRIBUTION_HTML)
+    if include_listen:
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.append("▶️ Слушать:")
+    return "\n".join(lines)
+
+
+def build_smartlink_keyboard(
+    smartlink: dict,
+    subscribed: bool = False,
+    can_remind: bool = False,
+    page: int | None = None,
+) -> InlineKeyboardMarkup | None:
+    return build_smartlink_buttons(
+        smartlink,
+        subscribed=subscribed,
+        can_remind=can_remind,
+        page=page,
+    )
 
 DB_PATH = "bot.db"
 LABEL_EMAIL = "sreda.records@gmail.com"
@@ -190,11 +313,6 @@ async def send_export_invoice(message: Message):
         currency="XTR",
         prices=prices
     )
-
-# -------------------- DATE: RU format --------------------
-
-def format_date_ru(d: dt.date) -> str:
-    return d.strftime("%d.%m.%Y")
 
 def parse_date(date_str: str) -> dt.date | None:
     """
@@ -1207,26 +1325,6 @@ async def build_focus_for_user(tg_id: int, exp: str, focus_task_id: int | None =
     tasks_state = await get_tasks_state(tg_id)
     important = await get_important_tasks(tg_id)
     return build_focus(tasks_state, exp, important, focus_task_id)
-
-
-def build_focus_caption(
-    tasks_state: dict[int, int],
-    experience: str | None = None,
-    important: set[int] | None = None,
-    focus_task_id: int | None = None,
-) -> str:
-    text, _ = build_focus(tasks_state, experience, important, focus_task_id)
-    return text
-
-
-def build_focus_keyboard(
-    tasks_state: dict[int, int],
-    experience: str | None = None,
-    important: set[int] | None = None,
-    focus_task_id: int | None = None,
-) -> InlineKeyboardMarkup:
-    _, kb = build_focus(tasks_state, experience, important, focus_task_id)
-    return kb
 
 def build_focus(
     tasks_state: dict[int, int],
@@ -2434,67 +2532,6 @@ async def apply_caption_update(message: Message, tg_id: int, smartlink_id: int, 
 ATTRIBUTION_HTML = 'Сделано с помощью <a href="https://t.me/iskramusic_bot">ИСКРЫ</a>'
 
 
-def build_smartlink_caption(
-    smartlink: dict, release_today: bool = False, show_listen_label: bool | None = None
-) -> str:
-    artist = html.escape(smartlink.get("artist") or "")
-    title = html.escape(smartlink.get("title") or "")
-    caption_text = html.escape(smartlink.get("caption_text") or "")
-    release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
-    show_branding = not smartlink.get("branding_disabled")
-    presave_active = smartlink_pre_save_active(smartlink)
-
-    links = smartlink.get("links") or {}
-    has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
-    include_listen = False if presave_active else (show_listen_label if show_listen_label is not None else has_platforms)
-
-    if release_today:
-        lines = [f"{artist} — {title}"]
-        lines.append("🎉 Сегодня релиз!")
-        if release_date:
-            lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
-        if caption_text:
-            lines.append(caption_text)
-        if show_branding:
-            lines.append("")
-            lines.append(ATTRIBUTION_HTML)
-        if include_listen:
-            if lines and lines[-1] != "":
-                lines.append("")
-            lines.append("▶️ Слушать:")
-        return "\n".join(lines)
-
-    lines = [f"{artist} — {title}"]
-    if release_date:
-        lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
-    if presave_active:
-        lines.append("⏳ Скоро выйдет")
-    if caption_text:
-        lines.append(caption_text)
-    if show_branding:
-        lines.append("")
-        lines.append(ATTRIBUTION_HTML)
-    if include_listen:
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.append("▶️ Слушать:")
-    return "\n".join(lines)
-
-
-def build_smartlink_keyboard(
-    smartlink: dict,
-    subscribed: bool = False,
-    can_remind: bool = False,
-    page: int | None = None,
-) -> InlineKeyboardMarkup | None:
-    return build_smartlink_buttons(
-        smartlink,
-        subscribed=subscribed,
-        can_remind=can_remind,
-        page=page,
-    )
-
-
 def build_smartlink_buttons(
     smartlink: dict,
     subscribed: bool = False,
@@ -2720,18 +2757,6 @@ def build_donate_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Своя сумма", callback_data="donate:custom")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_focus")]
     ])
-
-async def safe_edit(message: Message, text: str, kb: InlineKeyboardMarkup | None) -> Message | None:
-    try:
-        await message.edit_text(text, reply_markup=kb)
-        return message
-    except Exception as edit_err:
-        try:
-            return await message.answer(text, reply_markup=kb)
-        except Exception as answer_err:
-            print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
-            return None
-
 
 async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMarkup | None) -> Message | None:
     try:
@@ -5172,3 +5197,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# TODO (PR-2): вынести повторяющиеся функции для формирования клавиатур и текстов
+# - unify safe_edit_caption с safe_edit через общий обработчик
+# - собрать общую функцию для экспорта смартлинков (copy/export)
