@@ -32,7 +32,7 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import MessageNotModified, TelegramForbiddenError, TelegramNetworkError
+from aiogram.exceptions import MessageNotModified, TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -65,9 +65,7 @@ async def safe_edit(target: Message, text: str, reply_markup: InlineKeyboardMark
     try:
         await target.edit_text(text, reply_markup=reply_markup)
         return target
-    from aiogram.exceptions import TelegramBadRequest
-         except TelegramBadRequest:
-         pass
+    except TelegramBadRequest:
         return target
     except Exception as edit_err:
         try:
