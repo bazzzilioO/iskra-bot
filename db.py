@@ -283,6 +283,17 @@ async def get_reminders_enabled(tg_id: int) -> bool:
         return bool(row[0]) if row and row[0] is not None else True
 
 
+async def toggle_reminders_enabled(tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT reminders_enabled FROM users WHERE tg_id=?", (tg_id,))
+        row = await cur.fetchone()
+        current = row[0] if row else 1
+        new_value = 0 if current else 1
+        await db.execute("UPDATE users SET reminders_enabled=? WHERE tg_id=?", (new_value, tg_id))
+        await db.commit()
+        return bool(new_value)
+
+
 async def get_user_reminder_prefs(tg_id: int) -> tuple[str, list[int], dt.time | None]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -368,6 +379,15 @@ async def toggle_task(tg_id: int, task_id: int):
         await db.commit()
 
 
+async def toggle_task_and_get_state(tg_id: int, task_id: int) -> dict[int, int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE user_tasks SET done = 1 - done WHERE tg_id=? AND task_id=?", (tg_id, task_id))
+        cur = await db.execute("SELECT task_id, done FROM user_tasks WHERE tg_id=?", (tg_id,))
+        rows = await cur.fetchall()
+        await db.commit()
+        return {tid: done for tid, done in rows}
+
+
 async def set_task_done(tg_id: int, task_id: int, done: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT done FROM user_tasks WHERE tg_id=? AND task_id=?", (tg_id, task_id))
@@ -423,6 +443,33 @@ async def get_important_tasks(tg_id: int) -> set[int]:
             (tg_id,),
         )
         rows = await cur.fetchall()
+        return {r[0] for r in rows}
+
+
+async def toggle_important_task(tg_id: int, task_id: int) -> set[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT task_id FROM important_tasks WHERE tg_id=?",
+            (tg_id,),
+        )
+        rows = await cur.fetchall()
+        important = {r[0] for r in rows}
+        if task_id in important:
+            await db.execute(
+                "DELETE FROM important_tasks WHERE tg_id=? AND task_id=?",
+                (tg_id, task_id)
+            )
+        else:
+            await db.execute(
+                "INSERT OR IGNORE INTO important_tasks (tg_id, task_id) VALUES (?, ?)",
+                (tg_id, task_id)
+            )
+        cur = await db.execute(
+            "SELECT task_id FROM important_tasks WHERE tg_id=?",
+            (tg_id,),
+        )
+        rows = await cur.fetchall()
+        await db.commit()
         return {r[0] for r in rows}
 
 

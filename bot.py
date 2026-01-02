@@ -42,7 +42,6 @@ from aiogram.types import (
 from aiogram.utils.backoff import Backoff, BackoffConfig
 from dotenv import load_dotenv
 from db import (
-    add_important_task,
     cleanup_reminder_log,
     count_smartlinks,
     cycle_account_status as db_cycle_account_status,
@@ -74,7 +73,6 @@ from db import (
     mark_reminder_sent,
     mark_smartlink_day_sent,
     mark_smartlink_notified,
-    remove_important_task,
     reset_all_data,
     reset_progress_only,
     save_qc_check,
@@ -83,11 +81,12 @@ from db import (
     set_experience,
     set_last_update_notified,
     set_release_date,
-    set_reminders_enabled,
     set_smartlink_subscription,
     set_updates_opt_in,
-    toggle_task,
     toggle_updates_opt_in,
+    toggle_important_task,
+    toggle_reminders_enabled,
+    toggle_task_and_get_state,
     update_smartlink_caption,
     update_smartlink_data,
     was_qc_checked,
@@ -2239,8 +2238,7 @@ async def section_toggle_cb(callback):
     page = int(page_s)
     task_id = int(tid_s)
 
-    await toggle_task(tg_id, task_id)
-    tasks_state = await get_tasks_state(tg_id)
+    tasks_state = await toggle_task_and_get_state(tg_id, task_id)
     text, kb = build_section_page(tasks_state, sid, page)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Ок")
@@ -2284,12 +2282,11 @@ async def timeline_cb(callback):
 async def reminders_toggle_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
-    current = await get_reminders_enabled(tg_id)
-    await set_reminders_enabled(tg_id, not current)
+    new_state = await toggle_reminders_enabled(tg_id)
     rd = await get_release_date(tg_id)
     d = parse_date(rd) if rd else None
-    kb = build_timeline_kb(not current, has_date=bool(d))
-    await safe_edit(callback.message, timeline_text(d, not current), kb)
+    kb = build_timeline_kb(new_state, has_date=bool(d))
+    await safe_edit(callback.message, timeline_text(d, new_state), kb)
     await callback.answer("Напоминания обновлены")
 
 @dp.callback_query(F.data == "timeline:set_date")
@@ -3180,12 +3177,7 @@ async def important_toggle_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     task_id = int(callback.data.split(":")[2])
-    important = await get_important_tasks(tg_id)
-    if task_id in important:
-        await remove_important_task(tg_id, task_id)
-    else:
-        await add_important_task(tg_id, task_id)
-    important = await get_important_tasks(tg_id)
+    important = await toggle_important_task(tg_id, task_id)
     tasks_state = await get_tasks_state(tg_id)
     exp = await get_experience(tg_id)
     if callback.message.text and callback.message.text.startswith("🔥 Важное"):
