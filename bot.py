@@ -32,7 +32,7 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import MessageNotModified, TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
