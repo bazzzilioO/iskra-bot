@@ -401,11 +401,8 @@ PORT = int(os.getenv("PORT", "8000"))
 POLLING_LOCK_FILE = os.getenv("POLLING_LOCK_FILE", "/tmp/iskra_bot_polling.lock")
 POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "60"))
 NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30"))
-HTTP_TIMEOUT = aiohttp.ClientTimeout(
-    total=float(os.getenv("HTTP_TIMEOUT_TOTAL", "90")),
-    connect=float(os.getenv("HTTP_TIMEOUT_CONNECT", "30")),
-    sock_read=float(os.getenv("HTTP_TIMEOUT_SOCK_READ", "90")),
-)
+# HTTP timeout must be numeric: aiogram adds it to polling_timeout internally.
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_TOTAL", "90"))
 POLLING_BACKOFF_CONFIG = BackoffConfig(
     min_delay=float(os.getenv("BACKOFF_MIN_DELAY", "1")),
     max_delay=float(os.getenv("BACKOFF_MAX_DELAY", "60")),
