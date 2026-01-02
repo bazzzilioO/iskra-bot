@@ -65,7 +65,9 @@ async def safe_edit(target: Message, text: str, reply_markup: InlineKeyboardMark
     try:
         await target.edit_text(text, reply_markup=reply_markup)
         return target
-    except MessageNotModified:
+    from aiogram.exceptions import TelegramBadRequest
+         except TelegramBadRequest:
+         pass
         return target
     except Exception as edit_err:
         try:
