@@ -1211,6 +1211,26 @@ async def build_focus_for_user(tg_id: int, exp: str, focus_task_id: int | None =
     important = await get_important_tasks(tg_id)
     return build_focus(tasks_state, exp, important, focus_task_id)
 
+
+def build_focus_caption(
+    tasks_state: dict[int, int],
+    experience: str | None = None,
+    important: set[int] | None = None,
+    focus_task_id: int | None = None,
+) -> str:
+    text, _ = build_focus(tasks_state, experience, important, focus_task_id)
+    return text
+
+
+def build_focus_keyboard(
+    tasks_state: dict[int, int],
+    experience: str | None = None,
+    important: set[int] | None = None,
+    focus_task_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    _, kb = build_focus(tasks_state, experience, important, focus_task_id)
+    return kb
+
 def build_focus(
     tasks_state: dict[int, int],
     experience: str | None = None,
@@ -2464,6 +2484,20 @@ def build_smartlink_caption(
     return "\n".join(lines)
 
 
+def build_smartlink_keyboard(
+    smartlink: dict,
+    subscribed: bool = False,
+    can_remind: bool = False,
+    page: int | None = None,
+) -> InlineKeyboardMarkup | None:
+    return build_smartlink_buttons(
+        smartlink,
+        subscribed=subscribed,
+        can_remind=can_remind,
+        page=page,
+    )
+
+
 def build_smartlink_buttons(
     smartlink: dict,
     subscribed: bool = False,
@@ -2588,7 +2622,12 @@ async def send_smartlink_photo(
     page: int | None = None,
 ):
     caption = build_smartlink_caption(smartlink, release_today=release_today)
-    kb = build_smartlink_buttons(smartlink, subscribed=subscribed, can_remind=allow_remind, page=page)
+    kb = build_smartlink_keyboard(
+        smartlink,
+        subscribed=subscribed,
+        can_remind=allow_remind,
+        page=page,
+    )
     return await bot.send_photo(
         chat_id,
         photo=smartlink.get("cover_file_id"),
@@ -4072,7 +4111,7 @@ async def smartlink_toggle_cb(callback):
     current = await is_smartlink_subscribed(smartlink_id, tg_id)
     await set_smartlink_subscription(smartlink_id, tg_id, not current)
     allow_remind = smartlink_can_remind(smartlink)
-    kb = build_smartlink_buttons(smartlink, subscribed=not current, can_remind=allow_remind)
+    kb = build_smartlink_keyboard(smartlink, subscribed=not current, can_remind=allow_remind)
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Напомню" if not current else "Напоминание выключено")
