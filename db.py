@@ -33,6 +33,7 @@ def _parse_reminder_time(raw: str | None) -> dt.time | None:
 
 
 async def init_db():
+    """Initialize the SQLite database schema and tuning pragmas."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
