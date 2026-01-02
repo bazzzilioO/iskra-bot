@@ -1689,6 +1689,18 @@ async def process_smartlink_notifications(bot: Bot):
                     continue
                 except Exception:
                     continue
+
+
+async def reminder_scheduler(bot: Bot):
+    while True:
+        try:
+            await asyncio.gather(
+                process_reminders(bot),
+                process_smartlink_notifications(bot),
+            )
+        except Exception as err:
+            print(f"[reminder_scheduler] failed: {err}")
+        await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
 # -------------------- Email send (optional) --------------------
 
 def _send_email_sync(subject: str, body: str) -> bool:
@@ -3923,7 +3935,13 @@ async def main():
     print(f"Single-instance lock acquired at {POLLING_LOCK_FILE} (pid={os.getpid()})")
 
     await init_db()
-    session = AiohttpSession(timeout=HTTP_TIMEOUT)
+    timeout_seconds = float(HTTP_TIMEOUT)
+    session = AiohttpSession(timeout=timeout_seconds)
+    if not isinstance(session.timeout, (int, float)):
+        with contextlib.suppress(Exception):
+            session.timeout = float(getattr(session.timeout, "total", timeout_seconds))
+    if not isinstance(session.timeout, (int, float)):
+        session.timeout = timeout_seconds
     bot = Bot(token=TOKEN, session=session)
     me = await bot.get_me()
     HEALTH_STATE.update({
@@ -3938,7 +3956,10 @@ async def main():
     await start_health_server()
     print("Dropping webhook and pending updates before polling...")
     await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(reminder_scheduler(bot))
+    try:
+        asyncio.create_task(reminder_scheduler(bot))
+    except Exception as err:
+        print(f"[main] reminder scheduler not started: {err}")
     try:
         await run_polling(bot)
     finally:
