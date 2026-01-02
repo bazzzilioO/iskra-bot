@@ -3934,6 +3934,7 @@ async def main():
 
     print(f"Single-instance lock acquired at {POLLING_LOCK_FILE} (pid={os.getpid()})")
 
+    # Ensure database schema is initialized before starting external services
     await init_db()
     timeout_seconds = float(HTTP_TIMEOUT)
     session = AiohttpSession(timeout=timeout_seconds)
