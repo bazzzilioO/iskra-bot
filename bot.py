@@ -23,7 +23,6 @@ from zoneinfo import ZoneInfo
 from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
 
 import aiohttp
-import aiosqlite
 from bs4 import BeautifulSoup
 import smtplib
 from email.mime.text import MIMEText
@@ -42,6 +41,59 @@ from aiogram.types import (
 )
 from aiogram.utils.backoff import Backoff, BackoffConfig
 from dotenv import load_dotenv
+from db import (
+    add_important_task,
+    cleanup_reminder_log,
+    count_smartlinks,
+    cycle_account_status as db_cycle_account_status,
+    delete_smartlink,
+    ensure_user as db_ensure_user,
+    form_clear,
+    form_get,
+    form_set,
+    form_start,
+    get_accounts_state,
+    get_export_unlocked,
+    get_experience,
+    get_important_tasks,
+    get_last_update_notified,
+    get_latest_smartlink,
+    get_release_date,
+    get_reminder_users,
+    get_reminders_enabled,
+    get_smartlink_by_id,
+    get_smartlink_subscribers,
+    get_smartlinks_with_release,
+    list_smartlinks,
+    get_tasks_state,
+    get_updates_opt_in,
+    get_updates_opt_in_users,
+    get_user_reminder_prefs,
+    init_db,
+    is_smartlink_subscribed,
+    mark_reminder_sent,
+    mark_smartlink_day_sent,
+    mark_smartlink_notified,
+    remove_important_task,
+    reset_all_data,
+    reset_progress_only,
+    save_qc_check,
+    save_smartlink,
+    set_export_unlocked,
+    set_experience,
+    set_last_update_notified,
+    set_release_date,
+    set_reminders_enabled,
+    set_smartlink_subscription,
+    set_updates_opt_in,
+    toggle_task,
+    toggle_updates_opt_in,
+    update_smartlink_caption,
+    update_smartlink_data,
+    was_qc_checked,
+    was_reminder_sent,
+    was_smartlink_day_sent,
+)
 from helpers import escape_html, format_date_ru, parse_date, safe_edit, safe_edit_caption
 from keyboards import (
     ACCOUNTS,
@@ -165,16 +217,19 @@ def build_smartlink_keyboard(
         page=page,
     )
 
-DB_PATH = "bot.db"
 LABEL_EMAIL = "sreda.records@gmail.com"
 REMINDER_INTERVAL_SECONDS = 300
-REMINDER_CLEAN_DAYS = 60
 REMINDER_LAST_CLEAN: dt.date | None = None
-DEFAULT_TIMEZONE = "Europe/Moscow"
-DEFAULT_REMINDER_OFFSETS = "-7,-1,0,7"
-DEFAULT_REMINDER_TIME = "12:00"
 
 HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
+
+
+async def ensure_user(tg_id: int, username: str | None = None):
+    await db_ensure_user(tg_id, username, TASKS, ACCOUNTS)
+
+
+async def cycle_account_status(tg_id: int, key: str):
+    return await db_cycle_account_status(tg_id, key, next_acc_status)
 
 
 def smartlink_step_prompt(step: int) -> str:
@@ -351,347 +406,6 @@ _SPOTIFY_TOKEN_EXPIRES_AT: dt.datetime | None = None
 
 dp = Dispatcher()
 
-# -------------------- DB --------------------
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("PRAGMA journal_mode=WAL;")
-        await db.execute("PRAGMA synchronous=NORMAL;")
-        await db.execute("PRAGMA temp_store=MEMORY;")
-        await db.execute("PRAGMA cache_size=-20000;")
-
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            tg_id INTEGER PRIMARY KEY,
-            experience TEXT DEFAULT 'unknown',
-            username TEXT,
-            release_date TEXT DEFAULT NULL,
-            reminders_enabled INTEGER DEFAULT 1,
-            reminder_offsets TEXT DEFAULT '-7,-1,0,7',
-            reminder_time TEXT DEFAULT '12:00',
-            timezone TEXT DEFAULT 'Europe/Moscow',
-            export_unlocked INTEGER DEFAULT 0
-        )
-        """)
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN reminder_offsets TEXT DEFAULT '-7,-1,0,7'")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN reminder_time TEXT DEFAULT '12:00'")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN timezone TEXT DEFAULT 'Europe/Moscow'")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN reminders_enabled INTEGER DEFAULT 1")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN release_date TEXT")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN updates_opt_in INTEGER DEFAULT 1")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN last_update_notified TEXT")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN export_unlocked INTEGER DEFAULT 0")
-        except Exception:
-            pass
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS reminder_log (
-            tg_id INTEGER,
-            key TEXT,
-            "when" TEXT,
-            sent_on TEXT,
-            PRIMARY KEY (tg_id, key, "when")
-        )
-        """)
-        try:
-            await db.execute("ALTER TABLE reminder_log ADD COLUMN sent_on TEXT")
-        except Exception:
-            pass
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_reminder_log_sent_on ON reminder_log(sent_on)")
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS user_tasks (
-            tg_id INTEGER,
-            task_id INTEGER,
-            done INTEGER DEFAULT 0,
-            PRIMARY KEY (tg_id, task_id)
-        )
-        """)
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_user_tasks_tg ON user_tasks(tg_id)"
-        )
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS user_accounts (
-            tg_id INTEGER,
-            key TEXT,
-            status INTEGER DEFAULT 0,
-            PRIMARY KEY (tg_id, key)
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS user_forms (
-            tg_id INTEGER PRIMARY KEY,
-            form_name TEXT,
-            step INTEGER DEFAULT 0,
-            data_json TEXT DEFAULT '{}'
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS smartlinks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_tg_id INTEGER,
-            artist TEXT,
-            title TEXT,
-            release_date TEXT,
-            pre_save_enabled INTEGER DEFAULT 1,
-            reminders_enabled INTEGER DEFAULT 1,
-            project_id INTEGER,
-            cover_file_id TEXT,
-            links_json TEXT,
-            caption_text TEXT,
-            branding_disabled INTEGER DEFAULT 0,
-            branding_paid INTEGER DEFAULT 0,
-            created_at TEXT
-        )
-        """)
-        try:
-            await db.execute("ALTER TABLE smartlinks ADD COLUMN caption_text TEXT")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE smartlinks ADD COLUMN pre_save_enabled INTEGER DEFAULT 1")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE smartlinks ADD COLUMN reminders_enabled INTEGER DEFAULT 1")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE smartlinks ADD COLUMN project_id INTEGER")
-        except Exception:
-            pass
-        try:
-            await db.execute(
-                "ALTER TABLE smartlinks ADD COLUMN branding_disabled INTEGER DEFAULT 0"
-            )
-        except Exception:
-            pass
-        try:
-            await db.execute(
-                "ALTER TABLE smartlinks ADD COLUMN branding_paid INTEGER DEFAULT 0"
-            )
-        except Exception:
-            pass
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS smartlink_subscriptions (
-            smartlink_id INTEGER,
-            subscriber_tg_id INTEGER,
-            notified INTEGER DEFAULT 0,
-            PRIMARY KEY(smartlink_id, subscriber_tg_id)
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS smartlink_reminder_log (
-            smartlink_id INTEGER,
-            subscriber_tg_id INTEGER,
-            offset_days INTEGER,
-            sent_on TEXT,
-            PRIMARY KEY (smartlink_id, subscriber_tg_id, offset_days)
-        )
-        """)
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_smartlink_reminder_sent ON smartlink_reminder_log(sent_on)")
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_tg_id INTEGER,
-            name TEXT NOT NULL,
-            slug TEXT,
-            created_at TEXT
-        )
-        """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS important_tasks (
-            tg_id INTEGER,
-            task_id INTEGER,
-            PRIMARY KEY (tg_id, task_id)
-        )
-        """)
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_important_tasks_tg ON important_tasks(tg_id)"
-        )
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS qc_checks (
-            tg_id INTEGER,
-            task_id INTEGER,
-            key TEXT,
-            value TEXT,
-            PRIMARY KEY (tg_id, task_id, key)
-        )
-        """)
-        await db.commit()
-
-async def ensure_user(tg_id: int, username: str | None = None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users (tg_id) VALUES (?)", (tg_id,))
-        if username is not None:
-            await db.execute("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
-        for task_id, _ in TASKS:
-            await db.execute("INSERT OR IGNORE INTO user_tasks (tg_id, task_id) VALUES (?, ?)", (tg_id, task_id))
-        for key, _ in ACCOUNTS:
-            await db.execute("INSERT OR IGNORE INTO user_accounts (tg_id, key) VALUES (?, ?)", (tg_id, key))
-        await db.commit()
-
-async def get_experience(tg_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT experience FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        return row[0] if row and row[0] else "unknown"
-
-async def set_experience(tg_id: int, exp: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET experience=? WHERE tg_id=?", (exp, tg_id))
-        await db.commit()
-
-async def set_release_date(tg_id: int, date_str: str | None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT release_date FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        current = row[0] if row else None
-        if current == date_str:
-            return
-        await db.execute("UPDATE users SET release_date=? WHERE tg_id=?", (date_str, tg_id))
-        await db.execute("DELETE FROM reminder_log WHERE tg_id=?", (tg_id,))
-        await db.commit()
-
-async def get_release_date(tg_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT release_date FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        return row[0] if row and row[0] else None
-
-async def set_reminders_enabled(tg_id: int, enabled: bool):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT reminders_enabled FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        current = row[0] if row else 1
-        if current == (1 if enabled else 0):
-            return
-        await db.execute("UPDATE users SET reminders_enabled=? WHERE tg_id=?", (1 if enabled else 0, tg_id))
-        await db.commit()
-
-async def get_reminders_enabled(tg_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT reminders_enabled FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        return bool(row[0]) if row and row[0] is not None else True
-
-
-def _parse_offsets(raw: str | None) -> list[int]:
-    values: list[int] = []
-    for part in (raw or DEFAULT_REMINDER_OFFSETS).split(","):
-        try:
-            values.append(int(part.strip()))
-        except ValueError:
-            continue
-    return values or [-7, -1, 0, 7]
-
-
-def _parse_reminder_time(raw: str | None) -> dt.time | None:
-    if not raw:
-        return None
-    try:
-        h, m = raw.split(":")
-        return dt.time(int(h), int(m))
-    except Exception:
-        return None
-
-
-async def get_user_reminder_prefs(db: aiosqlite.Connection, tg_id: int) -> tuple[str, list[int], dt.time | None]:
-    cur = await db.execute(
-        "SELECT timezone, reminder_offsets, reminder_time FROM users WHERE tg_id=?",
-        (tg_id,),
-    )
-    row = await cur.fetchone()
-    timezone = row[0] if row and row[0] else DEFAULT_TIMEZONE
-    offsets_raw = row[1] if row else DEFAULT_REMINDER_OFFSETS
-    reminder_time_raw = row[2] if row else DEFAULT_REMINDER_TIME
-    return timezone, _parse_offsets(offsets_raw), _parse_reminder_time(reminder_time_raw) or _parse_reminder_time(DEFAULT_REMINDER_TIME)
-
-async def get_updates_opt_in(tg_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT updates_opt_in FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        return bool(row[0]) if row and row[0] is not None else True
-
-async def set_updates_opt_in(tg_id: int, enabled: bool):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET updates_opt_in=? WHERE tg_id=?", (1 if enabled else 0, tg_id))
-        await db.commit()
-
-async def set_export_unlocked(tg_id: int, unlocked: bool = True):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET export_unlocked=? WHERE tg_id=?",
-            (1 if unlocked else 0, tg_id),
-        )
-        await db.commit()
-
-
-async def get_export_unlocked(tg_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT export_unlocked FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        return bool(row[0]) if row and row[0] is not None else False
-
-async def toggle_updates_opt_in(tg_id: int) -> bool:
-    enabled = await get_updates_opt_in(tg_id)
-    await set_updates_opt_in(tg_id, not enabled)
-    return not enabled
-
-async def get_last_update_notified(tg_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT last_update_notified FROM users WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        return row[0] if row and row[0] else None
-
-async def set_last_update_notified(
-    tg_id: int,
-    value: str | None,
-    db: aiosqlite.Connection | None = None,
-    *,
-    commit: bool = True,
-):
-    """Update the last notified update URL for a user.
-
-    Args:
-        tg_id: Telegram user identifier.
-        value: URL string or ``None`` to reset the marker.
-        db: Optional existing DB connection to reuse.
-        commit: Whether to commit the transaction when ``db`` is provided.
-    """
-    if db:
-        await db.execute("UPDATE users SET last_update_notified=? WHERE tg_id=?", (value, tg_id))
-        if commit:
-            await db.commit()
-        return
-    async with aiosqlite.connect(DB_PATH) as db_conn:
-        await db_conn.execute("UPDATE users SET last_update_notified=? WHERE tg_id=?", (value, tg_id))
-        await db_conn.commit()
-
 async def maybe_send_update_notice(message: Message, tg_id: int):
     if not UPDATES_POST_URL:
         return
@@ -702,289 +416,6 @@ async def maybe_send_update_notice(message: Message, tg_id: int):
         return
     await message.answer(f"⚡️ Есть обновление ИСКРЫ. Подробнее: {UPDATES_POST_URL}")
     await set_last_update_notified(tg_id, UPDATES_POST_URL)
-
-async def get_tasks_state(tg_id: int) -> dict[int, int]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT task_id, done FROM user_tasks WHERE tg_id=?", (tg_id,))
-        rows = await cur.fetchall()
-        return {tid: done for tid, done in rows}
-
-async def toggle_task(tg_id: int, task_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE user_tasks SET done = 1 - done WHERE tg_id=? AND task_id=?", (tg_id, task_id))
-        await db.commit()
-
-async def set_task_done(tg_id: int, task_id: int, done: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT done FROM user_tasks WHERE tg_id=? AND task_id=?", (tg_id, task_id))
-        row = await cur.fetchone()
-        current = row[0] if row else 0
-        if current == done:
-            return False
-        await db.execute("UPDATE user_tasks SET done=? WHERE tg_id=? AND task_id=?", (done, tg_id, task_id))
-        await db.commit()
-        return True
-
-async def get_accounts_state(tg_id: int) -> dict[str, int]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT key, status FROM user_accounts WHERE tg_id=?", (tg_id,))
-        rows = await cur.fetchall()
-        return {k: (s if s is not None else 0) for k, s in rows}
-
-async def cycle_account_status(tg_id: int, key: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT status FROM user_accounts WHERE tg_id=? AND key=?", (tg_id, key))
-        row = await cur.fetchone()
-        current = row[0] if row and row[0] is not None else 0
-        new = next_acc_status(current)
-        await db.execute("UPDATE user_accounts SET status=? WHERE tg_id=? AND key=?", (new, tg_id, key))
-        await db.commit()
-
-async def add_important_task(tg_id: int, task_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO important_tasks (tg_id, task_id) VALUES (?, ?)",
-            (tg_id, task_id)
-        )
-        await db.commit()
-
-async def remove_important_task(tg_id: int, task_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "DELETE FROM important_tasks WHERE tg_id=? AND task_id=?",
-            (tg_id, task_id)
-        )
-        await db.commit()
-
-async def get_important_tasks(tg_id: int) -> set[int]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT task_id FROM important_tasks WHERE tg_id=?",
-            (tg_id,)
-        )
-        rows = await cur.fetchall()
-        return {r[0] for r in rows}
-
-async def save_qc_check(tg_id: int, task_id: int, key: str, value: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO qc_checks (tg_id, task_id, key, value) VALUES (?, ?, ?, ?)",
-            (tg_id, task_id, key, value)
-        )
-        await db.commit()
-
-async def was_qc_checked(tg_id: int, task_id: int, key: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM qc_checks WHERE tg_id=? AND task_id=? AND key=?",
-            (tg_id, task_id, key)
-        )
-        row = await cur.fetchone()
-        return row is not None
-
-async def reset_progress_only(tg_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE user_tasks SET done=0 WHERE tg_id=?", (tg_id,))
-        await db.execute("UPDATE user_accounts SET status=0 WHERE tg_id=?", (tg_id,))
-        await db.commit()
-
-async def reset_all_data(tg_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE user_tasks SET done=0 WHERE tg_id=?", (tg_id,))
-        await db.execute("UPDATE user_accounts SET status=0 WHERE tg_id=?", (tg_id,))
-        await db.execute("DELETE FROM important_tasks WHERE tg_id=?", (tg_id,))
-        await db.execute("DELETE FROM qc_checks WHERE tg_id=?", (tg_id,))
-        await db.execute("DELETE FROM reminder_log WHERE tg_id=?", (tg_id,))
-        await db.execute("DELETE FROM smartlink_subscriptions WHERE subscriber_tg_id=?", (tg_id,))
-        await db.execute("DELETE FROM smartlinks WHERE owner_tg_id=?", (tg_id,))
-        await db.execute(
-            "UPDATE users SET release_date=NULL, reminders_enabled=1 WHERE tg_id=?",
-            (tg_id,)
-        )
-        await db.execute("DELETE FROM user_forms WHERE tg_id=?", (tg_id,))
-        await db.commit()
-
-def _smartlink_row_to_dict(row) -> dict:
-    if not row:
-        return {}
-    return {
-        "id": row[0],
-        "owner_tg_id": row[1],
-        "artist": row[2] or "",
-        "title": row[3] or "",
-        "release_date": row[4],
-        "pre_save_enabled": bool(row[5]) if len(row) > 5 else True,
-        "reminders_enabled": bool(row[6]) if len(row) > 6 else True,
-        "project_id": row[7] if len(row) > 7 else None,
-        "cover_file_id": row[8] if len(row) > 8 else "",
-        "links": json.loads(row[9] or "{}"),
-        "caption_text": row[10] or "",
-        "branding_disabled": bool(row[11]) if len(row) > 11 else False,
-        "created_at": row[12] if len(row) > 12 else None,
-        "branding_paid": bool(row[13]) if len(row) > 13 else False,
-    }
-
-
-async def save_smartlink(
-    owner_tg_id: int,
-    artist: str,
-    title: str,
-    release_date_iso: str,
-    cover_file_id: str,
-    links: dict,
-    caption_text: str,
-    branding_disabled: bool = False,
-    pre_save_enabled: bool = True,
-    reminders_enabled: bool = True,
-    project_id: int | None = None,
-) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            """
-            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                owner_tg_id,
-                artist,
-                title,
-                release_date_iso,
-                1 if pre_save_enabled else 0,
-                1 if reminders_enabled else 0,
-                project_id,
-                cover_file_id,
-                json.dumps(links, ensure_ascii=False),
-                caption_text,
-                1 if branding_disabled else 0,
-                dt.datetime.utcnow().isoformat(),
-            ),
-        )
-        await db.commit()
-        return cur.lastrowid
-
-
-async def update_smartlink_caption(smartlink_id: int, caption_text: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE smartlinks SET caption_text=? WHERE id=?",
-            (caption_text, smartlink_id),
-        )
-        await db.commit()
-
-
-async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
-            (owner_tg_id,),
-        )
-        row = await cur.fetchone()
-        return _smartlink_row_to_dict(row) if row else None
-
-
-async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE id=?",
-            (smartlink_id,),
-        )
-        row = await cur.fetchone()
-        return _smartlink_row_to_dict(row) if row else None
-
-
-async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
-            (owner_tg_id, limit, offset),
-        )
-        return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
-
-
-async def count_smartlinks(owner_tg_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM smartlinks WHERE owner_tg_id=?", (owner_tg_id,))
-        row = await cur.fetchone()
-        return int(row[0]) if row else 0
-
-
-async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: dict) -> bool:
-    allowed = {
-        "artist",
-        "title",
-        "release_date",
-        "cover_file_id",
-        "links",
-        "caption_text",
-        "branding_disabled",
-        "branding_paid",
-        "pre_save_enabled",
-        "reminders_enabled",
-        "project_id",
-    }
-    fields: list[str] = []
-    params: list = []
-
-    for key, value in updates.items():
-        if key not in allowed:
-            continue
-        if key == "links":
-            fields.append("links_json=?")
-            params.append(json.dumps(value or {}, ensure_ascii=False))
-        elif key == "branding_disabled":
-            fields.append("branding_disabled=?")
-            params.append(1 if value else 0)
-        elif key == "branding_paid":
-            fields.append("branding_paid=?")
-            params.append(1 if value else 0)
-        else:
-            fields.append(f"{key}=?")
-            params.append(value)
-
-    if not fields:
-        return False
-
-    params.extend([smartlink_id, owner_tg_id])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            f"UPDATE smartlinks SET {', '.join(fields)} WHERE id=? AND owner_tg_id=?",
-            params,
-        )
-        await db.commit()
-    return True
-
-
-async def delete_smartlink(smartlink_id: int, owner_tg_id: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM smartlinks WHERE id=? AND owner_tg_id=?", (smartlink_id, owner_tg_id))
-        await db.execute("DELETE FROM smartlink_subscriptions WHERE smartlink_id=?", (smartlink_id,))
-        await db.commit()
-
-
-async def set_smartlink_subscription(smartlink_id: int, subscriber_tg_id: int, subscribed: bool):
-    async with aiosqlite.connect(DB_PATH) as db:
-        if subscribed:
-            await db.execute(
-                "INSERT OR REPLACE INTO smartlink_subscriptions (smartlink_id, subscriber_tg_id, notified) VALUES (?, ?, 0)",
-                (smartlink_id, subscriber_tg_id),
-            )
-        else:
-            await db.execute(
-                "DELETE FROM smartlink_subscriptions WHERE smartlink_id=? AND subscriber_tg_id=?",
-                (smartlink_id, subscriber_tg_id),
-            )
-        await db.commit()
-
-
-async def is_smartlink_subscribed(smartlink_id: int, subscriber_tg_id: int) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM smartlink_subscriptions WHERE smartlink_id=? AND subscriber_tg_id=?",
-            (smartlink_id, subscriber_tg_id),
-        )
-        row = await cur.fetchone()
-        return row is not None
 
 
 async def start_smartlink_form(
@@ -1019,43 +450,6 @@ async def start_smartlink_import(message: Message, tg_id: int):
         SMARTLINK_IMPORT_PROMPT,
         reply_markup=await user_menu_keyboard(tg_id),
     )
-
-
-# -------------------- Forms --------------------
-
-async def form_start(tg_id: int, form_name: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO user_forms (tg_id, form_name, step, data_json) VALUES (?, ?, 0, ?)",
-            (tg_id, form_name, "{}")
-        )
-        await db.commit()
-
-async def form_get(tg_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT form_name, step, data_json FROM user_forms WHERE tg_id=?", (tg_id,))
-        row = await cur.fetchone()
-        if not row:
-            return None
-        form_name, step, data_json = row
-        try:
-            data = json.loads(data_json or "{}")
-        except Exception:
-            data = {}
-        return {"form_name": form_name, "step": step, "data": data}
-
-async def form_set(tg_id: int, step: int, data: dict):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE user_forms SET step=?, data_json=? WHERE tg_id=?",
-            (step, json.dumps(data, ensure_ascii=False), tg_id)
-        )
-        await db.commit()
-
-async def form_clear(tg_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM user_forms WHERE tg_id=?", (tg_id,))
-        await db.commit()
 
 
 async def health_handler(request: web.Request) -> web.Response:
@@ -2203,45 +1597,6 @@ def timeline_text(release_date: dt.date | None, reminders_enabled: bool = True) 
 
 # -------------------- Reminders --------------------
 
-async def was_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when: str) -> bool:
-    cur = await db.execute(
-        "SELECT 1 FROM reminder_log WHERE tg_id=? AND key=? AND \"when\"=?",
-        (tg_id, key, when)
-    )
-    row = await cur.fetchone()
-    return row is not None
-
-
-async def mark_reminder_sent(db: aiosqlite.Connection, tg_id: int, key: str, when: str, sent_on: dt.date):
-    await db.execute(
-        "INSERT OR IGNORE INTO reminder_log (tg_id, key, \"when\", sent_on) VALUES (?, ?, ?, ?)",
-        (tg_id, key, when, sent_on.isoformat())
-    )
-
-
-async def was_smartlink_day_sent(db: aiosqlite.Connection, smartlink_id: int, subscriber_tg_id: int, offset_days: int) -> bool:
-    cur = await db.execute(
-        "SELECT 1 FROM smartlink_reminder_log WHERE smartlink_id=? AND subscriber_tg_id=? AND offset_days=?",
-        (smartlink_id, subscriber_tg_id, offset_days),
-    )
-    return await cur.fetchone() is not None
-
-
-async def mark_smartlink_day_sent(db: aiosqlite.Connection, smartlink_id: int, subscriber_tg_id: int, offset_days: int, sent_on: dt.date):
-    await db.execute(
-        "INSERT OR REPLACE INTO smartlink_reminder_log (smartlink_id, subscriber_tg_id, offset_days, sent_on) VALUES (?, ?, ?, ?)",
-        (smartlink_id, subscriber_tg_id, offset_days, sent_on.isoformat()),
-    )
-
-
-async def cleanup_reminder_log(db: aiosqlite.Connection, today: dt.date):
-    threshold = today - dt.timedelta(days=REMINDER_CLEAN_DAYS)
-    await db.execute(
-        "DELETE FROM reminder_log WHERE sent_on IS NOT NULL AND sent_on < ?",
-        (threshold.isoformat(),)
-    )
-
-
 def build_deadline_messages(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
     messages: list[tuple[str, str, dt.date]] = []
     for key, title, d in build_deadlines(release_date):
@@ -2264,103 +1619,76 @@ def smartlink_reminder_text(offset: int, artist: str, title: str) -> str:
 
 async def process_reminders(bot: Bot):
     today = dt.date.today()
-    async with aiosqlite.connect(DB_PATH) as db:
-        global REMINDER_LAST_CLEAN
-        if REMINDER_LAST_CLEAN != today:
-            await cleanup_reminder_log(db, today)
-            REMINDER_LAST_CLEAN = today
-        cur = await db.execute(
-            "SELECT tg_id, username, release_date FROM users WHERE reminders_enabled=1 AND release_date IS NOT NULL"
-        )
-        users = await cur.fetchall()
+    global REMINDER_LAST_CLEAN
+    if REMINDER_LAST_CLEAN != today:
+        await cleanup_reminder_log(today)
+        REMINDER_LAST_CLEAN = today
 
-        for tg_id, _username, rd_s in users:
-            rd = parse_date(rd_s)
-            if not rd:
-                continue
-            deadlines = build_deadline_messages(rd)
-            for key, title, ddate in deadlines:
-                for when_label, send_date, prefix in (
-                    ("pre2", ddate - dt.timedelta(days=2), "⏳ Через 2 дня дедлайн: " + title),
-                    ("day0", ddate, "🚨 Сегодня дедлайн: " + title),
-                ):
-                    if today != send_date:
-                        continue
-                    if await was_reminder_sent(db, tg_id, key, when_label):
-                        continue
-                    try:
-                        await bot.send_message(tg_id, prefix)
-                        await mark_reminder_sent(db, tg_id, key, when_label, today)
-                    except TelegramForbiddenError:
-                        continue
-                    except Exception:
-                        continue
-        await db.commit()
+    users = await get_reminder_users()
+
+    for tg_id, _username, rd_s in users:
+        rd = parse_date(rd_s)
+        if not rd:
+            continue
+        deadlines = build_deadline_messages(rd)
+        for key, title, ddate in deadlines:
+            for when_label, send_date, prefix in (
+                ("pre2", ddate - dt.timedelta(days=2), "⏳ Через 2 дня дедлайн: " + title),
+                ("day0", ddate, "🚨 Сегодня дедлайн: " + title),
+            ):
+                if today != send_date:
+                    continue
+                if await was_reminder_sent(tg_id, key, when_label):
+                    continue
+                try:
+                    await bot.send_message(tg_id, prefix)
+                    await mark_reminder_sent(tg_id, key, when_label, today)
+                except TelegramForbiddenError:
+                    continue
+                except Exception:
+                    continue
 
 
 async def process_smartlink_notifications(bot: Bot):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE release_date IS NOT NULL",
-        )
-        smartlinks = [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
+    smartlinks = await get_smartlinks_with_release()
 
-        for smartlink in smartlinks:
-            if not smartlink.get("reminders_enabled"):
+    for smartlink in smartlinks:
+        if not smartlink.get("reminders_enabled"):
+            continue
+        rd = parse_date(smartlink.get("release_date") or "")
+        if not rd:
+            continue
+        subscribers = await get_smartlink_subscribers(smartlink.get("id"))
+        for subscriber_tg_id in subscribers:
+            tz, offsets, reminder_time = await get_user_reminder_prefs(subscriber_tg_id)
+            now_local = dt.datetime.now(ZoneInfo(tz))
+            if reminder_time and (now_local.hour != reminder_time.hour or now_local.minute != reminder_time.minute):
                 continue
-            rd = parse_date(smartlink.get("release_date") or "")
-            if not rd:
-                continue
-            sub_cur = await db.execute(
-                "SELECT subscriber_tg_id FROM smartlink_subscriptions WHERE smartlink_id=?",
-                (smartlink.get("id"),),
-            )
-            subscribers = [row[0] for row in await sub_cur.fetchall()]
-            for subscriber_tg_id in subscribers:
-                tz, offsets, reminder_time = await get_user_reminder_prefs(db, subscriber_tg_id)
-                now_local = dt.datetime.now(ZoneInfo(tz))
-                if reminder_time and (now_local.hour != reminder_time.hour or now_local.minute != reminder_time.minute):
+            for offset in offsets:
+                target_date = rd + dt.timedelta(days=offset)
+                if target_date != now_local.date():
                     continue
-                for offset in offsets:
-                    target_date = rd + dt.timedelta(days=offset)
-                    if target_date != now_local.date():
-                        continue
-                    if await was_smartlink_day_sent(db, smartlink.get("id"), subscriber_tg_id, offset):
-                        continue
-                    try:
-                        text = smartlink_reminder_text(offset, smartlink.get("artist") or "", smartlink.get("title") or "")
-                        if text:
-                            await bot.send_message(subscriber_tg_id, text)
-                        await send_smartlink_photo(
-                            bot,
-                            subscriber_tg_id,
-                            smartlink,
-                            release_today=offset == 0,
-                            subscribed=True,
-                            allow_remind=False,
-                        )
-                        await mark_smartlink_day_sent(db, smartlink.get("id"), subscriber_tg_id, offset, now_local.date())
-                        if offset == 0:
-                            await db.execute(
-                                "UPDATE smartlink_subscriptions SET notified=1 WHERE smartlink_id=? AND subscriber_tg_id=?",
-                                (smartlink.get("id"), subscriber_tg_id),
-                            )
-                    except TelegramForbiddenError:
-                        continue
-                    except Exception:
-                        continue
-        await db.commit()
-
-
-async def reminder_scheduler(bot: Bot):
-    while True:
-        try:
-            await process_reminders(bot)
-            await process_smartlink_notifications(bot)
-        except Exception as e:
-            print(f"[reminder_scheduler] error: {e}")
-        await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
-
+                if await was_smartlink_day_sent(smartlink.get("id"), subscriber_tg_id, offset):
+                    continue
+                try:
+                    text = smartlink_reminder_text(offset, smartlink.get("artist") or "", smartlink.get("title") or "")
+                    if text:
+                        await bot.send_message(subscriber_tg_id, text)
+                    await send_smartlink_photo(
+                        bot,
+                        subscriber_tg_id,
+                        smartlink,
+                        release_today=offset == 0,
+                        subscribed=True,
+                        allow_remind=False,
+                    )
+                    await mark_smartlink_day_sent(smartlink.get("id"), subscriber_tg_id, offset, now_local.date())
+                    if offset == 0:
+                        await mark_smartlink_notified(smartlink.get("id"), subscriber_tg_id)
+                except TelegramForbiddenError:
+                    continue
+                except Exception:
+                    continue
 # -------------------- Email send (optional) --------------------
 
 def _send_email_sync(subject: str, body: str) -> bool:
@@ -2593,26 +1921,21 @@ async def broadcast_update(message: Message, bot: Bot):
     if not url:
         await message.answer("Укажи ссылку: /broadcast_update <url> или задай UPDATES_POST_URL.")
         return
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT tg_id, last_update_notified FROM users WHERE updates_opt_in=1"
-        )
-        users = await cur.fetchall()
-        sent = skipped = errors = 0
-        for tg_id, last_notified in users:
-            if last_notified == url:
-                skipped += 1
-                continue
-            try:
-                await bot.send_message(tg_id, f"⚡️ Есть обновление ИСКРЫ. Подробнее: {url}")
-                await set_last_update_notified(tg_id, url, db, commit=False)
-                sent += 1
-            except TelegramForbiddenError:
-                skipped += 1
-            except Exception:
-                errors += 1
-            await asyncio.sleep(0.1)
-        await db.commit()
+    users = await get_updates_opt_in_users()
+    sent = skipped = errors = 0
+    for tg_id, last_notified in users:
+        if last_notified == url:
+            skipped += 1
+            continue
+        try:
+            await bot.send_message(tg_id, f"⚡️ Есть обновление ИСКРЫ. Подробнее: {url}")
+            await set_last_update_notified(tg_id, url)
+            sent += 1
+        except TelegramForbiddenError:
+            skipped += 1
+        except Exception:
+            errors += 1
+        await asyncio.sleep(0.1)
     await message.answer(
         f"Рассылка завершена. Отправлено: {sent}. Пропущено/ошибок: {skipped + errors}.",
         reply_markup=await user_menu_keyboard(message.from_user.id)
