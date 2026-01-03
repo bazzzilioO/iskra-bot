@@ -19,6 +19,7 @@ import os
 import re
 import datetime as dt
 import time
+import traceback
 from typing import IO
 from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
 
@@ -425,7 +426,7 @@ async def start_smartlink_form(
         await finalize_smartlink_form(message, tg_id, data)
         return
 
-    await message.answer(smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_step_kb())
+    await _send_smartlink_prompt(message, tg_id, step, data)
 
 
 async def start_smartlink_import(message: Message, tg_id: int):
@@ -669,8 +670,6 @@ def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str 
     if "band.link" in host:
         return "bandlink"
     if host.startswith("music.yandex.") and ("/track/" in path or "/album/" in path):
-        if query.get("utm_source", "").lower() == "bandlink":
-            return "bandlink"
         return "yandex"
     if host == "open.spotify.com":
         return "spotify"
@@ -1169,10 +1168,29 @@ def _is_valid_url(url: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+async def _send_smartlink_prompt(message: Message, tg_id: int, step: int, data: dict):
+    prev_prompt_id = data.get("_prompt_message_id")
+    if prev_prompt_id:
+        with contextlib.suppress(Exception):
+            await message.bot.delete_message(message.chat.id, prev_prompt_id)
+
+    prompt = await message.answer(
+        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_step_kb()
+    )
+    data["_prompt_message_id"] = prompt.message_id
+    await form_set(tg_id, step, data)
+    return prompt
+
+
 
 async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     logger.info("[smartlink] finalize start tg_id=%s", tg_id)
     try:
+        last_prompt_id = data.get("_prompt_message_id")
+        if last_prompt_id:
+            with contextlib.suppress(Exception):
+                await message.bot.delete_message(message.chat.id, last_prompt_id)
+
         artist = data.get("artist") or ""
         title = data.get("title") or ""
         release_iso = data.get("release_date") or ""
@@ -1242,9 +1260,11 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             len(links_clean),
         )
     except TelegramBadRequest:
+        traceback.print_exc()
         logger.exception("[smartlink] finalize failed (bad request) tg_id=%s", tg_id)
         await message.answer("Не удалось отправить карточку. Попробуй изменить данные и повторить.")
     except Exception:
+        traceback.print_exc()
         logger.exception("[smartlink] finalize failed tg_id=%s", tg_id)
         await message.answer("Не удалось создать смартлинк. Проверь данные или попробуй ещё раз.")
     finally:
@@ -2963,11 +2983,7 @@ async def smartlink_skip_cb(callback):
         next_step = skip_prefilled_smartlink_steps(step + 1, data)
         total_steps = 5 + len(SMARTLINK_PLATFORMS)
         if next_step < total_steps:
-            await form_set(tg_id, next_step, data)
-            await callback.message.answer(
-                smartlink_step_prompt(next_step) + "\n\n(Отмена: /cancel)",
-                reply_markup=smartlink_step_kb(),
-            )
+            await _send_smartlink_prompt(callback.message, tg_id, next_step, data)
         else:
             await form_set(tg_id, next_step, data)
             await finalize_smartlink_form(callback.message, tg_id, data)
@@ -3636,11 +3652,7 @@ async def any_message_router(message: Message):
         step += 1
         step = skip_prefilled_smartlink_steps(step, data)
         if step < total_steps:
-            await form_set(tg_id, step, data)
-            await message.answer(
-                smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
-                reply_markup=smartlink_step_kb(),
-            )
+            await _send_smartlink_prompt(message, tg_id, step, data)
             return
 
         await form_set(tg_id, step, data)
