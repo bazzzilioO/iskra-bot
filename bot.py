@@ -19,7 +19,6 @@ import re
 import datetime as dt
 import time
 from typing import IO
-from zoneinfo import ZoneInfo
 from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
 
 import aiohttp
@@ -42,7 +41,6 @@ from aiogram.types import (
 from aiogram.utils.backoff import Backoff, BackoffConfig
 from dotenv import load_dotenv
 from db import (
-    cleanup_reminder_log,
     count_smartlinks,
     cycle_account_status as db_cycle_account_status,
     delete_smartlink,
@@ -58,21 +56,14 @@ from db import (
     get_last_update_notified,
     get_latest_smartlink,
     get_release_date,
-    get_reminder_users,
     get_reminders_enabled,
     get_smartlink_by_id,
-    get_smartlink_subscribers,
-    get_smartlinks_with_release,
     list_smartlinks,
     get_tasks_state,
     get_updates_opt_in,
     get_updates_opt_in_users,
-    get_user_reminder_prefs,
     init_db,
     is_smartlink_subscribed,
-    mark_reminder_sent,
-    mark_smartlink_day_sent,
-    mark_smartlink_notified,
     reset_all_data,
     reset_progress_only,
     save_qc_check,
@@ -90,8 +81,6 @@ from db import (
     update_smartlink_caption,
     update_smartlink_data,
     was_qc_checked,
-    was_reminder_sent,
-    was_smartlink_day_sent,
 )
 from helpers import escape_html, format_date_ru, parse_date, safe_edit, safe_edit_caption
 from keyboards import (
@@ -145,6 +134,7 @@ from texts import (
     SMARTLINK_IMPORT_PROMPT,
     UGC_TIP_TEXT,
 )
+from scheduler import build_deadlines, reminder_scheduler
 
 def build_focus_caption(
     tasks_state: dict[int, int],
@@ -217,8 +207,6 @@ def build_smartlink_keyboard(
     )
 
 LABEL_EMAIL = "sreda.records@gmail.com"
-REMINDER_INTERVAL_SECONDS = 300
-REMINDER_LAST_CLEAN: dt.date | None = None
 
 HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
 
@@ -301,17 +289,6 @@ async def send_export_invoice(message: Message):
     )
 
 # -------------------- TASKS --------------------
-
-DEADLINES = [
-    {"key": "pitching", "title": "Pitching (Spotify / Яндекс / VK / Звук / МТС-КИОН)", "offset": -14},
-    {"key": "presave", "title": "Pre-save", "offset": -7},
-    {"key": "bandlink", "title": "BandLink / Smartlink", "offset": -7},
-    {"key": "content_sprint", "title": "Контент-спринт ДО — старт", "offset": -14},
-    {"key": "post_1", "title": "Пост-релиз план (+1)", "offset": 1},
-    {"key": "post_3", "title": "Пост-релиз план (+3)", "offset": 3},
-    {"key": "post_7", "title": "Пост-релиз план (+7)", "offset": 7},
-]
-
 
 async def maybe_send_qc_prompt(callback, tg_id: int, task_id: int):
     qc = QC_PROMPTS.get(task_id)
@@ -1530,13 +1507,6 @@ async def send_smartlink_photo(
         parse_mode="HTML",
     )
 
-def build_deadlines(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
-    items: list[tuple[str, str, dt.date]] = []
-    for d in DEADLINES:
-        items.append((d["key"], d["title"], release_date + dt.timedelta(days=d["offset"])))
-    return sorted(items, key=lambda x: x[2])
-
-
 def timeline_text(release_date: dt.date | None, reminders_enabled: bool = True) -> str:
     if not release_date:
         return (
@@ -1594,112 +1564,6 @@ def timeline_text(release_date: dt.date | None, reminders_enabled: bool = True) 
 
     return "\n".join([l for l in lines if l is not None])
 
-# -------------------- Reminders --------------------
-
-def build_deadline_messages(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
-    messages: list[tuple[str, str, dt.date]] = []
-    for key, title, d in build_deadlines(release_date):
-        messages.append((key, title, d))
-    return messages
-
-
-def smartlink_reminder_text(offset: int, artist: str, title: str) -> str:
-    label = f"{artist} — {title}".strip(" —")
-    if offset == -7:
-        return f"Через 7 дней релиз: {label}. Проверь смарт-линк и материалы."
-    if offset == -1:
-        return f"Завтра релиз: {label}. Подготовь посты и рассылку."
-    if offset == 0:
-        return f"Сегодня релиз: {label}. Пора постить смарт-линк."
-    if offset == 7:
-        return f"Прошла неделя после релиза: {label}. Самое время допушить в плейлисты/медиа."
-    return ""
-
-
-async def process_reminders(bot: Bot):
-    today = dt.date.today()
-    global REMINDER_LAST_CLEAN
-    if REMINDER_LAST_CLEAN != today:
-        await cleanup_reminder_log(today)
-        REMINDER_LAST_CLEAN = today
-
-    users = await get_reminder_users()
-
-    for tg_id, _username, rd_s in users:
-        rd = parse_date(rd_s)
-        if not rd:
-            continue
-        deadlines = build_deadline_messages(rd)
-        for key, title, ddate in deadlines:
-            for when_label, send_date, prefix in (
-                ("pre2", ddate - dt.timedelta(days=2), "⏳ Через 2 дня дедлайн: " + title),
-                ("day0", ddate, "🚨 Сегодня дедлайн: " + title),
-            ):
-                if today != send_date:
-                    continue
-                if await was_reminder_sent(tg_id, key, when_label):
-                    continue
-                try:
-                    await bot.send_message(tg_id, prefix)
-                    await mark_reminder_sent(tg_id, key, when_label, today)
-                except TelegramForbiddenError:
-                    continue
-                except Exception:
-                    continue
-
-
-async def process_smartlink_notifications(bot: Bot):
-    smartlinks = await get_smartlinks_with_release()
-
-    for smartlink in smartlinks:
-        if not smartlink.get("reminders_enabled"):
-            continue
-        rd = parse_date(smartlink.get("release_date") or "")
-        if not rd:
-            continue
-        subscribers = await get_smartlink_subscribers(smartlink.get("id"))
-        for subscriber_tg_id in subscribers:
-            tz, offsets, reminder_time = await get_user_reminder_prefs(subscriber_tg_id)
-            now_local = dt.datetime.now(ZoneInfo(tz))
-            if reminder_time and (now_local.hour != reminder_time.hour or now_local.minute != reminder_time.minute):
-                continue
-            for offset in offsets:
-                target_date = rd + dt.timedelta(days=offset)
-                if target_date != now_local.date():
-                    continue
-                if await was_smartlink_day_sent(smartlink.get("id"), subscriber_tg_id, offset):
-                    continue
-                try:
-                    text = smartlink_reminder_text(offset, smartlink.get("artist") or "", smartlink.get("title") or "")
-                    if text:
-                        await bot.send_message(subscriber_tg_id, text)
-                    await send_smartlink_photo(
-                        bot,
-                        subscriber_tg_id,
-                        smartlink,
-                        release_today=offset == 0,
-                        subscribed=True,
-                        allow_remind=False,
-                    )
-                    await mark_smartlink_day_sent(smartlink.get("id"), subscriber_tg_id, offset, now_local.date())
-                    if offset == 0:
-                        await mark_smartlink_notified(smartlink.get("id"), subscriber_tg_id)
-                except TelegramForbiddenError:
-                    continue
-                except Exception:
-                    continue
-
-
-async def reminder_scheduler(bot: Bot):
-    while True:
-        try:
-            await asyncio.gather(
-                process_reminders(bot),
-                process_smartlink_notifications(bot),
-            )
-        except Exception as err:
-            print(f"[reminder_scheduler] failed: {err}")
-        await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
 # -------------------- Email send (optional) --------------------
 
 def _send_email_sync(subject: str, body: str) -> bool:
@@ -3950,7 +3814,7 @@ async def main():
     print("Dropping webhook and pending updates before polling...")
     await bot.delete_webhook(drop_pending_updates=True)
     try:
-        asyncio.create_task(reminder_scheduler(bot))
+        asyncio.create_task(reminder_scheduler(bot, send_smartlink_photo))
     except Exception as err:
         print(f"[main] reminder scheduler not started: {err}")
     try:
