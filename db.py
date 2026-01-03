@@ -388,7 +388,9 @@ async def set_last_update_notified(
 
 async def get_tasks_state(tg_id: int) -> dict[int, int]:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT task_id, done FROM user_tasks WHERE tg_id=?", (tg_id,))
+        cur = await db.execute(
+            "SELECT task_id, done FROM user_tasks WHERE tg_id=? AND task_id > 0", (tg_id,)
+        )
         rows = await cur.fetchall()
         return {tid: done for tid, done in rows}
 
@@ -418,6 +420,30 @@ async def set_task_done(tg_id: int, task_id: int, done: int) -> bool:
         await db.execute("UPDATE user_tasks SET done=? WHERE tg_id=? AND task_id=?", (done, tg_id, task_id))
         await db.commit()
         return True
+
+
+FOCUS_SHOW_COMPLETED_TASK_ID = -1000
+
+
+async def get_focus_show_completed(tg_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT done FROM user_tasks WHERE tg_id=? AND task_id=?",
+            (tg_id, FOCUS_SHOW_COMPLETED_TASK_ID),
+        )
+        row = await cur.fetchone()
+    return bool(row[0]) if row else False
+
+
+async def set_focus_show_completed(tg_id: int, show: bool):
+    value = 1 if show else 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO user_tasks (tg_id, task_id, done) VALUES (?, ?, ?) "
+            "ON CONFLICT(tg_id, task_id) DO UPDATE SET done=excluded.done",
+            (tg_id, FOCUS_SHOW_COMPLETED_TASK_ID, value),
+        )
+        await db.commit()
 
 
 async def get_accounts_state(tg_id: int) -> dict[str, int]:

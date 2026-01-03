@@ -57,6 +57,7 @@ from db import (
     get_export_unlocked,
     get_experience,
     get_important_tasks,
+    get_focus_show_completed,
     get_last_update_notified,
     get_latest_smartlink,
     get_release_date,
@@ -79,6 +80,7 @@ from db import (
     set_smartlink_subscription,
     set_updates_opt_in,
     toggle_updates_opt_in,
+    set_focus_show_completed,
     toggle_important_task,
     toggle_reminders_enabled,
     toggle_task_and_get_state,
@@ -145,8 +147,9 @@ def build_focus_caption(
     experience: str | None = None,
     important: set[int] | None = None,
     focus_task_id: int | None = None,
+    show_completed: bool = False,
 ) -> str:
-    text, _ = build_focus(tasks_state, experience, important, focus_task_id)
+    text, _ = build_focus(tasks_state, experience, important, focus_task_id, show_completed)
     return text
 
 
@@ -478,10 +481,17 @@ def release_single_instance_lock(lock_file: IO[str]) -> None:
 
 # -------------------- UX helpers --------------------
 
-async def build_focus_for_user(tg_id: int, exp: str, focus_task_id: int | None = None) -> tuple[str, InlineKeyboardMarkup]:
+async def build_focus_for_user(
+    tg_id: int,
+    exp: str,
+    focus_task_id: int | None = None,
+    *,
+    show_completed: bool | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
     tasks_state = await get_tasks_state(tg_id)
     important = await get_important_tasks(tg_id)
-    return build_focus(tasks_state, exp, important, focus_task_id)
+    show_completed = show_completed if show_completed is not None else await get_focus_show_completed(tg_id)
+    return build_focus(tasks_state, exp, important, focus_task_id, show_completed)
 
 SMARTLINKS_PAGE_SIZE = 5
 SUPPORT_DONATE_PRICE = 50
@@ -1786,10 +1796,8 @@ async def plan_cmd(message: Message):
         text, kb = experience_prompt()
         await message.answer(text, reply_markup=await user_menu_keyboard(tg_id))
         return
-    tasks_state = await get_tasks_state(tg_id)
     await message.answer("Меню снизу, держу фокус здесь:", reply_markup=await user_menu_keyboard(tg_id))
-    important = await get_important_tasks(tg_id)
-    text, kb = build_focus(tasks_state, exp, important)
+    text, kb = await build_focus_for_user(tg_id, exp)
     await message.answer(text, reply_markup=kb)
 
 @dp.message(Command("set_date"))
@@ -2078,11 +2086,28 @@ async def focus_done_cb(callback):
     await set_task_done(tg_id, task_id, 0 if was_done else 1)
     tasks_state = await get_tasks_state(tg_id)
     important = await get_important_tasks(tg_id)
-    text, kb = build_focus(tasks_state, exp, important)
+    show_completed = await get_focus_show_completed(tg_id)
+    text, kb = build_focus(tasks_state, exp, important, show_completed=show_completed)
     await safe_edit(callback.message, text, kb)
-    if not was_done:
-        await maybe_send_qc_prompt(callback, tg_id, task_id)
     await callback.answer("Ок")
+
+
+@dp.callback_query(F.data == "focus_toggle_completed")
+async def focus_toggle_completed_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    exp = await get_experience(tg_id)
+    if exp == "unknown":
+        text, kb = experience_prompt()
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.answer()
+        return
+    current = await get_focus_show_completed(tg_id)
+    new_value = not current
+    await set_focus_show_completed(tg_id, new_value)
+    text, kb = await build_focus_for_user(tg_id, exp, show_completed=new_value)
+    await safe_edit(callback.message, text, kb)
+    await callback.answer("Обновил фокус")
 
 @dp.callback_query(F.data.startswith("help:"))
 async def help_cb(callback):
@@ -3132,7 +3157,8 @@ async def important_toggle_cb(callback):
     if callback.message.text and callback.message.text.startswith("🔥 Важное"):
         text, kb = build_important_screen(tasks_state, important)
     else:
-        text, kb = build_focus(tasks_state, exp, important)
+        show_completed = await get_focus_show_completed(tg_id)
+        text, kb = build_focus(tasks_state, exp, important, show_completed=show_completed)
     await safe_edit(callback.message, text, kb)
     await callback.answer("Обновил")
 

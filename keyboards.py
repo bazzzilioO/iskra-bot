@@ -163,6 +163,7 @@ def build_focus(
     experience: str | None = None,
     important: set[int] | None = None,
     focus_task_id: int | None = None,
+    show_completed: bool = False,
 ) -> tuple[str, InlineKeyboardMarkup]:
     done, total = count_progress(tasks_state)
     next_task = None
@@ -183,6 +184,14 @@ def build_focus(
 
     if not next_task:
         lines.append("✨ Всё выполнено. Поздравляю с закрытием релиза.")
+        if show_completed and done:
+            completed = [t for _, t in TASKS]
+            lines.append("")
+            lines.append(f"Выполненные ({len(completed)}):")
+            for t in completed:
+                lines.append(f"✅ {t}")
+        toggle_text = "🙈 Скрыть выполненные" if show_completed else "👁 Показать выполненные"
+        rows.append([InlineKeyboardButton(text=toggle_text, callback_data="focus_toggle_completed")])
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     task_id, title = next_task
@@ -210,6 +219,14 @@ def build_focus(
         for t in upcoming:
             lines.append(f"▫️ {t}")
 
+    if show_completed and done:
+        completed = [t for tid, t in TASKS if tasks_state.get(tid, 0) == 1]
+        if completed:
+            lines.append("")
+            lines.append(f"Выполненные ({len(completed)}):")
+            for t in completed:
+                lines.append(f"✅ {t}")
+
     is_done = tasks_state.get(task_id, 0) == 1
     mark_text = f"↩️ Отменить: {title}" if is_done else f"✅ Сделано: {title}"
     rows.append([
@@ -218,6 +235,8 @@ def build_focus(
             callback_data=f"focus_done:{task_id}"
         )
     ])
+    toggle_text = "🙈 Скрыть выполненные" if show_completed else "👁 Показать выполненные"
+    rows.append([InlineKeyboardButton(text=toggle_text, callback_data="focus_toggle_completed")])
     imp_set = important or set()
     imp_text = "🔥 Убрать из важных" if task_id in imp_set else "⭐ Важное"
     rows.append([InlineKeyboardButton(text=imp_text, callback_data=f"important:toggle:{task_id}")])
@@ -231,8 +250,9 @@ def build_focus_keyboard(
     experience: str | None = None,
     important: set[int] | None = None,
     focus_task_id: int | None = None,
+    show_completed: bool = False,
 ) -> InlineKeyboardMarkup:
-    _, kb = build_focus(tasks_state, experience, important, focus_task_id)
+    _, kb = build_focus(tasks_state, experience, important, focus_task_id, show_completed)
     return kb
 
 
