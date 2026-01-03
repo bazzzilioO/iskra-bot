@@ -4,6 +4,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+from helpers import smartlink_pre_save_active
 
 
 LINKS = {

@@ -89,7 +89,15 @@ from db import (
     update_smartlink_data,
     was_qc_checked,
 )
-from helpers import escape_html, format_date_ru, parse_date, safe_edit, safe_edit_caption
+from helpers import (
+    escape_html,
+    format_date_ru,
+    parse_date,
+    safe_edit,
+    safe_edit_caption,
+    smartlink_can_remind,
+    smartlink_pre_save_active,
+)
 from keyboards import (
     ACCOUNTS,
     BRANDING_DISABLE_PRICE,
@@ -213,6 +221,46 @@ def build_smartlink_keyboard(
         can_remind=can_remind,
         page=page,
     )
+
+
+def _build_smartlink_fallback_text(smartlink: dict) -> str:
+    artist = smartlink.get("artist") or "Без артиста"
+    title = smartlink.get("title") or "Без названия"
+    links = smartlink.get("links") or {}
+
+    lines = [f"{artist} — {title}"]
+
+    if links:
+        lines.append("Ссылки:")
+        added_keys: set[str] = set()
+        for key, label in SMARTLINK_BUTTON_ORDER:
+            url = links.get(key)
+            if url:
+                lines.append(f"- {label}: {url}")
+                added_keys.add(key)
+        for key, url in links.items():
+            if key in added_keys:
+                continue
+            label = platform_label(key)
+            lines.append(f"- {label}: {url}")
+    else:
+        lines.append("Ссылки: —")
+
+    return "\n".join(lines)
+
+
+async def _send_smartlink_fallback(bot: Bot, chat_id: int, smartlink: dict):
+    fallback_text = _build_smartlink_fallback_text(smartlink)
+    return await bot.send_message(chat_id, fallback_text)
+
+
+def _smartlink_sanity_check():
+    dummy = {"id": 0, "links": {}}
+    try:
+        build_smartlink_buttons(dummy, subscribed=False, can_remind=False)
+    except Exception:
+        logger.exception("[smartlink] sanity check failed")
+
 
 LABEL_EMAIL = "sreda.records@gmail.com"
 
@@ -1296,7 +1344,21 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         }
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
-        await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+        try:
+            await send_smartlink_photo(
+                message.bot,
+                tg_id,
+                smartlink,
+                subscribed=subscribed,
+                allow_remind=allow_remind,
+            )
+        except Exception:
+            logger.exception(
+                "[smartlink] finalize send failed tg_id=%s smartlink_id=%s",
+                tg_id,
+                smartlink_id,
+            )
+            await _send_smartlink_fallback(message.bot, tg_id, smartlink)
         platforms_text = ", ".join(platform_label(k) for k, v in links_clean.items() if v)
         rd_text = format_date_ru(parse_date(release_iso)) if release_iso else "—"
         summary_lines = [
@@ -1636,18 +1698,6 @@ def build_smartlink_export_text(smartlink: dict, variant: str) -> str:
     return ""
 
 
-def smartlink_pre_save_active(smartlink: dict) -> bool:
-    if not smartlink:
-        return False
-    rd = parse_date(smartlink.get("release_date") or "")
-    return bool(rd and rd > dt.date.today() and smartlink.get("pre_save_enabled", True))
-
-
-def smartlink_can_remind(smartlink: dict) -> bool:
-    rd = parse_date(smartlink.get("release_date") or "") if smartlink else None
-    return bool(rd and rd > dt.date.today() and smartlink.get("reminders_enabled", True))
-
-
 async def get_release_reminder_state(tg_id: int, smartlink_id: int, allow_remind: bool) -> bool:
     if not allow_remind:
         return False
@@ -1665,29 +1715,37 @@ async def send_smartlink_photo(
     allow_remind: bool = False,
     page: int | None = None,
 ):
-    caption = build_smartlink_caption(smartlink, release_today=release_today)
-    kb = build_smartlink_keyboard(
-        smartlink,
-        subscribed=subscribed,
-        can_remind=allow_remind,
-        page=page,
-    )
+    try:
+        caption = build_smartlink_caption(smartlink, release_today=release_today)
+        kb = build_smartlink_keyboard(
+            smartlink,
+            subscribed=subscribed,
+            can_remind=allow_remind,
+            page=page,
+        )
+    except Exception:
+        logger.exception("[smartlink] render failed smartlink_id=%s", smartlink.get("id"))
+        return await _send_smartlink_fallback(bot, chat_id, smartlink)
     cover_file_id = smartlink.get("cover_file_id")
-    if cover_file_id:
-        return await bot.send_photo(
+    try:
+        if cover_file_id:
+            return await bot.send_photo(
+                chat_id,
+                photo=cover_file_id,
+                caption=caption,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+
+        return await bot.send_message(
             chat_id,
-            photo=cover_file_id,
-            caption=caption,
+            text=caption,
             reply_markup=kb,
             parse_mode="HTML",
         )
-
-    return await bot.send_message(
-        chat_id,
-        text=caption,
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+    except Exception:
+        logger.exception("[smartlink] send failed smartlink_id=%s", smartlink.get("id"))
+        return await _send_smartlink_fallback(bot, chat_id, smartlink)
 
 def timeline_text(release_date: dt.date | None, reminders_enabled: bool = True) -> str:
     if not release_date:
@@ -4045,6 +4103,7 @@ async def main():
 
     # Ensure database schema is initialized before starting external services
     await init_db()
+    _smartlink_sanity_check()
     timeout_seconds = float(HTTP_TIMEOUT)
     session = AiohttpSession(timeout=timeout_seconds)
     if not isinstance(session.timeout, (int, float)):
