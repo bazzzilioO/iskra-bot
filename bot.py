@@ -176,6 +176,24 @@ def build_smartlink_caption(
     has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
     include_listen = False if presave_active else (show_listen_label if show_listen_label is not None else has_platforms)
 
+    def build_links_block() -> list[str]:
+        lines: list[str] = ["Ссылки:"]
+        added_keys: set[str] = set()
+        for key, label in SMARTLINK_BUTTON_ORDER:
+            url = links.get(key)
+            if url:
+                lines.append(f"- {label}: {escape_html(url)}")
+                added_keys.add(key)
+        for key, url in links.items():
+            if key in added_keys:
+                continue
+            label = platform_label(key)
+            lines.append(f"- {label}: {escape_html(url)}")
+            added_keys.add(key)
+        if not added_keys:
+            lines.append("Ссылки пока не найдены (релиз ещё не вышел или ссылки не добавлены).")
+        return lines
+
     if release_today:
         lines = [f"{artist} — {title}"]
         lines.append("🎉 Сегодня релиз!")
@@ -186,26 +204,34 @@ def build_smartlink_caption(
         if show_branding:
             lines.append("")
             lines.append(ATTRIBUTION_HTML)
-        if include_listen:
-            if lines and lines[-1] != "":
-                lines.append("")
-            lines.append("▶️ Слушать:")
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.extend(build_links_block())
         return "\n".join(lines)
 
     lines = [f"{artist} — {title}"]
     if release_date:
         lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
-    if presave_active:
-        lines.append("⏳ Скоро выйдет")
+    status_line: str | None = None
+    today = dt.date.today()
+    if presave_active and release_date and release_date > today:
+        status_line = "Релиз запланирован. Ссылки появятся ближе к дате или в день релиза."
+    if not has_platforms:
+        if release_date and release_date > today:
+            status_line = "Релиз запланирован. Ссылки появятся ближе к дате или в день релиза."
+        elif release_date and release_date <= today:
+            status_line = "Ссылки не найдены. Добавь вручную или обнови."
+    if status_line:
+        lines.append(status_line)
     if caption_text:
         lines.append(caption_text)
     if show_branding:
         lines.append("")
         lines.append(ATTRIBUTION_HTML)
-    if include_listen:
+    if include_listen or (lines and lines[-1] != ""):
         if lines and lines[-1] != "":
             lines.append("")
-        lines.append("▶️ Слушать:")
+    lines.extend(build_links_block())
     return "\n".join(lines)
 
 
@@ -297,6 +323,8 @@ BANDLINK_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+BANDLINK_REFRESH_PLATFORMS = {"spotify", "yandex", "apple", "vk", "zvuk", "youtube", "deezer", "youtubemusic"}
 
 SONGLINK_API_URL = "https://api.song.link/v1-alpha.1/links"
 SONGLINK_PLATFORM_ALIASES = {
@@ -1175,6 +1203,25 @@ async def fetch_bandlink_html(url: str) -> str | None:
         return None
 
 
+async def refresh_smartlink_links_from_bandlink(smartlink: dict) -> dict[str, str]:
+    bandlink_url = (smartlink.get("links") or {}).get("bandlink")
+    if not bandlink_url:
+        raise ValueError("bandlink_missing")
+
+    html_content = await fetch_bandlink_html(bandlink_url)
+    if not html_content:
+        raise RuntimeError("bandlink_fetch_failed")
+
+    links, _ = parse_bandlink(html_content)
+    filtered_links = {k: v for k, v in links.items() if k in BANDLINK_REFRESH_PLATFORMS}
+    if not filtered_links:
+        return smartlink.get("links") or {}
+
+    updated_links = dict(smartlink.get("links") or {})
+    updated_links.update(filtered_links)
+    return updated_links
+
+
 def skip_prefilled_smartlink_steps(step: int, data: dict) -> int:
     total_steps = 5 + len(SMARTLINK_PLATFORMS)
     links = data.get("links") or {}
@@ -1214,6 +1261,16 @@ def _is_valid_url(url: str) -> bool:
     except Exception:
         return False
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+async def _cleanup_user_input_message(message: Message, data: dict):
+    last_id = data.pop("_last_input_message_id", None)
+    if last_id:
+        with contextlib.suppress(Exception):
+            await message.bot.delete_message(message.chat.id, last_id)
+    data["_last_input_message_id"] = message.message_id
+    with contextlib.suppress(Exception):
+        await message.bot.delete_message(message.chat.id, message.message_id)
 
 
 async def _send_smartlink_prompt(message: Message, tg_id: int, step: int, data: dict):
@@ -2487,6 +2544,43 @@ async def smartlinks_open_cb(callback):
         return
     await resend_smartlink_card(callback.message, tg_id, smartlink, page)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:refresh:"))
+async def smartlinks_refresh_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id = int(parts[2])
+    page = int(parts[3])
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    try:
+        updated_links = await refresh_smartlink_links_from_bandlink(smartlink)
+    except ValueError:
+        await callback.answer("Добавь ссылку BandLink, чтобы обновить площадки автоматически.", show_alert=True)
+        return
+    except Exception:
+        logger.exception("[smartlink] bandlink refresh failed smartlink_id=%s", smartlink_id)
+        await callback.answer("Не получилось обновить ссылки. Попробуй позже или добавь вручную.", show_alert=True)
+        return
+
+    if updated_links != (smartlink.get("links") or {}):
+        await update_smartlink_data(smartlink_id, tg_id, {"links": updated_links})
+        smartlink = await get_owned_smartlink(tg_id, smartlink_id) or smartlink
+
+    allow_remind = smartlink_can_remind(smartlink)
+    subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
+    kb = build_smartlink_keyboard(smartlink, subscribed=subscribed, can_remind=allow_remind, page=page)
+    caption = build_smartlink_caption(smartlink)
+    await safe_edit_caption(callback.message, caption, kb)
+    await callback.answer("Карточка обновлена")
 
 
 @dp.callback_query(F.data.startswith("smartlinks:delete:"))
@@ -3773,6 +3867,8 @@ async def any_message_router(message: Message):
 
         log_smartlink_step(tg_id, step, field_name or "unknown", skip_text)
 
+        await _cleanup_user_input_message(message, data)
+
         step += 1
         step = skip_prefilled_smartlink_steps(step, data)
         if step < total_steps:
@@ -3804,6 +3900,7 @@ async def any_message_router(message: Message):
         else:
             await start_prefill_editor(message, tg_id, data)
             return
+        await _cleanup_user_input_message(message, data)
         data.pop("pending", None)
         await form_set(tg_id, 0, data)
         await start_prefill_editor(message, tg_id, data)
@@ -4020,6 +4117,8 @@ async def any_message_router(message: Message):
         return
 
     data[key] = normalized
+
+    await _cleanup_user_input_message(message, data)
 
     step += 1
     if step < len(LABEL_FORM_STEPS):
