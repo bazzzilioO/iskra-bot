@@ -174,25 +174,7 @@ def build_smartlink_caption(
 
     links = smartlink.get("links") or {}
     has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
-    include_listen = False if presave_active else (show_listen_label if show_listen_label is not None else has_platforms)
-
-    def build_links_block() -> list[str]:
-        lines: list[str] = ["Ссылки:"]
-        added_keys: set[str] = set()
-        for key, label in SMARTLINK_BUTTON_ORDER:
-            url = links.get(key)
-            if url:
-                lines.append(f"- {label}: {escape_html(url)}")
-                added_keys.add(key)
-        for key, url in links.items():
-            if key in added_keys:
-                continue
-            label = platform_label(key)
-            lines.append(f"- {label}: {escape_html(url)}")
-            added_keys.add(key)
-        if not added_keys:
-            lines.append("Ссылки пока не найдены (релиз ещё не вышел или ссылки не добавлены).")
-        return lines
+    no_links_line = "Ссылки пока не найдены (попробуй обновить или добавь вручную)."
 
     if release_today:
         lines = [f"{artist} — {title}"]
@@ -204,9 +186,10 @@ def build_smartlink_caption(
         if show_branding:
             lines.append("")
             lines.append(ATTRIBUTION_HTML)
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.extend(build_links_block())
+        if not has_platforms:
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append(no_links_line)
         return "\n".join(lines)
 
     lines = [f"{artist} — {title}"]
@@ -228,10 +211,10 @@ def build_smartlink_caption(
     if show_branding:
         lines.append("")
         lines.append(ATTRIBUTION_HTML)
-    if include_listen or (lines and lines[-1] != ""):
+    if not has_platforms:
         if lines and lines[-1] != "":
             lines.append("")
-    lines.extend(build_links_block())
+        lines.append(no_links_line)
     return "\n".join(lines)
 
 
