@@ -1161,6 +1161,15 @@ def log_smartlink_step(tg_id: int, step: int, field: str, skipped: bool):
 
 
 
+def _is_valid_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+
 async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     logger.info("[smartlink] finalize start tg_id=%s", tg_id)
     try:
@@ -1170,7 +1179,35 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         cover_file_id = data.get("cover_file_id") or ""
         caption_text = data.get("caption_text", "") or ""
         links = data.get("links") or {}
-        links_clean = {k: v for k, v in links.items() if v}
+        links_clean = {
+            k: v
+            for k, v in links.items()
+            if v and isinstance(v, str) and _is_valid_url(v.strip())
+        }
+        logger.info(
+            "[smartlink] links filtered tg_id=%s total=%s valid=%s",
+            tg_id,
+            len(links),
+            len(links_clean),
+        )
+
+        missing_fields = [name for name, value in {"artist": artist, "title": title}.items() if not value]
+        if missing_fields:
+            logger.warning("[smartlink] missing fields tg_id=%s fields=%s", tg_id, missing_fields)
+
+        if not (artist or title or release_iso):
+            await message.answer(
+                "Нужен хотя бы артист, название или дата релиза, чтобы сохранить смартлинк.",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+
+        if missing_fields:
+            missing_text = " и ".join("артиста" if f == "artist" else "названия" for f in missing_fields)
+            await message.answer(
+                f"Нет {missing_text}. Добавь, чтобы карточка выглядела лучше.",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
 
         smartlink_id = await save_smartlink(
             tg_id,
@@ -1198,7 +1235,15 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
         await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
-        logger.info("[smartlink] finalize done tg_id=%s smartlink_id=%s", tg_id, smartlink_id)
+        logger.info(
+            "[smartlink] finalize done tg_id=%s smartlink_id=%s links=%s",
+            tg_id,
+            smartlink_id,
+            len(links_clean),
+        )
+    except TelegramBadRequest:
+        logger.exception("[smartlink] finalize failed (bad request) tg_id=%s", tg_id)
+        await message.answer("Не удалось отправить карточку. Попробуй изменить данные и повторить.")
     except Exception:
         logger.exception("[smartlink] finalize failed tg_id=%s", tg_id)
         await message.answer("Не удалось создать смартлинк. Проверь данные или попробуй ещё раз.")
@@ -1544,10 +1589,19 @@ async def send_smartlink_photo(
         can_remind=allow_remind,
         page=page,
     )
-    return await bot.send_photo(
+    cover_file_id = smartlink.get("cover_file_id")
+    if cover_file_id:
+        return await bot.send_photo(
+            chat_id,
+            photo=cover_file_id,
+            caption=caption,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+
+    return await bot.send_message(
         chat_id,
-        photo=smartlink.get("cover_file_id"),
-        caption=caption,
+        text=caption,
         reply_markup=kb,
         parse_mode="HTML",
     )

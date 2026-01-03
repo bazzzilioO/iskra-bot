@@ -474,8 +474,9 @@ def build_smartlink_buttons(
     page_marker = page if page is not None else -1
     presave_active = smartlink_pre_save_active(smartlink)
 
+    platform_rows: list[list[InlineKeyboardButton]] = []
+
     if not presave_active:
-        platform_rows: list[list[InlineKeyboardButton]] = []
         for key, label in SMARTLINK_BUTTON_ORDER:
             url = links.get(key)
             if url:
@@ -488,8 +489,9 @@ def build_smartlink_buttons(
         toggle_text = "🔕 Не напоминать" if subscribed else "🔔 Напомнить о релизе"
         rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"smartrem:{smartlink.get('id')}:toggle")])
 
-    rows.append([InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink.get('id')}")])
-    rows.append([InlineKeyboardButton(text="📤 Экспорт", callback_data=f"smartlinks:export:{smartlink.get('id')}:{page_marker}")])
+    if platform_rows:
+        rows.append([InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink.get('id')}")])
+        rows.append([InlineKeyboardButton(text="📤 Экспорт", callback_data=f"smartlinks:export:{smartlink.get('id')}:{page_marker}")])
 
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
