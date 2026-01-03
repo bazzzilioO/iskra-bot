@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import fcntl
 import json
+import logging
 import os
 import re
 import datetime as dt
@@ -349,6 +350,7 @@ async def user_menu_keyboard(tg_id: int) -> ReplyKeyboardMarkup:
     return menu_keyboard(updates_enabled)
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")
 APP_VERSION = os.getenv("APP_VERSION", "dev")
@@ -384,6 +386,7 @@ _SPOTIFY_ACCESS_TOKEN: str | None = None
 _SPOTIFY_TOKEN_EXPIRES_AT: dt.datetime | None = None
 
 dp = Dispatcher()
+logger = logging.getLogger(__name__)
 
 async def maybe_send_update_notice(message: Message, tg_id: int):
     if not UPDATES_POST_URL:
@@ -409,6 +412,10 @@ async def start_smartlink_form(
     step = skip_prefilled_smartlink_steps(0, data)
     await form_start(tg_id, "smartlink")
     await form_set(tg_id, step, data)
+
+    logger.info(
+        "[smartlink] wizard started tg_id=%s initial_step=%s prefilled=%s", tg_id, step, bool(prefill)
+    )
 
     total_steps = 5 + len(SMARTLINK_PLATFORMS)
     if step >= total_steps:
@@ -1137,39 +1144,56 @@ def skip_prefilled_smartlink_steps(step: int, data: dict) -> int:
     return step
 
 
+def log_smartlink_step(tg_id: int, step: int, field: str, skipped: bool):
+    logger.info(
+        "[smartlink] step saved tg_id=%s step=%s field=%s skipped=%s", tg_id, step, field, skipped
+    )
+
+
 
 async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
-    links = data.get("links") or {}
-    links_clean = {k: v for k, v in links.items() if v}
-    release_iso = data.get("release_date")
-    caption_text = data.get("caption_text", "") or ""
-    smartlink_id = await save_smartlink(
-        tg_id,
-        data.get("artist", ""),
-        data.get("title", ""),
-        release_iso or "",
-        data.get("cover_file_id", ""),
-        links_clean,
-        caption_text,
-        bool(data.get("branding_disabled")),
-    )
-    smartlink = {
-        "id": smartlink_id,
-        "owner_tg_id": tg_id,
-        "artist": data.get("artist", ""),
-        "title": data.get("title", ""),
-        "release_date": release_iso,
-        "cover_file_id": data.get("cover_file_id", ""),
-        "links": links_clean,
-        "caption_text": caption_text,
-        "branding_disabled": bool(data.get("branding_disabled")),
-        "created_at": dt.datetime.utcnow().isoformat(),
-    }
-    allow_remind = smartlink_can_remind(smartlink)
-    subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
-    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
-    await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
-    await form_clear(tg_id)
+    logger.info("[smartlink] finalize start tg_id=%s", tg_id)
+    try:
+        artist = data.get("artist") or ""
+        title = data.get("title") or ""
+        release_iso = data.get("release_date") or ""
+        cover_file_id = data.get("cover_file_id") or ""
+        caption_text = data.get("caption_text", "") or ""
+        links = data.get("links") or {}
+        links_clean = {k: v for k, v in links.items() if v}
+
+        smartlink_id = await save_smartlink(
+            tg_id,
+            artist,
+            title,
+            release_iso,
+            cover_file_id,
+            links_clean,
+            caption_text,
+            bool(data.get("branding_disabled")),
+        )
+        smartlink = {
+            "id": smartlink_id,
+            "owner_tg_id": tg_id,
+            "artist": artist,
+            "title": title,
+            "release_date": release_iso,
+            "cover_file_id": cover_file_id,
+            "links": links_clean,
+            "caption_text": caption_text,
+            "branding_disabled": bool(data.get("branding_disabled")),
+            "created_at": dt.datetime.utcnow().isoformat(),
+        }
+        allow_remind = smartlink_can_remind(smartlink)
+        subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
+        await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+        await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
+        logger.info("[smartlink] finalize done tg_id=%s smartlink_id=%s", tg_id, smartlink_id)
+    except Exception:
+        logger.exception("[smartlink] finalize failed tg_id=%s", tg_id)
+        await message.answer("Не удалось создать смартлинк. Проверь данные или попробуй ещё раз.")
+    finally:
+        await form_clear(tg_id)
 
 
 async def fetch_cover_file(cover_url: str) -> BufferedInputFile | None:
@@ -2830,24 +2854,33 @@ async def smartlink_skip_cb(callback):
         if step >= total_steps:
             await callback.answer("Шагов больше нет", show_alert=True)
             return
+        field_name = ""
         if step == 0:
             data["artist"] = ""
+            field_name = "artist"
         elif step == 1:
             data["title"] = ""
+            field_name = "title"
         elif step == 2:
             data["release_date"] = ""
+            field_name = "release_date"
         elif step == 3:
             data["cover_file_id"] = ""
+            field_name = "cover_file_id"
         elif step == 4:
             data["caption_text"] = ""
+            field_name = "caption_text"
         else:
             idx = step - 5
             if idx < 0 or idx >= len(SMARTLINK_PLATFORMS):
                 await form_clear(tg_id)
                 await callback.answer("Нет шага", show_alert=True)
                 return
-            data["links"][SMARTLINK_PLATFORMS[idx][0]] = ""
+            platform_key = SMARTLINK_PLATFORMS[idx][0]
+            data["links"][platform_key] = ""
+            field_name = platform_key
 
+        log_smartlink_step(tg_id, step, field_name or "unknown", True)
         next_step = skip_prefilled_smartlink_steps(step + 1, data)
         total_steps = 5 + len(SMARTLINK_PLATFORMS)
         if next_step < total_steps:
@@ -2857,6 +2890,7 @@ async def smartlink_skip_cb(callback):
                 reply_markup=smartlink_step_kb(),
             )
         else:
+            await form_set(tg_id, next_step, data)
             await finalize_smartlink_form(callback.message, tg_id, data)
         await callback.answer("Пропустил")
         return
@@ -3428,6 +3462,7 @@ async def any_message_router(message: Message):
         data["links"] = links
         total_steps = 5 + len(SMARTLINK_PLATFORMS)
         skip_text = txt.lower() in {"пропустить", "skip"}
+        field_name = ""
 
         if step == 0:
             if skip_text:
@@ -3440,6 +3475,7 @@ async def any_message_router(message: Message):
                     )
                     return
                 data["artist"] = txt
+            field_name = "artist"
         elif step == 1:
             if skip_text:
                 data["title"] = ""
@@ -3451,6 +3487,7 @@ async def any_message_router(message: Message):
                     )
                     return
                 data["title"] = txt
+            field_name = "title"
         elif step == 2:
             if skip_text:
                 data["release_date"] = ""
@@ -3463,6 +3500,7 @@ async def any_message_router(message: Message):
                     )
                     return
                 data["release_date"] = d.isoformat()
+            field_name = "release_date"
         elif step == 3:
             if skip_text:
                 data["cover_file_id"] = ""
@@ -3474,6 +3512,7 @@ async def any_message_router(message: Message):
                     )
                     return
                 data["cover_file_id"] = message.photo[-1].file_id
+            field_name = "cover_file_id"
         elif step == 4:
             if skip_text:
                 data["caption_text"] = ""
@@ -3491,6 +3530,7 @@ async def any_message_router(message: Message):
                     )
                     return
                 data["caption_text"] = txt
+            field_name = "caption_text"
         else:
             idx = step - 5
             if idx < 0 or idx >= len(SMARTLINK_PLATFORMS):
@@ -3509,6 +3549,9 @@ async def any_message_router(message: Message):
                     await message.answer("Нужна ссылка или «Пропустить».", reply_markup=smartlink_step_kb())
                     return
                 links[SMARTLINK_PLATFORMS[idx][0]] = txt
+            field_name = SMARTLINK_PLATFORMS[idx][0]
+
+        log_smartlink_step(tg_id, step, field_name or "unknown", skip_text)
 
         step += 1
         step = skip_prefilled_smartlink_steps(step, data)
@@ -3520,6 +3563,7 @@ async def any_message_router(message: Message):
             )
             return
 
+        await form_set(tg_id, step, data)
         await finalize_smartlink_form(message, tg_id, data)
         return
 
