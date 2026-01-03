@@ -8,14 +8,19 @@ from aiogram.exceptions import TelegramForbiddenError
 
 from db import (
     cleanup_reminder_log,
+    DEFAULT_TIMEZONE,
+    get_due_smartlink_reminders,
     get_reminder_users,
+    get_smartlink_by_id,
     get_smartlink_subscribers,
     get_smartlinks_with_release,
     get_user_reminder_prefs,
     mark_reminder_sent,
+    mark_smartlink_reminder_sent,
     mark_smartlink_day_sent,
     mark_smartlink_notified,
     was_reminder_sent,
+    was_smartlink_reminder_sent,
     was_smartlink_day_sent,
 )
 from helpers import parse_date
@@ -135,12 +140,46 @@ async def process_smartlink_notifications(bot: Bot, send_smartlink_photo: Callab
                     continue
 
 
+async def process_smartlink_release_day_reminders(bot: Bot, send_smartlink_photo: Callable[..., Awaitable]):
+    today = dt.datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).date()
+    due = await get_due_smartlink_reminders(today.isoformat())
+
+    for smartlink_id, tg_id in due:
+        try:
+            if await was_smartlink_reminder_sent(tg_id, smartlink_id):
+                continue
+
+            try:
+                sid = int(smartlink_id)
+            except Exception:
+                continue
+
+            smartlink = await get_smartlink_by_id(sid)
+            if not smartlink:
+                continue
+
+            await send_smartlink_photo(
+                bot,
+                tg_id,
+                smartlink,
+                release_today=True,
+                subscribed=True,
+                allow_remind=False,
+            )
+            await mark_smartlink_reminder_sent(tg_id, smartlink_id)
+        except TelegramForbiddenError:
+            continue
+        except Exception:
+            continue
+
+
 async def reminder_scheduler(bot: Bot, send_smartlink_photo: Callable[..., Awaitable]):
     while True:
         try:
             await asyncio.gather(
                 process_reminders(bot),
                 process_smartlink_notifications(bot, send_smartlink_photo),
+                process_smartlink_release_day_reminders(bot, send_smartlink_photo),
             )
         except Exception as err:
             print(f"[reminder_scheduler] failed: {err}")

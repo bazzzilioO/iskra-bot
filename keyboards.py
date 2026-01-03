@@ -465,8 +465,8 @@ def build_smartlink_buttons(
             rows.extend(platform_rows)
 
     if can_remind:
-        toggle_text = "✅ Напоминание включено" if subscribed else "🔔 Напомнить о релизе"
-        rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"smartlink:toggle:{smartlink.get('id')}")])
+        toggle_text = "🔕 Не напоминать" if subscribed else "🔔 Напомнить о релизе"
+        rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"smartrem:{smartlink.get('id')}:toggle")])
 
     rows.append([InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink.get('id')}")])
     rows.append([InlineKeyboardButton(text="📤 Экспорт", callback_data=f"smartlinks:export:{smartlink.get('id')}:{page_marker}")])

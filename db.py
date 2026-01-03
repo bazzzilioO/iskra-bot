@@ -176,6 +176,26 @@ async def init_db():
             await db.execute("ALTER TABLE smartlink_subscriptions ADD COLUMN notified INTEGER DEFAULT 0")
         except Exception:
             pass
+        await db.execute(
+            """
+        CREATE TABLE IF NOT EXISTS smartlink_reminders (
+            smartlink_id INTEGER,
+            tg_id INTEGER,
+            created_at TEXT,
+            UNIQUE(smartlink_id, tg_id)
+        )
+        """
+        )
+        await db.execute(
+            """
+        CREATE TABLE IF NOT EXISTS smartlink_reminder_sends (
+            smartlink_id INTEGER,
+            tg_id INTEGER,
+            sent_at TEXT,
+            UNIQUE(smartlink_id, tg_id)
+        )
+        """
+        )
         await db.execute("""
         CREATE TABLE IF NOT EXISTS smartlink_reminder_log (
             smartlink_id INTEGER,
@@ -507,6 +527,8 @@ async def reset_all_data(tg_id: int):
         await db.execute("DELETE FROM qc_checks WHERE tg_id=?", (tg_id,))
         await db.execute("DELETE FROM reminder_log WHERE tg_id=?", (tg_id,))
         await db.execute("DELETE FROM smartlink_subscriptions WHERE subscriber_tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM smartlink_reminders WHERE tg_id=?", (tg_id,))
+        await db.execute("DELETE FROM smartlink_reminder_sends WHERE tg_id=?", (tg_id,))
         await db.execute("DELETE FROM smartlinks WHERE owner_tg_id=?", (tg_id,))
         await db.execute(
             "UPDATE users SET release_date=NULL, reminders_enabled=1 WHERE tg_id=?",
@@ -671,6 +693,8 @@ async def delete_smartlink(smartlink_id: int, owner_tg_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM smartlinks WHERE id=? AND owner_tg_id=?", (smartlink_id, owner_tg_id))
         await db.execute("DELETE FROM smartlink_subscriptions WHERE smartlink_id=?", (smartlink_id,))
+        await db.execute("DELETE FROM smartlink_reminders WHERE smartlink_id=?", (smartlink_id,))
+        await db.execute("DELETE FROM smartlink_reminder_sends WHERE smartlink_id=?", (smartlink_id,))
         await db.commit()
 
 
@@ -798,6 +822,87 @@ async def mark_smartlink_day_sent(smartlink_id: int, subscriber_tg_id: int, offs
             (smartlink_id, subscriber_tg_id, offset_days, sent_on.isoformat()),
         )
         await db.commit()
+
+
+def _parse_smartlink_date(date_str: str | None) -> dt.date | None:
+    if not date_str:
+        return None
+    try:
+        if "-" in date_str:
+            y, m, d = date_str.split("-")
+            return dt.date(int(y), int(m), int(d))
+        if "." in date_str:
+            d, m, y = date_str.split(".")
+            return dt.date(int(y), int(m), int(d))
+    except Exception:
+        return None
+    return None
+
+
+async def add_smartlink_reminder(tg_id: int, smartlink_id: int | str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO smartlink_reminders (smartlink_id, tg_id, created_at) VALUES (?, ?, ?)",
+            (smartlink_id, tg_id, dt.datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def remove_smartlink_reminder(tg_id: int, smartlink_id: int | str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM smartlink_reminders WHERE smartlink_id=? AND tg_id=?",
+            (smartlink_id, tg_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def is_smartlink_reminder_set(tg_id: int, smartlink_id: int | str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM smartlink_reminders WHERE smartlink_id=? AND tg_id=?",
+            (smartlink_id, tg_id),
+        )
+        return await cur.fetchone() is not None
+
+
+async def get_due_smartlink_reminders(today_date_str: str) -> list[tuple[int | str, int]]:
+    target_date = _parse_smartlink_date(today_date_str)
+    if not target_date:
+        return []
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT r.smartlink_id, r.tg_id, s.release_date FROM smartlink_reminders r JOIN smartlinks s ON r.smartlink_id = s.id"
+        )
+        rows = await cur.fetchall()
+
+    due: list[tuple[int | str, int]] = []
+    for smartlink_id, tg_id, release_date in rows:
+        rd = _parse_smartlink_date(release_date)
+        if rd and rd == target_date:
+            due.append((smartlink_id, tg_id))
+    return due
+
+
+async def mark_smartlink_reminder_sent(tg_id: int, smartlink_id: int | str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO smartlink_reminder_sends (smartlink_id, tg_id, sent_at) VALUES (?, ?, ?)",
+            (smartlink_id, tg_id, dt.datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+
+
+async def was_smartlink_reminder_sent(tg_id: int, smartlink_id: int | str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM smartlink_reminder_sends WHERE smartlink_id=? AND tg_id=?",
+            (smartlink_id, tg_id),
+        )
+        return await cur.fetchone() is not None
 
 
 async def cleanup_reminder_log(today: dt.date, clean_days: int = REMINDER_CLEAN_DAYS):
