@@ -493,6 +493,18 @@ def build_smartlink_buttons(
     if platform_rows:
         rows.append([InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink.get('id')}")])
         rows.append([InlineKeyboardButton(text="📤 Экспорт", callback_data=f"smartlinks:export:{smartlink.get('id')}:{page_marker}")])
+    else:
+        rows.append(
+            [InlineKeyboardButton(text="🔄 Обновить ссылки", callback_data=f"smartlinks:refresh:{smartlink.get('id')}:{page_marker}")]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="✏️ Добавить/Изменить ссылки",
+                    callback_data=f"smartlinks:edit_links:{smartlink.get('id')}:{page_marker}",
+                )
+            ]
+        )
 
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
