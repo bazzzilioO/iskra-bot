@@ -1,5 +1,6 @@
 import datetime as dt
 import html
+import logging
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup, Message
@@ -7,6 +8,9 @@ from aiogram.types import InlineKeyboardMarkup, Message
 
 def escape_html(text: str | None) -> str:
     return html.escape(text or "")
+
+
+logger = logging.getLogger(__name__)
 
 
 def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
@@ -41,6 +45,8 @@ def parse_date(date_str: str) -> dt.date | None:
       - DD.MM.YYYY
     """
     s = (date_str or "").strip()
+    if not s:
+        return None
     try:
         if "-" in s:
             y, m, d = s.split("-")
@@ -49,6 +55,7 @@ def parse_date(date_str: str) -> dt.date | None:
             d, m, y = s.split(".")
             return dt.date(int(y), int(m), int(d))
     except Exception:
+        logger.warning("[parse_date] failed to parse raw='%s'", date_str)
         return None
     return None
 

@@ -1169,28 +1169,68 @@ def _is_valid_url(url: str) -> bool:
 
 
 async def _send_smartlink_prompt(message: Message, tg_id: int, step: int, data: dict):
+    await _update_smartlink_prompt(
+        message,
+        tg_id,
+        step,
+        data,
+    )
+
+
+async def _update_smartlink_prompt(
+    message: Message,
+    tg_id: int,
+    step: int,
+    data: dict,
+    prefix: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+):
+    prompt_text = smartlink_step_prompt(step)
+    if prefix:
+        prompt_text = f"{prefix}\n\n{prompt_text}"
+    prompt_text += "\n\n(Отмена: /cancel)"
+    kb = reply_markup if reply_markup is not None else smartlink_step_kb()
+
+    await _update_prompt_message(message, tg_id, data, prompt_text, kb, step=step)
+
+
+async def _update_prompt_message(
+    message: Message,
+    tg_id: int,
+    data: dict,
+    text: str,
+    kb: InlineKeyboardMarkup | None,
+    *,
+    step: int | None = None,
+):
     prev_prompt_id = data.get("_prompt_message_id")
     if prev_prompt_id:
-        with contextlib.suppress(Exception):
-            await message.bot.delete_message(message.chat.id, prev_prompt_id)
+        try:
+            await message.bot.edit_message_text(
+                text, chat_id=message.chat.id, message_id=prev_prompt_id, reply_markup=kb
+            )
+            if step is not None:
+                await form_set(tg_id, step, data)
+            return
+        except TelegramBadRequest:
+            with contextlib.suppress(Exception):
+                await message.bot.edit_message_reply_markup(message.chat.id, prev_prompt_id, reply_markup=None)
+        except Exception:
+            logger.exception("[smartlink] failed to edit prompt tg_id=%s", tg_id)
 
-    prompt = await message.answer(
-        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)", reply_markup=smartlink_step_kb()
-    )
+    prompt = await message.answer(text, reply_markup=kb)
     data["_prompt_message_id"] = prompt.message_id
-    await form_set(tg_id, step, data)
+    if step is not None:
+        await form_set(tg_id, step, data)
     return prompt
 
 
 
 async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     logger.info("[smartlink] finalize start tg_id=%s", tg_id)
+    failure_reason: str | None = None
     try:
-        last_prompt_id = data.get("_prompt_message_id")
-        if last_prompt_id:
-            with contextlib.suppress(Exception):
-                await message.bot.delete_message(message.chat.id, last_prompt_id)
-
+        
         artist = data.get("artist") or ""
         title = data.get("title") or ""
         release_iso = data.get("release_date") or ""
@@ -1202,6 +1242,9 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             for k, v in links.items()
             if v and isinstance(v, str) and _is_valid_url(v.strip())
         }
+        has_anchor_link = any(links_clean.get(p) for p in KEY_PLATFORM_SET)
+        if links_clean.get("bandlink"):
+            has_anchor_link = True
         logger.info(
             "[smartlink] links filtered tg_id=%s total=%s valid=%s",
             tg_id,
@@ -1213,9 +1256,11 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         if missing_fields:
             logger.warning("[smartlink] missing fields tg_id=%s fields=%s", tg_id, missing_fields)
 
-        if not (artist or title or release_iso):
+        if not has_anchor_link:
+            failure_reason = "Нет ни одной ссылки на платформу. Добавь Spotify, Apple Music, Яндекс, VK или BandLink."
+            await _update_prompt_message(message, tg_id, data, failure_reason, None)
             await message.answer(
-                "Нужен хотя бы артист, название или дата релиза, чтобы сохранить смартлинк.",
+                failure_reason,
                 reply_markup=await user_menu_keyboard(tg_id),
             )
             return
@@ -1252,7 +1297,23 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
-        await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
+        platforms_text = ", ".join(platform_label(k) for k, v in links_clean.items() if v)
+        rd_text = format_date_ru(parse_date(release_iso)) if release_iso else "—"
+        summary_lines = [
+            "Смартлинк готов ✅",
+            f"Артист: {artist or '—'}",
+            f"Релиз: {title or '—'}",
+            f"Дата: {rd_text if rd_text else '—'}",
+            f"Площадки: {platforms_text or '—'}",
+        ]
+        await _update_prompt_message(
+            message,
+            tg_id,
+            data,
+            "\n".join(summary_lines),
+            smartlinks_menu_kb(),
+            step=None,
+        )
         logger.info(
             "[smartlink] finalize done tg_id=%s smartlink_id=%s links=%s",
             tg_id,
@@ -1266,7 +1327,9 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     except Exception:
         traceback.print_exc()
         logger.exception("[smartlink] finalize failed tg_id=%s", tg_id)
-        await message.answer("Не удалось создать смартлинк. Проверь данные или попробуй ещё раз.")
+        error_text = failure_reason or "Не удалось создать смартлинк. Проверь данные или попробуй ещё раз."
+        await _update_prompt_message(message, tg_id, data, error_text, None, step=None)
+        await message.answer(error_text)
     finally:
         await form_clear(tg_id)
 
@@ -3565,10 +3628,7 @@ async def any_message_router(message: Message):
                 data["artist"] = ""
             else:
                 if len(txt) < 2:
-                    await message.answer(
-                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
-                        reply_markup=smartlink_step_kb(),
-                    )
+                    await _update_smartlink_prompt(message, tg_id, step, data)
                     return
                 data["artist"] = txt
             field_name = "artist"
@@ -3577,10 +3637,7 @@ async def any_message_router(message: Message):
                 data["title"] = ""
             else:
                 if len(txt) < 1:
-                    await message.answer(
-                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
-                        reply_markup=smartlink_step_kb(),
-                    )
+                    await _update_smartlink_prompt(message, tg_id, step, data)
                     return
                 data["title"] = txt
             field_name = "title"
@@ -3590,9 +3647,12 @@ async def any_message_router(message: Message):
             else:
                 d = parse_date(txt)
                 if not d:
-                    await message.answer(
-                        "Не понял дату. Формат: ДД.ММ.ГГГГ\n\n" + smartlink_step_prompt(step),
-                        reply_markup=smartlink_step_kb(),
+                    await _update_smartlink_prompt(
+                        message,
+                        tg_id,
+                        step,
+                        data,
+                        prefix="Не понял дату. Формат: ДД.ММ.ГГГГ",
                     )
                     return
                 data["release_date"] = d.isoformat()
@@ -3602,9 +3662,12 @@ async def any_message_router(message: Message):
                 data["cover_file_id"] = ""
             else:
                 if not message.photo:
-                    await message.answer(
-                        "Пришли фото для обложки.\n\n" + smartlink_step_prompt(step),
-                        reply_markup=smartlink_step_kb(),
+                    await _update_smartlink_prompt(
+                        message,
+                        tg_id,
+                        step,
+                        data,
+                        prefix="Пришли фото для обложки.",
                     )
                     return
                 data["cover_file_id"] = message.photo[-1].file_id
@@ -3614,15 +3677,15 @@ async def any_message_router(message: Message):
                 data["caption_text"] = ""
             else:
                 if not txt:
-                    await message.answer(
-                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
-                        reply_markup=smartlink_step_kb(),
-                    )
+                    await _update_smartlink_prompt(message, tg_id, step, data)
                     return
                 if len(txt) > 600:
-                    await message.answer(
-                        "Максимум 600 символов. Сократи текст и отправь снова.\n\n" + smartlink_step_prompt(step),
-                        reply_markup=smartlink_step_kb(),
+                    await _update_smartlink_prompt(
+                        message,
+                        tg_id,
+                        step,
+                        data,
+                        prefix="Максимум 600 символов. Сократи текст и отправь снова.",
                     )
                     return
                 data["caption_text"] = txt
@@ -3636,13 +3699,16 @@ async def any_message_router(message: Message):
                 links[SMARTLINK_PLATFORMS[idx][0]] = ""
             else:
                 if not txt:
-                    await message.answer(
-                        smartlink_step_prompt(step) + "\n\n(Отмена: /cancel)",
-                        reply_markup=smartlink_step_kb(),
-                    )
+                    await _update_smartlink_prompt(message, tg_id, step, data)
                     return
                 if not re.match(r"https?://", txt):
-                    await message.answer("Нужна ссылка или «Пропустить».", reply_markup=smartlink_step_kb())
+                    await _update_smartlink_prompt(
+                        message,
+                        tg_id,
+                        step,
+                        data,
+                        prefix="Нужна ссылка или «Пропустить».",
+                    )
                     return
                 links[SMARTLINK_PLATFORMS[idx][0]] = txt
             field_name = SMARTLINK_PLATFORMS[idx][0]
