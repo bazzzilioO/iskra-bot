@@ -45,6 +45,9 @@ from db import (
     cycle_account_status as db_cycle_account_status,
     delete_smartlink,
     ensure_user as db_ensure_user,
+    add_smartlink_reminder,
+    remove_smartlink_reminder,
+    is_smartlink_reminder_set,
     form_clear,
     form_get,
     form_set,
@@ -560,7 +563,7 @@ async def show_smartlink_view(message: Message, tg_id: int, smartlink_id: int, p
 
 async def resend_smartlink_card(message: Message, tg_id: int, smartlink: dict, page: int):
     allow_remind = smartlink_can_remind(smartlink)
-    subscribed = await is_smartlink_subscribed(smartlink.get("id"), tg_id) if allow_remind else False
+    subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
     await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind, page=page)
     await message.answer("Выбери действие:", reply_markup=smartlink_view_kb(smartlink.get("id"), page))
 
@@ -1163,7 +1166,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         "created_at": dt.datetime.utcnow().isoformat(),
     }
     allow_remind = smartlink_can_remind(smartlink)
-    subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+    subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
     await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
     await message.answer("Готово. Смартлинк сохранён.", reply_markup=await user_menu_keyboard(tg_id))
     await form_clear(tg_id)
@@ -1371,7 +1374,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "created_at": dt.datetime.utcnow().isoformat(),
         }
         allow_remind = smartlink_can_remind(smartlink)
-        subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+        subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
         await message.answer("Добавил Spotify по UPC. Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
         return
@@ -1391,13 +1394,13 @@ async def apply_caption_update(message: Message, tg_id: int, smartlink_id: int, 
         await form_clear(tg_id)
         return
     allow_remind = smartlink_can_remind(smartlink)
-    subscribed = await is_smartlink_subscribed(smartlink_id, tg_id) if allow_remind else False
+    subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
     await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
     await message.answer("Текст обновлён.", reply_markup=await user_menu_keyboard(tg_id))
     await form_clear(tg_id)
 
 
-ATTRIBUTION_HTML = 'Сделано с помощью <a href="https://t.me/iskramusic_bot">ИСКРЫ</a>'
+ATTRIBUTION_HTML = 'Создано с помощью <a href="https://t.me/iskramusic_bot">ИСКРА</a>'
 
 
 def build_copy_links_text(smartlink: dict) -> str:
@@ -1481,6 +1484,14 @@ def smartlink_pre_save_active(smartlink: dict) -> bool:
 def smartlink_can_remind(smartlink: dict) -> bool:
     rd = parse_date(smartlink.get("release_date") or "") if smartlink else None
     return bool(rd and rd > dt.date.today() and smartlink.get("reminders_enabled", True))
+
+
+async def get_release_reminder_state(tg_id: int, smartlink_id: int, allow_remind: bool) -> bool:
+    if not allow_remind:
+        return False
+    if await is_smartlink_reminder_set(tg_id, smartlink_id):
+        return True
+    return await is_smartlink_subscribed(smartlink_id, tg_id)
 
 
 async def send_smartlink_photo(
@@ -2517,7 +2528,7 @@ async def smartlink_open_cb(callback):
         return
 
     allow_remind = smartlink_can_remind(existing)
-    subscribed = await is_smartlink_subscribed(existing.get("id"), tg_id) if allow_remind else False
+    subscribed = await get_release_reminder_state(tg_id, existing.get("id"), allow_remind)
     await send_smartlink_photo(callback.message.bot, tg_id, existing, subscribed=subscribed, allow_remind=allow_remind)
 
     inline_keyboard = []
@@ -2753,9 +2764,49 @@ async def smartlink_toggle_cb(callback):
         await callback.answer("Релиз уже сегодня или прошёл", show_alert=True)
         return
 
-    current = await is_smartlink_subscribed(smartlink_id, tg_id)
+    current = await get_release_reminder_state(tg_id, smartlink_id, True)
+    if current:
+        await remove_smartlink_reminder(tg_id, smartlink_id)
+    else:
+        await add_smartlink_reminder(tg_id, smartlink_id)
     await set_smartlink_subscription(smartlink_id, tg_id, not current)
     allow_remind = smartlink_can_remind(smartlink)
+    kb = build_smartlink_keyboard(smartlink, subscribed=not current, can_remind=allow_remind)
+    caption = build_smartlink_caption(smartlink)
+    await safe_edit_caption(callback.message, caption, kb)
+    await callback.answer("Напомню" if not current else "Напоминание выключено")
+
+
+@dp.callback_query(F.data.startswith("smartrem:"))
+async def smartlink_release_reminder_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 3 or parts[2] != "toggle":
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_id_raw = parts[1]
+    if not smartlink_id_raw.isdigit():
+        await callback.answer("Ссылка не найдена", show_alert=True)
+        return
+    smartlink_id = int(smartlink_id_raw)
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        await callback.answer("Ссылка не найдена", show_alert=True)
+        return
+    allow_remind = smartlink_can_remind(smartlink)
+    if not allow_remind:
+        await callback.answer("Релиз уже сегодня или прошёл", show_alert=True)
+        return
+
+    current = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
+    if current:
+        await remove_smartlink_reminder(tg_id, smartlink_id)
+        await set_smartlink_subscription(smartlink_id, tg_id, False)
+    else:
+        await add_smartlink_reminder(tg_id, smartlink_id)
+        await set_smartlink_subscription(smartlink_id, tg_id, True)
+
     kb = build_smartlink_keyboard(smartlink, subscribed=not current, can_remind=allow_remind)
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
