@@ -1,6 +1,7 @@
 import datetime as dt
 import html
 import logging
+import re
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup, Message
@@ -48,16 +49,32 @@ def parse_date(date_str: str) -> dt.date | None:
     if not s:
         return None
     try:
-        if "-" in s:
-            y, m, d = s.split("-")
-            return dt.date(int(y), int(m), int(d))
-        if "." in s:
-            d, m, y = s.split(".")
-            return dt.date(int(y), int(m), int(d))
+        normalized = re.sub(r"[\s,/-]+", ".", s)
+        if normalized:
+            parts = normalized.split(".")
+            if len(parts) == 3:
+                first, second, third = parts
+                if len(first) == 4:
+                    y, m, d = first, second, third
+                else:
+                    d, m, y = first, second, third
+                return dt.date(int(y), int(m), int(d))
     except Exception:
         logger.warning("[parse_date] failed to parse raw='%s'", date_str)
         return None
     return None
+
+
+def smartlink_pre_save_active(smartlink: dict) -> bool:
+    if not smartlink:
+        return False
+    rd = parse_date(smartlink.get("release_date") or "")
+    return bool(rd and rd > dt.date.today() and smartlink.get("pre_save_enabled", True))
+
+
+def smartlink_can_remind(smartlink: dict) -> bool:
+    rd = parse_date(smartlink.get("release_date") or "") if smartlink else None
+    return bool(rd and rd > dt.date.today() and smartlink.get("reminders_enabled", True))
 
 
 async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMarkup | None) -> Message | None:
