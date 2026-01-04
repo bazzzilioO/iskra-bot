@@ -93,6 +93,7 @@ from helpers import (
     escape_html,
     format_date_ru,
     parse_date,
+    push_smartlink_to_index,
     safe_edit,
     safe_edit_caption,
     smartlink_can_remind,
@@ -423,6 +424,9 @@ POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "60"))
 NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30"))
 # Optional API key for smartlink read-only endpoint
 SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
+SMARTLINK_INDEX_URL = os.getenv(
+    "SMARTLINK_INDEX_URL", "https://go.sreda.pw/api/index/upsert"
+)
 GO_INDEX_BASE = os.getenv("GO_INDEX_BASE", "https://go.sreda.pw")
 # HTTP timeout must be numeric: aiogram adds it to polling_timeout internally.
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_TOTAL", "90"))
@@ -1492,6 +1496,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "branding_disabled": bool(data.get("branding_disabled")),
             "created_at": dt.datetime.utcnow().isoformat(),
         }
+        await push_smartlink_to_index(smartlink)
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         try:
@@ -1754,6 +1759,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "branding_disabled": bool(latest.get("branding_disabled")),
             "created_at": dt.datetime.utcnow().isoformat(),
         }
+        await push_smartlink_to_index(smartlink)
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)

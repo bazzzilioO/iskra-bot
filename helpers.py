@@ -1,7 +1,11 @@
 import datetime as dt
 import html
+import json
 import logging
+import os
 import re
+
+import aiohttp
 
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup, Message
@@ -92,3 +96,66 @@ async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMa
         except Exception as answer_err:
             print(f"[safe_edit_caption] edit failed: {edit_err}; answer failed: {answer_err}")
             return None
+
+
+def _slugify(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"[ _]+", "-", value)
+    value = re.sub(r"[^a-z0-9-]", "", value)
+    value = re.sub(r"-{2,}", "-", value)
+    return value.strip("-")
+
+
+async def push_smartlink_to_index(smartlink: dict) -> None:
+    index_url = os.getenv("SMARTLINK_INDEX_URL", "https://go.sreda.pw/api/index/upsert")
+    api_key = os.getenv("SMARTLINK_API_KEY")
+    if not index_url:
+        logger.info("[smartlink-index] index url is not configured, skipping")
+        return
+
+    artist_raw = (smartlink or {}).get("artist") or ""
+    artist_slug = (smartlink or {}).get("artist_slug") or _slugify(artist_raw)
+    if not artist_slug:
+        artist_slug = f"artist-{smartlink.get('id') if smartlink else 'unknown'}"
+
+    title_raw = (smartlink or {}).get("title") or ""
+    slug = (smartlink or {}).get("slug") or _slugify(title_raw)
+    if not slug:
+        slug = f"release-{smartlink.get('id') if smartlink else 'unknown'}"
+
+    artist_name = (smartlink or {}).get("artist_name") or artist_raw
+    if not artist_name and artist_slug:
+        artist_name = artist_slug.replace("-", " ").upper()
+
+    links = (smartlink or {}).get("links") or {}
+    payload = {
+        "id": str((smartlink or {}).get("id")),
+        "artist_slug": artist_slug,
+        "slug": slug,
+        "title": title_raw,
+        "artist_name": artist_name,
+        "release_date": (smartlink or {}).get("release_date"),
+        "cover_source": (smartlink or {}).get("cover_source"),
+        "links_json": json.dumps(links, ensure_ascii=False),
+    }
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["X-API-Key"] = api_key
+
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(index_url, headers=headers, json=payload) as resp:
+                if 200 <= resp.status < 300:
+                    logger.info("Indexed smartlink: %s/%s", artist_slug, slug)
+                    return
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = None
+                logger.warning(
+                    "[smartlink-index] failed status=%s body=%s", resp.status, body
+                )
+    except Exception as err:
+        logger.warning("[smartlink-index] request error: %s", err)
