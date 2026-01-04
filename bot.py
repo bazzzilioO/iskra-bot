@@ -421,6 +421,8 @@ PORT = int(os.getenv("PORT", "8000"))
 POLLING_LOCK_FILE = os.getenv("POLLING_LOCK_FILE", "/tmp/iskra_bot_polling.lock")
 POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "60"))
 NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30"))
+# Optional API key for smartlink read-only endpoint
+SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
 # HTTP timeout must be numeric: aiogram adds it to polling_timeout internally.
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_TOTAL", "90"))
 POLLING_BACKOFF_CONFIG = BackoffConfig(
@@ -505,9 +507,41 @@ async def health_handler(request: web.Request) -> web.Response:
     return web.json_response(HEALTH_STATE)
 
 
+async def smartlink_api_handler(request: web.Request) -> web.Response:
+    if SMARTLINK_API_KEY:
+        api_key = request.headers.get("X-API-Key")
+        if api_key != SMARTLINK_API_KEY:
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+    try:
+        smartlink_id = int(request.match_info.get("id", ""))
+    except ValueError:
+        return web.json_response({"error": "not_found"}, status=404)
+
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        return web.json_response({"error": "not_found"}, status=404)
+
+    response = {
+        "id": smartlink.get("id"),
+        "artist": smartlink.get("artist"),
+        "title": smartlink.get("title"),
+        "release_date": smartlink.get("release_date"),
+        "cover_file_id": smartlink.get("cover_file_id"),
+        "links": smartlink.get("links"),
+        "caption_text": smartlink.get("caption_text"),
+    }
+    return web.json_response(response)
+
+
 async def start_health_server() -> web.AppRunner:
     app = web.Application()
-    app.add_routes([web.get("/health", health_handler)])
+    app.add_routes(
+        [
+            web.get("/health", health_handler),
+            web.get("/api/smartlink/{id}", smartlink_api_handler),
+        ]
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
