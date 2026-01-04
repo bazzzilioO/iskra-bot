@@ -535,12 +535,35 @@ async def smartlink_api_handler(request: web.Request) -> web.Response:
     return web.json_response(response)
 
 
+async def smartlink_latest_api_handler(request: web.Request) -> web.Response:
+    if SMARTLINK_API_KEY:
+        api_key = request.headers.get("X-API-Key")
+        if api_key != SMARTLINK_API_KEY:
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+    smartlink = await get_latest_smartlink()
+    if not smartlink:
+        return web.json_response({"error": "not_found"}, status=404)
+
+    response = {
+        "id": smartlink.get("id"),
+        "artist": smartlink.get("artist"),
+        "title": smartlink.get("title"),
+        "release_date": smartlink.get("release_date"),
+        "cover_file_id": smartlink.get("cover_file_id"),
+        "links": smartlink.get("links"),
+        "caption_text": smartlink.get("caption_text"),
+    }
+    return web.json_response(response)
+
+
 async def start_health_server() -> web.AppRunner:
     app = web.Application()
     app.add_routes(
         [
             web.get("/health", health_handler),
             web.get("/api/smartlink/{id}", smartlink_api_handler),
+            web.get("/api/smartlink/latest", smartlink_latest_api_handler),
         ]
     )
     runner = web.AppRunner(app)
