@@ -423,6 +423,7 @@ POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "60"))
 NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30"))
 # Optional API key for smartlink read-only endpoint
 SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
+GO_INDEX_BASE = os.getenv("GO_INDEX_BASE", "https://go.sreda.pw")
 # HTTP timeout must be numeric: aiogram adds it to polling_timeout internally.
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_TOTAL", "90"))
 POLLING_BACKOFF_CONFIG = BackoffConfig(
@@ -1271,6 +1272,35 @@ def log_smartlink_step(tg_id: int, step: int, field: str, skipped: bool):
     )
 
 
+def slugify(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"[ _]+", "-", value)
+    value = re.sub(r"[^a-z0-9-]", "", value)
+    value = re.sub(r"-{2,}", "-", value)
+    return value.strip("-")
+
+
+async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | None]:
+    url = f"{GO_INDEX_BASE.rstrip('/')}/api/index/upsert"
+    headers = {"Content-Type": "application/json"}
+    if SMARTLINK_API_KEY:
+        headers["X-API-Key"] = SMARTLINK_API_KEY
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                status = resp.status
+                if 200 <= status < 300:
+                    return True, status, None
+                try:
+                    error_text = await resp.text()
+                except Exception:
+                    error_text = None
+                return False, status, error_text
+    except Exception as e:
+        return False, None, str(e)
+
+
 
 def _is_valid_url(url: str) -> bool:
     try:
@@ -1404,6 +1434,29 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             caption_text,
             bool(data.get("branding_disabled")),
         )
+        artist_slug = slugify(artist)
+        slug = slugify(title)
+        if not artist_slug:
+            artist_slug = f"release-{smartlink_id}"
+        if not slug:
+            slug = f"release-{smartlink_id}"
+        sync_payload = {
+            "id": str(smartlink_id),
+            "artist_slug": artist_slug,
+            "slug": slug,
+            "title": title,
+            "artist_name": artist,
+            "release_date": release_iso,
+            "links": links_clean,
+        }
+        sync_ok, sync_status, sync_error = await sync_smartlink_to_web(sync_payload)
+        if not sync_ok:
+            logger.warning(
+                "[smartlink] sync to web failed smartlink_id=%s status=%s error=%s",
+                smartlink_id,
+                sync_status,
+                sync_error,
+            )
         smartlink = {
             "id": smartlink_id,
             "owner_tg_id": tg_id,
@@ -1435,12 +1488,19 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             await _send_smartlink_fallback(message.bot, tg_id, smartlink)
         platforms_text = ", ".join(platform_label(k) for k, v in links_clean.items() if v)
         rd_text = format_date_ru(parse_date(release_iso)) if release_iso else "—"
+        web_url = f"{GO_INDEX_BASE.rstrip('/')}/{artist_slug}/{slug}"
         summary_lines = [
             "Смартлинк готов ✅",
             f"Артист: {artist or '—'}",
             f"Релиз: {title or '—'}",
             f"Дата: {rd_text if rd_text else '—'}",
             f"Площадки: {platforms_text or '—'}",
+            f"🌐 Web: {web_url}",
+            (
+                "🔄 Sync: ok"
+                if sync_ok
+                else f"🔄 Sync: fail (status={sync_status}, error={sync_error})"
+            ),
         ]
         await _update_prompt_message(
             message,
