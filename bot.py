@@ -1494,9 +1494,19 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "links": links_clean,
             "caption_text": caption_text,
             "branding_disabled": bool(data.get("branding_disabled")),
+            "artist_slug": artist_slug,
+            "slug": slug,
             "created_at": dt.datetime.utcnow().isoformat(),
         }
-        await push_smartlink_to_index(smartlink)
+        try:
+            await push_smartlink_to_index(smartlink)
+        except Exception:
+            logger.exception(
+                "[smartlink] indexing failed smartlink_id=%s artist_slug=%s slug=%s",
+                smartlink_id,
+                artist_slug,
+                slug,
+            )
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         try:
@@ -1747,6 +1757,13 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             latest.get("caption_text", "") or "",
             bool(latest.get("branding_disabled")),
         )
+        artist_slug = slugify(latest.get("artist", ""))
+        slug = slugify(latest.get("title", ""))
+        if not artist_slug:
+            artist_slug = f"artist-{smartlink_id}"
+        if not slug:
+            slug = f"release-{smartlink_id}"
+
         smartlink = {
             "id": smartlink_id,
             "owner_tg_id": tg_id,
@@ -1757,9 +1774,19 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "links": links,
             "caption_text": latest.get("caption_text", "") or "",
             "branding_disabled": bool(latest.get("branding_disabled")),
+            "artist_slug": artist_slug,
+            "slug": slug,
             "created_at": dt.datetime.utcnow().isoformat(),
         }
-        await push_smartlink_to_index(smartlink)
+        try:
+            await push_smartlink_to_index(smartlink)
+        except Exception:
+            logger.exception(
+                "[smartlink] indexing failed smartlink_id=%s artist_slug=%s slug=%s",
+                smartlink_id,
+                artist_slug,
+                slug,
+            )
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
