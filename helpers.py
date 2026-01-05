@@ -18,6 +18,18 @@ def escape_html(text: str | None) -> str:
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_SMARTLINK_BASE = "https://go.sreda.pw"
+
+
+def normalize_base_url(base: str | None, default: str = DEFAULT_SMARTLINK_BASE) -> str:
+    base = (base or "").strip()
+    if not base:
+        base = default
+    if not re.match(r"^https?://", base):
+        base = f"https://{base}"
+    return base.rstrip("/")
+
+
 def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
     if isinstance(value, dt.datetime):
         value = value.date()
@@ -106,13 +118,7 @@ def _slugify(value: str) -> str:
     return value.strip("-")
 
 
-async def push_smartlink_to_index(smartlink: dict) -> None:
-    index_url = os.getenv("SMARTLINK_INDEX_URL", "https://go.sreda.pw/api/index/upsert")
-    api_key = os.getenv("SMARTLINK_API_KEY")
-    if not index_url:
-        logger.info("[smartlink-index] index url is not configured, skipping")
-        return
-
+def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     artist_raw = (smartlink or {}).get("artist") or ""
     artist_slug = (smartlink or {}).get("artist_slug") or _slugify(artist_raw)
     if not artist_slug:
@@ -122,6 +128,21 @@ async def push_smartlink_to_index(smartlink: dict) -> None:
     slug = (smartlink or {}).get("slug") or _slugify(title_raw)
     if not slug:
         slug = f"release-{smartlink.get('id') if smartlink else 'unknown'}"
+
+    return artist_slug, slug
+
+
+async def push_smartlink_to_index(smartlink: dict) -> bool:
+    base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), DEFAULT_SMARTLINK_BASE)
+    index_url = f"{base_url}/api/index/upsert"
+    api_key = os.getenv("SMARTLINK_API_KEY")
+    if not index_url:
+        logger.info("[smartlink-index] index url is not configured, skipping")
+        return False
+
+    artist_slug, slug = get_smartlink_slugs(smartlink)
+    artist_raw = (smartlink or {}).get("artist") or ""
+    title_raw = (smartlink or {}).get("title") or ""
 
     artist_name = (smartlink or {}).get("artist_name") or artist_raw
     if not artist_name and artist_slug:
@@ -149,7 +170,7 @@ async def push_smartlink_to_index(smartlink: dict) -> None:
             async with session.post(index_url, headers=headers, json=payload) as resp:
                 if 200 <= resp.status < 300:
                     logger.info("Indexed smartlink: %s/%s", artist_slug, slug)
-                    return
+                    return True
                 try:
                     body = await resp.text()
                 except Exception:
@@ -159,3 +180,4 @@ async def push_smartlink_to_index(smartlink: dict) -> None:
                 )
     except Exception as err:
         logger.warning("[smartlink-index] request error: %s", err)
+    return False

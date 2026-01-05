@@ -469,6 +469,8 @@ def build_smartlink_buttons(
     subscribed: bool = False,
     can_remind: bool = False,
     page: int | None = None,
+    web_url: str | None = None,
+    can_update_web: bool = False,
 ) -> InlineKeyboardMarkup | None:
     rows: list[list[InlineKeyboardButton]] = []
     links = smartlink.get("links") or {}
@@ -489,6 +491,19 @@ def build_smartlink_buttons(
     if can_remind:
         toggle_text = "🔕 Не напоминать" if subscribed else "🔔 Напомнить о релизе"
         rows.append([InlineKeyboardButton(text=toggle_text, callback_data=f"smartrem:{smartlink.get('id')}:toggle")])
+
+    if web_url:
+        rows.append([InlineKeyboardButton(text="🌐 Открыть web", url=web_url)])
+
+    if can_update_web:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔁 Обновить web",
+                    callback_data=f"smartlinks:reindex:{smartlink.get('id')}:{page_marker}",
+                )
+            ]
+        )
 
     if platform_rows:
         rows.append([InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink.get('id')}")])
@@ -514,12 +529,16 @@ def build_smartlink_keyboard(
     subscribed: bool = False,
     can_remind: bool = False,
     page: int | None = None,
+    web_url: str | None = None,
+    can_update_web: bool = False,
 ) -> InlineKeyboardMarkup | None:
     return build_smartlink_buttons(
         smartlink,
         subscribed=subscribed,
         can_remind=can_remind,
         page=page,
+        web_url=web_url,
+        can_update_web=can_update_web,
     )
 
 
