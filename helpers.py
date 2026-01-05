@@ -178,10 +178,20 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
             cover_url = candidate
             break
 
+    cover_source_payload: dict | None = None
+    cover_source_type = "none"
+
     if cover_url:
-        logger.info("[smartlink-index] cover_url included")
+        cover_source_type = "external"
     else:
-        logger.info("[smartlink-index] cover_url missing or invalid, skipping")
+        cover_file_id = (smartlink or {}).get("cover_file_id")
+        if isinstance(cover_file_id, str):
+            cover_file_id = cover_file_id.strip()
+            if cover_file_id:
+                cover_source_type = "telegram"
+                cover_source_payload = {"type": "telegram", "file_id": cover_file_id}
+
+    logger.info("[smartlink-index] cover source=%s", cover_source_type)
 
     payload = {
         "artist_slug": artist_slug,
@@ -196,6 +206,8 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
 
     if cover_url:
         payload["cover_url"] = cover_url
+    elif cover_source_payload:
+        payload["cover_source"] = cover_source_payload
 
     return payload
 
