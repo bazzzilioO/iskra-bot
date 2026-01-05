@@ -95,6 +95,7 @@ from helpers import (
     parse_date,
     normalize_base_url,
     get_smartlink_slugs,
+    build_smartlink_index_payload,
     push_smartlink_to_index,
     safe_edit,
     safe_edit_caption,
@@ -1315,29 +1316,34 @@ def slugify(value: str) -> str:
 
 
 async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | None]:
+    if not payload or not payload.get("artist_slug") or not payload.get("slug"):
+        logger.warning("[smartlink-index] invalid payload slugs, skipping send")
+        return False, None, "missing_slugs"
+
+    links = payload.get("links")
+    if not isinstance(links, dict):
+        logger.warning("[smartlink-index] invalid links payload type=%s", type(links))
+        return False, None, "links_invalid"
+
     url = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
     headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
     if SMARTLINK_API_KEY:
         headers["X-API-Key"] = SMARTLINK_API_KEY
     timeout = aiohttp.ClientTimeout(total=15)
+    logger.info("[smartlink-index] outgoing payload=%s", json.dumps(payload, ensure_ascii=False))
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=headers, json=payload) as resp:
                 status = resp.status
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = None
+                truncated_body = body[:1000] if body else body
+                logger.info("[smartlink-index] worker response status=%s body=%s", status, truncated_body)
                 if 200 <= status < 300:
                     return True, status, None
-                try:
-                    error_text = await resp.text()
-                except Exception:
-                    error_text = None
-                truncated_error = error_text[:1000] if error_text else error_text
-                logger.warning(
-                    "[smartlink-index] non-200 response url=%s status=%s body=%s",
-                    url,
-                    status,
-                    truncated_error,
-                )
-                return False, status, error_text
+                return False, status, body
     except Exception as e:
         return False, None, str(e)
 
@@ -1477,25 +1483,6 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         )
         artist_slug = slugify(artist)
         slug = slugify(title)
-        if artist_slug and slug:
-            sync_payload = {
-                "artist_slug": artist_slug,
-                "slug": slug,
-                "title": title,
-                "artist_name": artist,
-                "release_date": release_iso,
-                "links": links_clean,
-            }
-            sync_ok, sync_status, sync_error = await sync_smartlink_to_web(sync_payload)
-        else:
-            sync_ok, sync_status, sync_error = False, None, "artist_slug or slug missing"
-        if not sync_ok:
-            logger.warning(
-                "[smartlink] sync to web failed smartlink_id=%s status=%s error=%s",
-                smartlink_id,
-                sync_status,
-                sync_error,
-            )
         smartlink = {
             "id": smartlink_id,
             "owner_tg_id": tg_id,
@@ -1510,6 +1497,18 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "slug": slug,
             "created_at": dt.datetime.utcnow().isoformat(),
         }
+        sync_payload = build_smartlink_index_payload(smartlink)
+        if sync_payload:
+            sync_ok, sync_status, sync_error = await sync_smartlink_to_web(sync_payload)
+        else:
+            sync_ok, sync_status, sync_error = False, None, "payload_invalid"
+        if not sync_ok:
+            logger.warning(
+                "[smartlink] sync to web failed smartlink_id=%s status=%s error=%s",
+                smartlink_id,
+                sync_status,
+                sync_error,
+            )
         try:
             await push_smartlink_to_index(smartlink)
         except Exception:

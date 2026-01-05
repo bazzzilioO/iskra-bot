@@ -128,6 +128,43 @@ def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     return artist_slug, slug
 
 
+def build_smartlink_index_payload(smartlink: dict) -> dict | None:
+    artist_slug, slug = get_smartlink_slugs(smartlink)
+    if not artist_slug or not slug:
+        logger.warning(
+            "[smartlink-index] missing slugs, skipping sync artist_slug=%s slug=%s",
+            artist_slug,
+            slug,
+        )
+        return None
+
+    raw_links = (smartlink or {}).get("links")
+    if raw_links is None:
+        links: dict[str, str] = {}
+    elif isinstance(raw_links, dict):
+        invalid_keys = [k for k, v in raw_links.items() if not isinstance(v, str)]
+        if invalid_keys:
+            logger.warning(
+                "[smartlink-index] links malformed (non-string values) keys=%s", invalid_keys
+            )
+            return None
+        links = {k: v.strip() for k, v in raw_links.items() if isinstance(v, str) and v.strip()}
+    else:
+        logger.warning("[smartlink-index] links malformed type=%s", type(raw_links))
+        return None
+
+    return {
+        "artist_slug": artist_slug,
+        "slug": slug,
+        "title": (smartlink or {}).get("title") or "",
+        "artist_name": (smartlink or {}).get("artist_name")
+        or (smartlink or {}).get("artist")
+        or "",
+        "release_date": (smartlink or {}).get("release_date") or None,
+        "links": links,
+    }
+
+
 async def push_smartlink_to_index(smartlink: dict) -> bool:
     base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), DEFAULT_SMARTLINK_BASE)
     index_url = f"{base_url}/api/index/upsert"
@@ -136,54 +173,32 @@ async def push_smartlink_to_index(smartlink: dict) -> bool:
         logger.info("[smartlink-index] index url is not configured, skipping")
         return False
 
-    artist_slug, slug = get_smartlink_slugs(smartlink)
-    if not artist_slug or not slug:
-        logger.warning(
-            "[smartlink-index] missing slugs, skipping sync artist_slug=%s slug=%s",
-            artist_slug,
-            slug,
-        )
+    payload = build_smartlink_index_payload(smartlink)
+    if not payload:
+        logger.warning("[smartlink-index] payload invalid, skipping send")
         return False
-    artist_raw = (smartlink or {}).get("artist") or ""
-    title_raw = (smartlink or {}).get("title") or ""
-
-    artist_name = (smartlink or {}).get("artist_name") or artist_raw
-    if not artist_name and artist_slug:
-        artist_name = artist_slug.replace("-", " ").upper()
-
-    links = (smartlink or {}).get("links") or {}
-    payload = {
-        "artist_slug": artist_slug,
-        "slug": slug,
-        "title": title_raw,
-        "artist_name": artist_name,
-        "release_date": (smartlink or {}).get("release_date"),
-        "cover_source": (smartlink or {}).get("cover_source"),
-        "links_json": json.dumps(links, ensure_ascii=False),
-    }
 
     headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
     if api_key:
         headers["X-API-Key"] = api_key
 
     timeout = aiohttp.ClientTimeout(total=15)
+    logger.info("[smartlink-index] outgoing payload=%s", json.dumps(payload, ensure_ascii=False))
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(index_url, headers=headers, json=payload) as resp:
-                if 200 <= resp.status < 300:
-                    logger.info("Indexed smartlink: %s/%s", artist_slug, slug)
-                    return True
                 try:
                     body = await resp.text()
                 except Exception:
                     body = None
                 truncated_body = (body[:1000] if body else body)
-                logger.warning(
-                    "[smartlink-index] failed url=%s status=%s body=%s",
-                    index_url,
+                logger.info(
+                    "[smartlink-index] worker response status=%s body=%s",
                     resp.status,
                     truncated_body,
                 )
+                if 200 <= resp.status < 300:
+                    return True
     except Exception as err:
         logger.warning("[smartlink-index] request error: %s", err)
     return False
