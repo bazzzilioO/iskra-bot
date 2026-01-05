@@ -93,6 +93,8 @@ from helpers import (
     escape_html,
     format_date_ru,
     parse_date,
+    normalize_base_url,
+    get_smartlink_slugs,
     push_smartlink_to_index,
     safe_edit,
     safe_edit_caption,
@@ -224,12 +226,16 @@ def build_smartlink_keyboard(
     subscribed: bool = False,
     can_remind: bool = False,
     page: int | None = None,
+    web_url: str | None = None,
+    can_update_web: bool = False,
 ) -> InlineKeyboardMarkup | None:
     return build_smartlink_buttons(
         smartlink,
         subscribed=subscribed,
         can_remind=can_remind,
         page=page,
+        web_url=web_url,
+        can_update_web=can_update_web,
     )
 
 
@@ -424,10 +430,11 @@ POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "60"))
 NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30"))
 # Optional API key for smartlink read-only endpoint
 SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
-SMARTLINK_INDEX_URL = os.getenv(
-    "SMARTLINK_INDEX_URL", "https://go.sreda.pw/api/index/upsert"
+SMARTLINK_INDEX_BASE = normalize_base_url(
+    os.getenv("SMARTLINK_INDEX_BASE") or os.getenv("GO_INDEX_BASE"),
+    "https://go.sreda.pw",
 )
-GO_INDEX_BASE = os.getenv("GO_INDEX_BASE", "https://go.sreda.pw")
+SMARTLINK_INDEX_URL = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
 # HTTP timeout must be numeric: aiogram adds it to polling_timeout internally.
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_TOTAL", "90"))
 POLLING_BACKOFF_CONFIG = BackoffConfig(
@@ -1308,7 +1315,7 @@ def slugify(value: str) -> str:
 
 
 async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | None]:
-    url = f"{GO_INDEX_BASE.rstrip('/')}/api/index/upsert"
+    url = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
     headers = {"Content-Type": "application/json"}
     if SMARTLINK_API_KEY:
         headers["X-API-Key"] = SMARTLINK_API_KEY
@@ -1526,7 +1533,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             await _send_smartlink_fallback(message.bot, tg_id, smartlink)
         platforms_text = ", ".join(platform_label(k) for k, v in links_clean.items() if v)
         rd_text = format_date_ru(parse_date(release_iso)) if release_iso else "—"
-        web_url = f"{GO_INDEX_BASE.rstrip('/')}/{artist_slug}/{slug}"
+        web_url = f"{SMARTLINK_INDEX_BASE}/{artist_slug}/{slug}"
         summary_lines = [
             "Смартлинк готов ✅",
             f"Артист: {artist or '—'}",
@@ -1906,12 +1913,17 @@ async def send_smartlink_photo(
     page: int | None = None,
 ):
     try:
+        artist_slug, slug = get_smartlink_slugs(smartlink)
+        web_url = f"{SMARTLINK_INDEX_BASE}/{artist_slug}/{slug}" if SMARTLINK_INDEX_BASE else None
+        is_admin = bool(ADMIN_TG_ID and str(chat_id) == str(ADMIN_TG_ID))
         caption = build_smartlink_caption(smartlink, release_today=release_today)
         kb = build_smartlink_keyboard(
             smartlink,
             subscribed=subscribed,
             can_remind=allow_remind,
             page=page,
+            web_url=web_url,
+            can_update_web=is_admin,
         )
     except Exception:
         logger.exception("[smartlink] render failed smartlink_id=%s", smartlink.get("id"))
@@ -2655,7 +2667,11 @@ async def smartlinks_view_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink_id = int(parts[2])
+    try:
+        smartlink_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
     page = int(parts[3])
     await show_smartlink_view(callback.message, tg_id, smartlink_id, page)
     await callback.answer()
@@ -2669,7 +2685,11 @@ async def smartlinks_open_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink_id = int(parts[2])
+    try:
+        smartlink_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
     page = int(parts[3])
     smartlink = await get_owned_smartlink(tg_id, smartlink_id)
     if not smartlink:
@@ -2687,7 +2707,11 @@ async def smartlinks_refresh_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink_id = int(parts[2])
+    try:
+        smartlink_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
     page = int(parts[3])
     smartlink = await get_owned_smartlink(tg_id, smartlink_id)
     if not smartlink:
@@ -2714,6 +2738,40 @@ async def smartlinks_refresh_cb(callback):
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Карточка обновлена")
+
+
+@dp.callback_query(F.data.startswith("smartlinks:reindex:"))
+async def smartlinks_reindex_cb(callback):
+    tg_id = callback.from_user.id
+    if ADMIN_TG_ID and str(tg_id) != str(ADMIN_TG_ID):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+
+    try:
+        smartlink_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    try:
+        success = await push_smartlink_to_index(smartlink)
+    except Exception:
+        logger.exception("[smartlink] reindex failed smartlink_id=%s", smartlink_id)
+        success = False
+
+    if success:
+        await callback.answer("✅ Web обновлён", show_alert=True)
+    else:
+        await callback.answer("❌ Не удалось обновить web (см. логи)", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("smartlinks:delete:"))
