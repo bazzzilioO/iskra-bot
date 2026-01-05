@@ -153,7 +153,37 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
         logger.warning("[smartlink-index] links malformed type=%s", type(raw_links))
         return None
 
-    return {
+    cover_url_candidates: list[str] = []
+    direct_cover_url = (smartlink or {}).get("cover_url")
+    if isinstance(direct_cover_url, str):
+        cover_url_candidates.append(direct_cover_url.strip())
+
+    metadata = (smartlink or {}).get("metadata")
+    if isinstance(metadata, dict):
+        meta_cover_url = metadata.get("cover_url")
+        if isinstance(meta_cover_url, str):
+            cover_url_candidates.append(meta_cover_url.strip())
+        sources = metadata.get("sources")
+        if isinstance(sources, dict):
+            for source_meta in sources.values():
+                if not isinstance(source_meta, dict):
+                    continue
+                source_cover = source_meta.get("cover_url")
+                if isinstance(source_cover, str):
+                    cover_url_candidates.append(source_cover.strip())
+
+    cover_url: str | None = None
+    for candidate in cover_url_candidates:
+        if candidate and re.match(r"^https?://", candidate):
+            cover_url = candidate
+            break
+
+    if cover_url:
+        logger.info("[smartlink-index] cover_url included")
+    else:
+        logger.info("[smartlink-index] cover_url missing or invalid, skipping")
+
+    payload = {
         "artist_slug": artist_slug,
         "slug": slug,
         "title": (smartlink or {}).get("title") or "",
@@ -163,6 +193,11 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
         "release_date": (smartlink or {}).get("release_date") or None,
         "links": links,
     }
+
+    if cover_url:
+        payload["cover_url"] = cover_url
+
+    return payload
 
 
 async def push_smartlink_to_index(smartlink: dict) -> bool:
