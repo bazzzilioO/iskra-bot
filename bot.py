@@ -3736,6 +3736,68 @@ async def label_start_cb(callback):
 
 # -------------------- Form router --------------------
 
+
+async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
+    """Handle lazy Telegram cover upgrade when a photo is sent outside forms.
+
+    Returns True if the photo was processed (including skipped with logging),
+    False if the message was not a photo and should be handled elsewhere.
+    """
+
+    if not message.photo:
+        return False
+
+    tg_id = message.from_user.id
+    latest = await get_latest_smartlink(tg_id)
+
+    if not latest:
+        logger.info("[cover-upgrade] skip: no smartlink context tg_id=%s", tg_id)
+        return True
+
+    cover_source = latest.get("cover_source") if isinstance(latest.get("cover_source"), dict) else {}
+    cover_file_id = (latest.get("cover_file_id") or "").strip()
+    if (cover_source.get("type") or cover_file_id):
+        logger.info(
+            "[cover-upgrade] skip: cover already exists smartlink_id=%s", latest.get("id")
+        )
+        return True
+
+    file_id = message.photo[-1].file_id if message.photo else ""
+    if not file_id or file_id.isdigit():
+        logger.info(
+            "[cover-upgrade] skip: invalid file_id smartlink_id=%s file_id=%s",
+            latest.get("id"),
+            file_id,
+        )
+        return True
+
+    updates = {
+        "cover_file_id": file_id,
+        "cover_source": {"type": "telegram", "file_id": file_id},
+    }
+
+    try:
+        await update_smartlink_data(latest["id"], tg_id, updates)
+        latest.update(updates)
+        logger.info(
+            "[cover-upgrade] success smartlink_id=%s file_id=%s", latest.get("id"), file_id
+        )
+    except Exception:
+        logger.exception(
+            "[cover-upgrade] failed to save cover smartlink_id=%s", latest.get("id")
+        )
+        return True
+
+    try:
+        await push_smartlink_to_index(latest)
+    except Exception:
+        logger.exception(
+            "[cover-upgrade] indexing failed smartlink_id=%s", latest.get("id")
+        )
+
+    return True
+
+
 @dp.message()
 async def any_message_router(message: Message):
     tg_id = message.from_user.id
@@ -3745,6 +3807,8 @@ async def any_message_router(message: Message):
     txt = (message.text or "").strip()
 
     if not form:
+        if await maybe_upgrade_smartlink_cover_from_photo(message):
+            return
         if not txt or txt.startswith("/"):
             return
 
