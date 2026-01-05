@@ -121,13 +121,9 @@ def _slugify(value: str) -> str:
 def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     artist_raw = (smartlink or {}).get("artist") or ""
     artist_slug = (smartlink or {}).get("artist_slug") or _slugify(artist_raw)
-    if not artist_slug:
-        artist_slug = f"artist-{smartlink.get('id') if smartlink else 'unknown'}"
 
     title_raw = (smartlink or {}).get("title") or ""
     slug = (smartlink or {}).get("slug") or _slugify(title_raw)
-    if not slug:
-        slug = f"release-{smartlink.get('id') if smartlink else 'unknown'}"
 
     return artist_slug, slug
 
@@ -141,6 +137,13 @@ async def push_smartlink_to_index(smartlink: dict) -> bool:
         return False
 
     artist_slug, slug = get_smartlink_slugs(smartlink)
+    if not artist_slug or not slug:
+        logger.warning(
+            "[smartlink-index] missing slugs, skipping sync artist_slug=%s slug=%s",
+            artist_slug,
+            slug,
+        )
+        return False
     artist_raw = (smartlink or {}).get("artist") or ""
     title_raw = (smartlink or {}).get("title") or ""
 
@@ -150,7 +153,6 @@ async def push_smartlink_to_index(smartlink: dict) -> bool:
 
     links = (smartlink or {}).get("links") or {}
     payload = {
-        "id": str((smartlink or {}).get("id")),
         "artist_slug": artist_slug,
         "slug": slug,
         "title": title_raw,
