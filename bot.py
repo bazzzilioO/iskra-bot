@@ -1434,6 +1434,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         title = data.get("title") or ""
         release_iso = data.get("release_date") or ""
         cover_file_id = data.get("cover_file_id") or ""
+        cover_source = data.get("cover_source") if isinstance(data.get("cover_source"), dict) else {}
         caption_text = data.get("caption_text", "") or ""
         links = data.get("links") or {}
         raw_cover_url = data.get("cover_url") if isinstance(data.get("cover_url"), str) else ""
@@ -1480,6 +1481,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             title,
             release_iso,
             cover_file_id,
+            cover_source,
             links_clean,
             caption_text,
             bool(data.get("branding_disabled")),
@@ -1493,6 +1495,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "title": title,
             "release_date": release_iso,
             "cover_file_id": cover_file_id,
+            "cover_source": cover_source,
             "links": links_clean,
             "caption_text": caption_text,
             "branding_disabled": bool(data.get("branding_disabled")),
@@ -1770,6 +1773,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             latest.get("title", ""),
             latest.get("release_date") or "",
             latest.get("cover_file_id", ""),
+            latest.get("cover_source") or {},
             links,
             latest.get("caption_text", "") or "",
             bool(latest.get("branding_disabled")),
@@ -1788,6 +1792,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "title": latest.get("title", ""),
             "release_date": latest.get("release_date") or "",
             "cover_file_id": latest.get("cover_file_id", ""),
+            "cover_source": latest.get("cover_source") or {},
             "links": links,
             "caption_text": latest.get("caption_text", "") or "",
             "branding_disabled": bool(latest.get("branding_disabled")),
@@ -3387,6 +3392,7 @@ async def smartlink_skip_cb(callback):
             field_name = "release_date"
         elif step == 3:
             data["cover_file_id"] = ""
+            data["cover_source"] = {}
             field_name = "cover_file_id"
         elif step == 4:
             data["caption_text"] = ""
@@ -4019,6 +4025,7 @@ async def any_message_router(message: Message):
         elif step == 3:
             if skip_text:
                 data["cover_file_id"] = ""
+                data["cover_source"] = {}
             else:
                 if not message.photo:
                     await _update_smartlink_prompt(
@@ -4030,6 +4037,7 @@ async def any_message_router(message: Message):
                     )
                     return
                 data["cover_file_id"] = message.photo[-1].file_id
+                data["cover_source"] = {"type": "telegram", "file_id": message.photo[-1].file_id}
             field_name = "cover_file_id"
         elif step == 4:
             if skip_text:
@@ -4208,6 +4216,7 @@ async def any_message_router(message: Message):
                 )
                 return
             updates["cover_file_id"] = message.photo[-1].file_id
+            updates["cover_source"] = {"type": "telegram", "file_id": message.photo[-1].file_id}
         elif field == "link":
             platform = info.get("platform")
             links = smartlink.get("links") or {}
