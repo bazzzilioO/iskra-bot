@@ -1316,7 +1316,7 @@ def slugify(value: str) -> str:
 
 async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | None]:
     url = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
     if SMARTLINK_API_KEY:
         headers["X-API-Key"] = SMARTLINK_API_KEY
     timeout = aiohttp.ClientTimeout(total=15)
@@ -1330,6 +1330,13 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
                     error_text = await resp.text()
                 except Exception:
                     error_text = None
+                truncated_error = error_text[:1000] if error_text else error_text
+                logger.warning(
+                    "[smartlink-index] non-200 response url=%s status=%s body=%s",
+                    url,
+                    status,
+                    truncated_error,
+                )
                 return False, status, error_text
     except Exception as e:
         return False, None, str(e)

@@ -162,7 +162,7 @@ async def push_smartlink_to_index(smartlink: dict) -> bool:
         "links_json": json.dumps(links, ensure_ascii=False),
     }
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
     if api_key:
         headers["X-API-Key"] = api_key
 
@@ -177,8 +177,12 @@ async def push_smartlink_to_index(smartlink: dict) -> bool:
                     body = await resp.text()
                 except Exception:
                     body = None
+                truncated_body = (body[:1000] if body else body)
                 logger.warning(
-                    "[smartlink-index] failed status=%s body=%s", resp.status, body
+                    "[smartlink-index] failed url=%s status=%s body=%s",
+                    index_url,
+                    resp.status,
+                    truncated_body,
                 )
     except Exception as err:
         logger.warning("[smartlink-index] request error: %s", err)
