@@ -1436,6 +1436,9 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         cover_file_id = data.get("cover_file_id") or ""
         caption_text = data.get("caption_text", "") or ""
         links = data.get("links") or {}
+        raw_cover_url = data.get("cover_url") if isinstance(data.get("cover_url"), str) else ""
+        cover_url = raw_cover_url.strip() if raw_cover_url and _is_valid_url(raw_cover_url.strip()) else ""
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         links_clean = {
             k: v
             for k, v in links.items()
@@ -1496,6 +1499,8 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "artist_slug": artist_slug,
             "slug": slug,
             "created_at": dt.datetime.utcnow().isoformat(),
+            "cover_url": cover_url,
+            "metadata": metadata,
         }
         sync_payload = build_smartlink_index_payload(smartlink)
         if sync_payload:
@@ -1690,6 +1695,7 @@ async def show_import_confirmation(
             "caption_text": caption_text,
             "metadata": metadata or {},
             "preferred_source": preferred_source,
+            "cover_url": selected_meta.get("cover_url") or "",
         },
     )
 
@@ -3126,6 +3132,9 @@ async def smartlink_import_confirm_cb(callback):
         "cover_file_id": data.get("cover_file_id") or pick_selected_metadata(data).get("cover_file_id"),
         "release_date": data.get("release_date") or "",
         "caption_text": data.get("caption_text") or "",
+        "cover_url": data.get("cover_url") or pick_selected_metadata(data).get("cover_url"),
+        "metadata": data.get("metadata") or {},
+        "preferred_source": data.get("preferred_source"),
     }
     links = data.get("links") or {}
     await start_smartlink_form(callback.message, tg_id, initial_links=links, prefill=prefill)
@@ -3225,6 +3234,9 @@ async def smartlink_prefill_continue_cb(callback):
         "cover_file_id": data.get("cover_file_id") or selected_meta.get("cover_file_id"),
         "release_date": data.get("release_date") or "",
         "caption_text": data.get("caption_text") or "",
+        "cover_url": data.get("cover_url") or selected_meta.get("cover_url"),
+        "metadata": data.get("metadata") or {},
+        "preferred_source": data.get("preferred_source"),
     }
     await start_smartlink_form(callback.message, tg_id, initial_links=data.get("links") or {}, prefill=prefill)
     await callback.answer("Давай сохраним")
