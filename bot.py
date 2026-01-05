@@ -1470,20 +1470,18 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         )
         artist_slug = slugify(artist)
         slug = slugify(title)
-        if not artist_slug:
-            artist_slug = f"release-{smartlink_id}"
-        if not slug:
-            slug = f"release-{smartlink_id}"
-        sync_payload = {
-            "id": str(smartlink_id),
-            "artist_slug": artist_slug,
-            "slug": slug,
-            "title": title,
-            "artist_name": artist,
-            "release_date": release_iso,
-            "links": links_clean,
-        }
-        sync_ok, sync_status, sync_error = await sync_smartlink_to_web(sync_payload)
+        if artist_slug and slug:
+            sync_payload = {
+                "artist_slug": artist_slug,
+                "slug": slug,
+                "title": title,
+                "artist_name": artist,
+                "release_date": release_iso,
+                "links": links_clean,
+            }
+            sync_ok, sync_status, sync_error = await sync_smartlink_to_web(sync_payload)
+        else:
+            sync_ok, sync_status, sync_error = False, None, "artist_slug or slug missing"
         if not sync_ok:
             logger.warning(
                 "[smartlink] sync to web failed smartlink_id=%s status=%s error=%s",
