@@ -38,7 +38,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
     LabeledPrice, PreCheckoutQuery,
-    BufferedInputFile,
+    BufferedInputFile, InputMediaPhoto,
 )
 from aiogram.utils.backoff import Backoff, BackoffConfig
 from dotenv import load_dotenv
@@ -88,6 +88,8 @@ from db import (
     update_smartlink_caption,
     update_smartlink_data,
     was_qc_checked,
+    save_smartlink_message_reference,
+    get_smartlink_messages,
 )
 from helpers import (
     escape_html,
@@ -1829,9 +1831,18 @@ async def apply_caption_update(message: Message, tg_id: int, smartlink_id: int, 
         await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
         await form_clear(tg_id)
         return
-    allow_remind = smartlink_can_remind(smartlink)
-    subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
-    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+    updated = await update_smartlink_message(message.bot, smartlink_id)
+    if not updated:
+        allow_remind = smartlink_can_remind(smartlink)
+        subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
+        await send_smartlink_photo(
+            message.bot,
+            tg_id,
+            smartlink,
+            subscribed=subscribed,
+            allow_remind=allow_remind,
+            store_message=True,
+        )
     await message.answer("Текст обновлён.", reply_markup=await user_menu_keyboard(tg_id))
     await form_clear(tg_id)
 
@@ -1918,6 +1929,170 @@ async def get_release_reminder_state(tg_id: int, smartlink_id: int, allow_remind
     return await is_smartlink_subscribed(smartlink_id, tg_id)
 
 
+SMARTLINK_UPDATE_DEBOUNCE_SECONDS = 1.5
+_smartlink_update_tasks: dict[int, asyncio.Task] = {}
+
+
+async def _store_smartlink_message(message: Message, smartlink: dict, chat_id: int):
+    try:
+        smartlink_id = int(smartlink.get("id")) if smartlink.get("id") is not None else None
+    except Exception:
+        smartlink_id = None
+    owner_id = smartlink.get("owner_tg_id")
+    if not smartlink_id or owner_id is None:
+        return
+
+    await save_smartlink_message_reference(smartlink_id, int(owner_id), int(chat_id), message.message_id)
+
+
+async def update_smartlink_message(bot: Bot, smartlink_id: int) -> bool:
+    smartlink = await get_smartlink_by_id(smartlink_id)
+    if not smartlink:
+        logger.warning("[smartlink-update] smartlink not found smartlink_id=%s", smartlink_id)
+        return False
+
+    refs = await get_smartlink_messages(smartlink_id)
+    if not refs:
+        logger.info("[smartlink-update] no stored messages smartlink_id=%s", smartlink_id)
+        return False
+
+    artist_slug, slug = get_smartlink_slugs(smartlink)
+    web_url = f"{SMARTLINK_INDEX_BASE}/{artist_slug}/{slug}" if SMARTLINK_INDEX_BASE else None
+    allow_remind = smartlink_can_remind(smartlink)
+    updated_any = False
+
+    for ref in refs:
+        chat_id = ref.get("chat_id")
+        message_id = ref.get("message_id")
+        user_id = ref.get("user_id") or smartlink.get("owner_tg_id")
+        is_admin = bool(ADMIN_TG_ID and str(chat_id) == str(ADMIN_TG_ID))
+        subscribed = False
+        try:
+            if user_id:
+                subscribed = await get_release_reminder_state(int(user_id), smartlink_id, allow_remind)
+        except Exception:
+            subscribed = False
+
+        kb = build_smartlink_keyboard(
+            smartlink,
+            subscribed=subscribed,
+            can_remind=allow_remind,
+            page=None,
+            web_url=web_url,
+            can_update_web=is_admin,
+        )
+        caption = build_smartlink_caption(smartlink)
+        cover_file_id = smartlink.get("cover_file_id")
+
+        try:
+            if cover_file_id:
+                media = InputMediaPhoto(media=cover_file_id, caption=caption, parse_mode="HTML")
+                await bot.edit_message_media(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    media=media,
+                    reply_markup=kb,
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=caption,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+            updated_any = True
+            logger.info(
+                "[smartlink-update] message edited smartlink_id=%s chat_id=%s message_id=%s",
+                smartlink_id,
+                chat_id,
+                message_id,
+            )
+            continue
+        except TelegramBadRequest as err:
+            logger.warning(
+                "[smartlink-update] edit failed smartlink_id=%s chat_id=%s message_id=%s error=%s",
+                smartlink_id,
+                chat_id,
+                message_id,
+                err,
+            )
+            if not cover_file_id:
+                with contextlib.suppress(Exception):
+                    await bot.edit_message_caption(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        caption=caption,
+                        reply_markup=kb,
+                        parse_mode="HTML",
+                    )
+                    updated_any = True
+                    logger.info(
+                        "[smartlink-update] caption edited smartlink_id=%s chat_id=%s message_id=%s",
+                        smartlink_id,
+                        chat_id,
+                        message_id,
+                    )
+                    continue
+        except TelegramForbiddenError as err:
+            logger.warning(
+                "[smartlink-update] forbidden smartlink_id=%s chat_id=%s message_id=%s error=%s",
+                smartlink_id,
+                chat_id,
+                message_id,
+                err,
+            )
+        except Exception as err:
+            logger.exception(
+                "[smartlink-update] unexpected error smartlink_id=%s chat_id=%s message_id=%s", smartlink_id, chat_id, message_id
+            )
+
+        try:
+            new_message = await send_smartlink_photo(
+                bot,
+                chat_id,
+                smartlink,
+                subscribed=subscribed,
+                allow_remind=allow_remind,
+                store_message=True,
+            )
+            if isinstance(new_message, Message):
+                updated_any = True
+                logger.info(
+                    "[smartlink-update] fallback send stored smartlink_id=%s chat_id=%s message_id=%s",
+                    smartlink_id,
+                    chat_id,
+                    new_message.message_id,
+                )
+        except Exception as err:
+            logger.warning(
+                "[smartlink-update] fallback send failed smartlink_id=%s chat_id=%s error=%s",
+                smartlink_id,
+                chat_id,
+                err,
+            )
+
+    return updated_any
+
+
+def schedule_smartlink_update(bot: Bot, smartlink_id: int, delay: float = SMARTLINK_UPDATE_DEBOUNCE_SECONDS):
+    existing = _smartlink_update_tasks.get(smartlink_id)
+    if existing and not existing.done():
+        existing.cancel()
+
+    async def _runner():
+        try:
+            await asyncio.sleep(delay)
+            await update_smartlink_message(bot, smartlink_id)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if _smartlink_update_tasks.get(smartlink_id) is asyncio.current_task():
+                _smartlink_update_tasks.pop(smartlink_id, None)
+
+    _smartlink_update_tasks[smartlink_id] = asyncio.create_task(_runner())
+
+
 async def send_smartlink_photo(
     bot: Bot,
     chat_id: int,
@@ -1926,6 +2101,7 @@ async def send_smartlink_photo(
     subscribed: bool = False,
     allow_remind: bool = False,
     page: int | None = None,
+    store_message: bool | None = None,
 ):
     try:
         artist_slug, slug = get_smartlink_slugs(smartlink)
@@ -1946,20 +2122,28 @@ async def send_smartlink_photo(
     cover_file_id = smartlink.get("cover_file_id")
     try:
         if cover_file_id:
-            return await bot.send_photo(
+            msg = await bot.send_photo(
                 chat_id,
                 photo=cover_file_id,
                 caption=caption,
                 reply_markup=kb,
                 parse_mode="HTML",
             )
+        else:
+            msg = await bot.send_message(
+                chat_id,
+                text=caption,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
 
-        return await bot.send_message(
-            chat_id,
-            text=caption,
-            reply_markup=kb,
-            parse_mode="HTML",
-        )
+        should_store = store_message
+        if should_store is None:
+            should_store = str(smartlink.get("owner_tg_id")) == str(chat_id)
+        if should_store:
+            await _store_smartlink_message(msg, smartlink, chat_id)
+
+        return msg
     except Exception:
         logger.exception("[smartlink] send failed smartlink_id=%s", smartlink.get("id"))
         return await _send_smartlink_fallback(bot, chat_id, smartlink)
@@ -2752,6 +2936,7 @@ async def smartlinks_refresh_cb(callback):
     kb = build_smartlink_keyboard(smartlink, subscribed=subscribed, can_remind=allow_remind, page=page)
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
+    schedule_smartlink_update(callback.message.bot, smartlink_id)
     await callback.answer("Карточка обновлена")
 
 
@@ -2784,6 +2969,7 @@ async def smartlinks_reindex_cb(callback):
         success = False
 
     if success:
+        schedule_smartlink_update(callback.message.bot, smartlink_id)
         await callback.answer("✅ Web обновлён", show_alert=True)
     else:
         await callback.answer("❌ Не удалось обновить web (см. логи)", show_alert=True)
@@ -3795,6 +3981,9 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
             "[cover-upgrade] indexing failed smartlink_id=%s", latest.get("id")
         )
 
+    if latest.get("id"):
+        schedule_smartlink_update(message.bot, int(latest.get("id")))
+
     return True
 
 
@@ -4306,7 +4495,10 @@ async def any_message_router(message: Message):
         await form_clear(tg_id)
         updated = await get_smartlink_by_id(smartlink_id)
         if updated:
-            await resend_smartlink_card(message, tg_id, updated, page)
+            schedule_smartlink_update(message.bot, smartlink_id)
+            await message.answer(
+                "Смартлинк обновлён.", reply_markup=smartlink_view_kb(smartlink_id, page)
+            )
         else:
             await message.answer("Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
         return

@@ -211,6 +211,17 @@ async def init_db():
         )
         """)
         await db.execute("""
+        CREATE TABLE IF NOT EXISTS smartlink_messages (
+            smartlink_id INTEGER,
+            user_id INTEGER,
+            chat_id INTEGER,
+            message_id INTEGER,
+            created_at TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (smartlink_id, chat_id)
+        )
+        """)
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             owner_tg_id INTEGER,
@@ -740,6 +751,7 @@ async def delete_smartlink(smartlink_id: int, owner_tg_id: int) -> None:
         await db.execute("DELETE FROM smartlink_subscriptions WHERE smartlink_id=?", (smartlink_id,))
         await db.execute("DELETE FROM smartlink_reminders WHERE smartlink_id=?", (smartlink_id,))
         await db.execute("DELETE FROM smartlink_reminder_sends WHERE smartlink_id=?", (smartlink_id,))
+        await db.execute("DELETE FROM smartlink_messages WHERE smartlink_id=?", (smartlink_id,))
         await db.commit()
 
 
@@ -867,6 +879,50 @@ async def mark_smartlink_day_sent(smartlink_id: int, subscriber_tg_id: int, offs
             (smartlink_id, subscriber_tg_id, offset_days, sent_on.isoformat()),
         )
         await db.commit()
+
+
+async def save_smartlink_message_reference(
+    smartlink_id: int, user_id: int, chat_id: int, message_id: int
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO smartlink_messages (smartlink_id, user_id, chat_id, message_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?,
+                COALESCE((SELECT created_at FROM smartlink_messages WHERE smartlink_id=? AND chat_id=?), ?),
+                ?
+            )
+            """,
+            (
+                smartlink_id,
+                user_id,
+                chat_id,
+                message_id,
+                smartlink_id,
+                chat_id,
+                dt.datetime.utcnow().isoformat(),
+                dt.datetime.utcnow().isoformat(),
+            ),
+        )
+        await db.commit()
+
+
+async def get_smartlink_messages(smartlink_id: int) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT smartlink_id, user_id, chat_id, message_id FROM smartlink_messages WHERE smartlink_id=?",
+            (smartlink_id,),
+        )
+        rows = await cur.fetchall()
+    return [
+        {
+            "smartlink_id": row[0],
+            "user_id": row[1],
+            "chat_id": row[2],
+            "message_id": row[3],
+        }
+        for row in rows
+    ]
 
 
 def _parse_smartlink_date(date_str: str | None) -> dt.date | None:
