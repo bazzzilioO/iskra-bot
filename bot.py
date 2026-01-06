@@ -753,7 +753,7 @@ def build_my_smartlinks_text(
 
     lines = [f"📎 Мои смартлинки (страница {page + 1}/{total_pages})", ""]
     for idx, item in enumerate(items, start=start_index + 1):
-        artist = item.get("artist_name") or item.get("artist") or "Без артиста"
+        artist = item.get("artist") or "Без артиста"
         title = item.get("title") or "Без названия"
         lines.append(f"{idx}. {artist} — {title}")
     return "\n".join(lines)
@@ -766,7 +766,7 @@ def build_my_smartlinks_kb(
     for idx, item in enumerate(items, start=start_index + 1):
         artist_slug = str(item.get("artist_slug") or "").strip()
         slug = str(item.get("slug") or "").strip()
-        smartlink_id = item.get("local_id")
+        smartlink_id = item.get("id")
         canonical_url = (
             f"{SMARTLINK_INDEX_BASE}/{artist_slug}/{slug}"
             if artist_slug and slug
@@ -775,7 +775,7 @@ def build_my_smartlinks_kb(
         row: list[InlineKeyboardButton] = []
         if canonical_url:
             row.append(InlineKeyboardButton(text=f"{idx}. 🌐 Открыть", url=canonical_url))
-        if smartlink_id:
+        if smartlink_id is not None:
             row.append(
                 InlineKeyboardButton(
                     text="✏️ Редактировать",
@@ -899,49 +899,23 @@ async def fetch_smartlink_from_index(
 
 
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
-    ok, items = await fetch_my_smartlinks_from_index(tg_id)
-    if not ok or items is None:
-        await message.answer(
-            "Не удалось загрузить список (см. логи).",
-            reply_markup=smartlinks_menu_kb(),
-        )
-        return
-
-    if not items:
+    total = await count_smartlinks(tg_id)
+    if total <= 0:
         await message.answer(
             "У тебя пока нет смартлинков. Создай первый через «➕ Создать смарт-линк».",
             reply_markup=smartlinks_menu_kb(),
         )
         return
 
-    total_pages = max(1, (len(items) + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
+    total_pages = max(1, (total + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
     start = page * MY_SMARTLINKS_PAGE_SIZE
-    page_items = items[start : start + MY_SMARTLINKS_PAGE_SIZE]
-    enriched_items: list[dict] = []
-    for item in page_items:
-        local_id = None
-        artist_slug = str(item.get("artist_slug") or "").strip()
-        slug = str(item.get("slug") or "").strip()
-        if artist_slug and slug:
-            try:
-                local = await get_smartlink_by_slugs(artist_slug, slug)
-            except Exception:
-                logger.exception(
-                    "[smartlink-my] lookup failed artist_slug=%s slug=%s",
-                    artist_slug,
-                    slug,
-                )
-            else:
-                if local and local.get("owner_tg_id") == tg_id:
-                    local_id = local.get("id")
-        enriched_item = {**item}
-        if local_id:
-            enriched_item["local_id"] = local_id
-        enriched_items.append(enriched_item)
+    items = await list_smartlinks(
+        tg_id, limit=MY_SMARTLINKS_PAGE_SIZE, offset=start
+    )
 
-    text = build_my_smartlinks_text(enriched_items, page, total_pages, start)
-    kb = build_my_smartlinks_kb(enriched_items, page, total_pages, start)
+    text = build_my_smartlinks_text(items, page, total_pages, start)
+    kb = build_my_smartlinks_kb(items, page, total_pages, start)
     await message.answer(text, reply_markup=kb)
 
 
@@ -3443,7 +3417,12 @@ async def smartlinks_edit_menu_cb(callback):
     page = int(parts[3])
     smartlink = await get_owned_smartlink(tg_id, smartlink_id)
     if not smartlink:
-        await callback.answer("Смартлинк не найден", show_alert=True)
+        logger.error(
+            "[smartlink-edit-menu] smartlink not found tg_id=%s smartlink_id=%s",
+            tg_id,
+            smartlink_id,
+        )
+        await callback.answer("Смартлинк не найден в базе", show_alert=True)
         return
     text = build_smartlink_view_text(smartlink)
     await callback.message.answer(
