@@ -991,14 +991,14 @@ async def show_smartlink_view(message: Message, tg_id: int, smartlink_id: int, p
         await message.answer("Смартлинк не найден.", reply_markup=smartlinks_menu_kb())
         return
     text = build_smartlink_view_text(smartlink)
-    await message.answer(text, reply_markup=smartlink_view_kb(smartlink_id, page))
+    await message.answer(text, reply_markup=smartlink_view_kb(smartlink, page))
 
 
 async def resend_smartlink_card(message: Message, tg_id: int, smartlink: dict, page: int):
     allow_remind = smartlink_can_remind(smartlink)
     subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
     await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind, page=page)
-    await message.answer("Выбери действие:", reply_markup=smartlink_view_kb(smartlink.get("id"), page))
+    await message.answer("Выбери действие:", reply_markup=smartlink_view_kb(smartlink, page))
 
 
 async def get_owned_smartlink(tg_id: int, smartlink_id: int) -> dict | None:
@@ -5059,7 +5059,7 @@ async def any_message_router(message: Message):
                             push_error,
                         )
             await message.answer(
-                "Смартлинк обновлён.", reply_markup=smartlink_view_kb(smartlink_id, page)
+                "Смартлинк обновлён.", reply_markup=smartlink_view_kb(updated, page)
             )
         else:
             await message.answer("Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
