@@ -40,6 +40,42 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["artist_slug"], "test-artist")
         self.assertEqual(payload["slug"], "test-song")
 
+    def test_build_payload_uses_sreda_cover_for_telegram(self):
+        payload = build_smartlink_index_payload(
+            {
+                "artist": "Cover Artist",
+                "title": "Cover Song",
+                "links": {"spotify": "https://example.com"},
+                "cover_source": {"type": "telegram", "file_id": "file_abc123"},
+                "metadata": {"cover_url": "https://railway.example/cover.png"},
+            }
+        )
+
+        self.assertEqual(
+            payload.get("cover_source"), {"type": "telegram", "file_id": "file_abc123"}
+        )
+        self.assertEqual(
+            payload.get("cover_url"), "https://go.sreda.pw/api/cover/cover-artist/cover-song"
+        )
+
+    def test_cover_source_forced_to_telegram_when_file_id_exists(self):
+        payload = build_smartlink_index_payload(
+            {
+                "artist": "Force Artist",
+                "title": "Force Song",
+                "links": {"spotify": "https://example.com"},
+                "cover_source": {"type": "external", "file_id": "some_file_id"},
+                "cover_file_id": "some_file_id",
+            }
+        )
+
+        self.assertEqual(
+            payload.get("cover_source"), {"type": "telegram", "file_id": "some_file_id"}
+        )
+        self.assertEqual(
+            payload.get("cover_url"), "https://go.sreda.pw/api/cover/force-artist/force-song"
+        )
+
     async def test_push_without_cover(self):
         captured = {}
 
