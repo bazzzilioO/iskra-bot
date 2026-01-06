@@ -248,18 +248,18 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
     return payload
 
 
-async def push_smartlink_to_index(smartlink: dict) -> bool:
+async def push_smartlink_to_index(smartlink: dict) -> tuple[bool, int | None, str | None]:
     base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), DEFAULT_SMARTLINK_BASE)
     index_url = f"{base_url}/api/index/upsert"
     api_key = os.getenv("SMARTLINK_API_KEY")
     if not index_url:
         logger.info("[smartlink-index] index url is not configured, skipping")
-        return False
+        return False, None, "config_missing"
 
     payload = build_smartlink_index_payload(smartlink)
     if not payload:
         logger.warning("[smartlink-index] payload invalid, skipping send")
-        return False
+        return False, None, "payload_invalid"
 
     headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
     if api_key:
@@ -281,7 +281,8 @@ async def push_smartlink_to_index(smartlink: dict) -> bool:
                     truncated_body,
                 )
                 if 200 <= resp.status < 300:
-                    return True
+                    return True, resp.status, None
+                return False, resp.status, truncated_body
     except Exception as err:
         logger.warning("[smartlink-index] request error: %s", err)
-    return False
+        return False, None, str(err)

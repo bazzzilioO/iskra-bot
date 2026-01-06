@@ -1637,7 +1637,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
                 sync_error,
             )
         try:
-            await push_smartlink_to_index(smartlink)
+            push_ok, push_status, push_error = await push_smartlink_to_index(smartlink)
         except Exception:
             logger.exception(
                 "[smartlink] indexing failed smartlink_id=%s artist_slug=%s slug=%s",
@@ -1645,6 +1645,14 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
                 artist_slug,
                 slug,
             )
+        else:
+            if not push_ok:
+                logger.warning(
+                    "[smartlink] indexing failed smartlink_id=%s status=%s error=%s",
+                    smartlink_id,
+                    push_status,
+                    push_error,
+                )
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         try:
@@ -1934,7 +1942,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "cover_version": 1,
         }
         try:
-            await push_smartlink_to_index(smartlink)
+            push_ok, push_status, push_error = await push_smartlink_to_index(smartlink)
         except Exception:
             logger.exception(
                 "[smartlink] indexing failed smartlink_id=%s artist_slug=%s slug=%s",
@@ -1942,6 +1950,14 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
                 artist_slug,
                 slug,
             )
+        else:
+            if not push_ok:
+                logger.warning(
+                    "[smartlink] indexing failed smartlink_id=%s status=%s error=%s",
+                    smartlink_id,
+                    push_status,
+                    push_error,
+                )
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
@@ -3088,7 +3104,13 @@ async def smartlinks_reindex_cb(callback):
     except ValueError:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink = await get_smartlink_by_id(smartlink_id)
+    try:
+        smartlink = await get_smartlink_by_id(smartlink_id)
+    except Exception:
+        logger.exception("[smartlink] db fetch failed smartlink_id=%s", smartlink_id)
+        await callback.answer("❌ Ошибка БД. Попробуй позже.", show_alert=True)
+        return
+
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
@@ -3100,18 +3122,29 @@ async def smartlinks_reindex_cb(callback):
         logger.exception(
             "[smartlink] cover version bump failed smartlink_id=%s", smartlink_id
         )
+        await callback.answer("❌ Ошибка БД. Попробуй позже.", show_alert=True)
+        return
 
     try:
-        success = await push_smartlink_to_index(smartlink)
+        success, status, error = await push_smartlink_to_index(smartlink)
     except Exception:
         logger.exception("[smartlink] reindex failed smartlink_id=%s", smartlink_id)
-        success = False
+        await callback.answer("❌ Ошибка воркера. Попробуй позже.", show_alert=True)
+        return
 
-    if success:
+    if success and status == 202:
+        await callback.answer("⏳ Обновление запущено. Проверим чуть позже.", show_alert=True)
+    elif success:
         schedule_smartlink_update(callback.message.bot, smartlink_id)
         await callback.answer("✅ Web обновлён", show_alert=True)
     else:
-        await callback.answer("❌ Не удалось обновить web (см. логи)", show_alert=True)
+        logger.warning(
+            "[smartlink] reindex worker error smartlink_id=%s status=%s error=%s",
+            smartlink_id,
+            status,
+            error,
+        )
+        await callback.answer("❌ Ошибка воркера. Попробуй позже.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("smartlinks:delete:"))
@@ -4128,11 +4161,19 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
         return True
 
     try:
-        await push_smartlink_to_index(latest)
+        push_ok, push_status, push_error = await push_smartlink_to_index(latest)
     except Exception:
         logger.exception(
             "[cover-upgrade] indexing failed smartlink_id=%s", latest.get("id")
         )
+    else:
+        if not push_ok:
+            logger.warning(
+                "[cover-upgrade] indexing failed smartlink_id=%s status=%s error=%s",
+                latest.get("id"),
+                push_status,
+                push_error,
+            )
 
     if latest.get("id"):
         schedule_smartlink_update(message.bot, int(latest.get("id")))
