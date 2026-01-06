@@ -4884,15 +4884,34 @@ async def any_message_router(message: Message):
             await message.answer("Не понял запрос.", reply_markup=await user_menu_keyboard(tg_id))
             return
 
+        cover_updated = bool({"cover_file_id", "cover_source", "cover_url"} & set(updates.keys()))
         if updates:
             await update_smartlink_data(smartlink_id, tg_id, updates)
-            if {"cover_file_id", "cover_source", "cover_url"} & set(updates.keys()):
+            if cover_updated:
                 with contextlib.suppress(Exception):
                     await bump_smartlink_cover_version(smartlink_id, tg_id)
         await form_clear(tg_id)
         updated = await get_smartlink_by_id(smartlink_id)
         if updated:
             schedule_smartlink_update(message.bot, smartlink_id)
+            if cover_updated:
+                try:
+                    push_ok, push_status, push_error = await push_smartlink_to_index(
+                        updated, owner=build_owner_payload(message.from_user)
+                    )
+                except Exception:
+                    logger.exception(
+                        "[smartlink] indexing failed after cover update smartlink_id=%s",
+                        smartlink_id,
+                    )
+                else:
+                    if not push_ok:
+                        logger.warning(
+                            "[smartlink] indexing failed after cover update smartlink_id=%s status=%s error=%s",
+                            smartlink_id,
+                            push_status,
+                            push_error,
+                        )
             await message.answer(
                 "Смартлинк обновлён.", reply_markup=smartlink_view_kb(smartlink_id, page)
             )

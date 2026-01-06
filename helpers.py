@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 import html
 import json
@@ -194,13 +195,14 @@ def build_smartlink_index_payload(
                 logger.warning(
                     "[smartlink-index] telegram cover malformed file_id=%s", file_id
                 )
-                return None
-            telegram_file_id = file_id
-        else:
+            else:
+                telegram_file_id = file_id
+        elif source_type:
             logger.warning(
                 "[smartlink-index] cover source unsupported type=%s", source_type
             )
-            return None
+        else:
+            logger.info("[smartlink-index] cover source missing type")
 
     if not telegram_file_id:
         cover_file_id = (smartlink or {}).get("cover_file_id")
@@ -211,14 +213,16 @@ def build_smartlink_index_payload(
                     logger.warning(
                         "[smartlink-index] telegram cover malformed file_id=%s", cover_file_id
                     )
-                    return None
-                telegram_file_id = cover_file_id
+                else:
+                    telegram_file_id = cover_file_id
 
     if telegram_file_id:
         cover_source_type = "telegram"
         cover_source_payload = {"type": "telegram", "file_id": telegram_file_id}
     elif cover_url:
         cover_source_type = "external"
+    else:
+        logger.info("[smartlink-index] cover missing; indexing without cover")
 
     logger.info("[smartlink-index] cover source=%s", cover_source_type)
 
@@ -272,23 +276,46 @@ async def push_smartlink_to_index(
         headers["X-API-Key"] = api_key
 
     timeout = aiohttp.ClientTimeout(total=15)
-    logger.info("[smartlink-index] outgoing payload=%s", json.dumps(payload, ensure_ascii=False))
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(index_url, headers=headers, json=payload) as resp:
-                try:
-                    body = await resp.text()
-                except Exception:
-                    body = None
-                truncated_body = (body[:1000] if body else body)
-                logger.info(
-                    "[smartlink-index] worker response status=%s body=%s",
-                    resp.status,
-                    truncated_body,
-                )
-                if 200 <= resp.status < 300:
-                    return True, resp.status, None
-                return False, resp.status, truncated_body
-    except Exception as err:
-        logger.warning("[smartlink-index] request error: %s", err)
-        return False, None, str(err)
+    redacted_payload = json.dumps(payload, ensure_ascii=False)
+    logger.info("[smartlink-index] outgoing payload=%s", redacted_payload)
+
+    max_attempts = 3
+    last_status: int | None = None
+    last_error: str | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(index_url, headers=headers, json=payload) as resp:
+                    try:
+                        body = await resp.text()
+                    except Exception:
+                        body = None
+                    truncated_body = (body[:1000] if body else body)
+                    logger.info(
+                        "[smartlink-index] worker response status=%s body=%s",
+                        resp.status,
+                        truncated_body,
+                    )
+                    last_status = resp.status
+                    if 200 <= resp.status < 300:
+                        return True, resp.status, None
+                    last_error = truncated_body
+                    if resp.status < 500:
+                        return False, resp.status, truncated_body
+        except Exception as err:
+            last_status = None
+            last_error = str(err)
+            logger.warning("[smartlink-index] request error attempt=%s error=%s", attempt, err)
+
+        if attempt < max_attempts:
+            backoff_seconds = 2 ** (attempt - 1)
+            logger.info(
+                "[smartlink-index] retrying attempt=%s backoff=%ss status=%s", 
+                attempt + 1,
+                backoff_seconds,
+                last_status,
+            )
+            await asyncio.sleep(backoff_seconds)
+
+    return False, last_status, last_error
