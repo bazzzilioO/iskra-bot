@@ -774,11 +774,11 @@ def build_my_smartlinks_kb(
         row: list[InlineKeyboardButton] = []
         if canonical_url:
             row.append(InlineKeyboardButton(text=f"{idx}. 🌐 Открыть", url=canonical_url))
-        local_id = item.get("local_id")
-        if local_id:
+        if artist_slug and slug:
             row.append(
                 InlineKeyboardButton(
-                    text="Выбрать", callback_data=f"smartlinks:choose:{local_id}"
+                    text="✏️ Редактировать",
+                    callback_data=f"smartlinks:edit:{artist_slug}:{slug}:{page}",
                 )
             )
         if row:
@@ -844,6 +844,56 @@ async def fetch_my_smartlinks_from_index(
                 return True, items or []
     except Exception as err:
         logger.warning("[smartlink-my] request error: %s", err)
+        return False, None
+
+
+async def fetch_smartlink_from_index(
+    artist_slug: str, slug: str
+) -> tuple[bool, dict | None]:
+    artist_slug = str(artist_slug or "").strip()
+    slug = str(slug or "").strip()
+    if not SMARTLINK_INDEX_BASE or not artist_slug or not slug:
+        return False, None
+
+    url = f"{SMARTLINK_INDEX_BASE}/api/index/{artist_slug}/{slug}"
+    headers = {}
+    if SMARTLINK_API_KEY:
+        headers["X-API-Key"] = SMARTLINK_API_KEY
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                body = await resp.text()
+                if not (200 <= resp.status < 300):
+                    logger.warning(
+                        "[smartlink-fetch] response status=%s body=%s", resp.status, body
+                    )
+                    return False, None
+                try:
+                    payload = await resp.json()
+                except Exception:
+                    logger.exception(
+                        "[smartlink-fetch] failed to parse json status=%s body=%s",
+                        resp.status,
+                        body,
+                    )
+                    return False, None
+
+                item: dict | None = None
+                if isinstance(payload, dict):
+                    for key in ("smartlink", "item", "data", "result"):
+                        value = payload.get(key)
+                        if isinstance(value, dict):
+                            item = value
+                            break
+                    if item is None:
+                        item = payload
+                elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                    item = payload[0]
+
+                return True, item
+    except Exception as err:
+        logger.warning("[smartlink-fetch] request error: %s", err)
         return False, None
 
 
@@ -3165,6 +3215,102 @@ async def smartlinks_my_cb(callback):
     except ValueError:
         page = 0
     await send_my_smartlinks(callback.message, tg_id, page=page)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:edit:"))
+async def smartlinks_edit_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    parts = callback.data.split(":")
+    if len(parts) != 5:
+        await callback.answer("Не понял", show_alert=True)
+        return
+
+    artist_slug = parts[2].strip()
+    slug = parts[3].strip()
+    try:
+        page = int(parts[4])
+    except ValueError:
+        page = 0
+
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
+
+    smartlink: dict | None = None
+    try:
+        candidate = await get_smartlink_by_slugs(artist_slug, slug)
+    except Exception:
+        logger.exception(
+            "[smartlink-edit] lookup failed artist_slug=%s slug=%s", artist_slug, slug
+        )
+    else:
+        if candidate and str(candidate.get("owner_tg_id")) == str(tg_id):
+            smartlink = candidate
+
+    if smartlink:
+        await show_smartlink_view(callback.message, tg_id, smartlink.get("id"), page)
+        await callback.answer()
+        return
+
+    ok, remote = await fetch_smartlink_from_index(artist_slug, slug)
+    if not ok:
+        await callback.answer("Не удалось открыть смартлинк (см. логи).", show_alert=True)
+        return
+    if not remote:
+        await callback.answer("Смартлинк не найден.", show_alert=True)
+        return
+
+    links = remote.get("links") or {}
+    if not isinstance(links, dict):
+        links = {}
+    cover_source = remote.get("cover_source")
+    if not isinstance(cover_source, dict):
+        cover_source = {}
+    cover_file_id = str(remote.get("cover_file_id") or "").strip()
+    caption_text = remote.get("caption_text") or remote.get("caption") or ""
+    release_date_iso = str(remote.get("release_date") or "").strip()
+    cover_url = remote.get("cover_url")
+    cover_version_raw = remote.get("cover_version")
+    try:
+        cover_version = int(cover_version_raw) if cover_version_raw is not None else 1
+    except Exception:
+        cover_version = 1
+
+    pre_save_enabled_raw = remote.get("pre_save_enabled")
+    reminders_enabled_raw = remote.get("reminders_enabled")
+
+    try:
+        new_id = await save_smartlink(
+            tg_id,
+            remote.get("artist_name") or remote.get("artist") or "",
+            remote.get("title") or "",
+            release_date_iso,
+            cover_file_id,
+            cover_source,
+            links,
+            caption_text,
+            bool(pre_save_enabled_raw)
+            if pre_save_enabled_raw is not None
+            else True,
+            bool(reminders_enabled_raw)
+            if reminders_enabled_raw is not None
+            else True,
+            remote.get("project_id"),
+            cover_url if cover_url else None,
+            artist_slug,
+            slug,
+            cover_version,
+        )
+    except Exception:
+        logger.exception(
+            "[smartlink-edit] import failed artist_slug=%s slug=%s", artist_slug, slug
+        )
+        await callback.answer("Не удалось импортировать смартлинк.", show_alert=True)
+        return
+
+    await show_smartlink_view(callback.message, tg_id, new_id, page)
     await callback.answer()
 
 
