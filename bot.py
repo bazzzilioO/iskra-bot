@@ -62,6 +62,7 @@ from db import (
     get_focus_show_completed,
     get_last_update_notified,
     get_latest_smartlink,
+    get_owned_smartlink,
     get_release_date,
     get_reminders_enabled,
     get_smartlink_by_id,
@@ -980,8 +981,8 @@ async def send_smartlink_list(message: Message, tg_id: int, page: int = 0):
 
 
 async def show_smartlink_view(message: Message, tg_id: int, smartlink_id: int, page: int):
-    smartlink = await get_smartlink_by_id(smartlink_id)
-    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
         await message.answer("Смартлинк не найден.", reply_markup=smartlinks_menu_kb())
         return
     text = build_smartlink_view_text(smartlink)
@@ -993,13 +994,6 @@ async def resend_smartlink_card(message: Message, tg_id: int, smartlink: dict, p
     subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
     await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind, page=page)
     await message.answer("Выбери действие:", reply_markup=smartlink_view_kb(smartlink, page))
-
-
-async def get_owned_smartlink(tg_id: int, smartlink_id: int) -> dict | None:
-    smartlink = await get_smartlink_by_id(smartlink_id)
-    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
-        return None
-    return smartlink
 async def get_spotify_access_token() -> str | None:
     global _SPOTIFY_ACCESS_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
 
@@ -4097,8 +4091,8 @@ async def smartlinks_export_format_cb(callback):
     smartlink_id = int(parts[2])
     page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
     variant = parts[4]
-    smartlink = await get_smartlink_by_id(smartlink_id)
-    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
     if not await get_export_unlocked(tg_id):
@@ -4200,8 +4194,8 @@ async def smartlinks_export_cb(callback):
 
     smartlink_id = int(parts[2])
     page = int(parts[3]) if len(parts) == 4 and parts[3].lstrip("-").isdigit() else -1
-    smartlink = await get_smartlink_by_id(smartlink_id)
-    if not smartlink or smartlink.get("owner_tg_id") != tg_id:
+    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
     if not await get_export_unlocked(tg_id):

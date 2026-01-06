@@ -1,5 +1,6 @@
 import datetime as dt
 import json
+import logging
 import os
 from typing import Iterable
 
@@ -10,6 +11,57 @@ DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_REMINDER_OFFSETS = "-7,-1,0,7"
 DEFAULT_REMINDER_TIME = "12:00"
 REMINDER_CLEAN_DAYS = 60
+logger = logging.getLogger(__name__)
+
+_SMARTLINK_LEGACY_OWNER_COLUMNS: list[str] | None = None
+
+
+async def _get_smartlink_legacy_owner_columns(db: aiosqlite.Connection) -> list[str]:
+    global _SMARTLINK_LEGACY_OWNER_COLUMNS
+    if _SMARTLINK_LEGACY_OWNER_COLUMNS is not None:
+        return _SMARTLINK_LEGACY_OWNER_COLUMNS
+    cur = await db.execute("PRAGMA table_info(smartlinks)")
+    rows = await cur.fetchall()
+    column_names = {row[1] for row in rows}
+    candidates = ("legacy_owner_id", "owner_id", "user_id", "tg_id", "chat_id")
+    _SMARTLINK_LEGACY_OWNER_COLUMNS = [col for col in candidates if col in column_names]
+    return _SMARTLINK_LEGACY_OWNER_COLUMNS
+
+
+async def _migrate_legacy_smartlink_owners(
+    db: aiosqlite.Connection, owner_tg_id: int, legacy_columns: list[str]
+) -> None:
+    migrated = 0
+    for column in legacy_columns:
+        cur = await db.execute(
+            f"""
+            UPDATE smartlinks
+            SET owner_tg_id=?
+            WHERE {column}=?
+              AND (owner_tg_id IS NULL OR owner_tg_id=0 OR owner_tg_id!=?)
+            """,
+            (owner_tg_id, owner_tg_id, owner_tg_id),
+        )
+        migrated += cur.rowcount or 0
+    if migrated:
+        await db.commit()
+        logger.warning(
+            "[smartlinks-owner] migrated legacy owner_tg_id=%s rows=%s columns=%s",
+            owner_tg_id,
+            migrated,
+            legacy_columns,
+        )
+
+
+async def _smartlink_owner_filter(
+    db: aiosqlite.Connection, owner_tg_id: int
+) -> tuple[str, list[int]]:
+    legacy_columns = await _get_smartlink_legacy_owner_columns(db)
+    if legacy_columns:
+        await _migrate_legacy_smartlink_owners(db, owner_tg_id, legacy_columns)
+    clauses = ["owner_tg_id=?"] + [f"{column}=?" for column in legacy_columns]
+    params = [owner_tg_id for _ in clauses]
+    return f"({' OR '.join(clauses)})", params
 
 
 def _parse_offsets(raw: str | None) -> list[int]:
@@ -695,9 +747,10 @@ async def update_smartlink_caption(smartlink_id: int, caption_text: str):
 
 async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
-            (owner_tg_id,),
+            f"SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE {owner_clause} ORDER BY id DESC LIMIT 1",
+            owner_params,
         )
         row = await cur.fetchone()
         return _smartlink_row_to_dict(row) if row else None
@@ -732,26 +785,41 @@ async def get_smartlink_by_slugs(artist_slug: str, slug: str) -> dict | None:
 
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
         cur = await db.execute(
-            """
+            f"""
             SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id,
                    cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at,
                    branding_paid, cover_url, artist_slug, slug, cover_version
             FROM smartlinks
-            WHERE owner_tg_id=?
+            WHERE {owner_clause}
             ORDER BY COALESCE(created_at, '') DESC, id DESC
             LIMIT ? OFFSET ?
             """,
-            (owner_tg_id, limit, offset),
+            (*owner_params, limit, offset),
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
 
 
 async def count_smartlinks(owner_tg_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM smartlinks WHERE owner_tg_id=?", (owner_tg_id,))
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        cur = await db.execute(
+            f"SELECT COUNT(*) FROM smartlinks WHERE {owner_clause}", owner_params
+        )
         row = await cur.fetchone()
         return int(row[0]) if row else 0
+
+
+async def get_owned_smartlink(owner_tg_id: int, smartlink_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        cur = await db.execute(
+            f"SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE id=? AND {owner_clause}",
+            (smartlink_id, *owner_params),
+        )
+        row = await cur.fetchone()
+        return _smartlink_row_to_dict(row) if row else None
 
 
 async def count_all_smartlinks() -> int:
