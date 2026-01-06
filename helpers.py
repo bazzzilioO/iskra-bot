@@ -128,7 +128,9 @@ def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     return artist_slug, slug
 
 
-def build_smartlink_index_payload(smartlink: dict) -> dict | None:
+def build_smartlink_index_payload(
+    smartlink: dict, owner: dict | None = None
+) -> dict | None:
     artist_slug, slug = get_smartlink_slugs(smartlink)
     if not artist_slug or not slug:
         logger.warning(
@@ -244,11 +246,15 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
         payload["cover_source"] = cover_source_payload
     if cover_url:
         payload["cover_url"] = cover_url
+    if owner:
+        payload["owner"] = owner
 
     return payload
 
 
-async def push_smartlink_to_index(smartlink: dict) -> tuple[bool, int | None, str | None]:
+async def push_smartlink_to_index(
+    smartlink: dict, owner: dict | None = None
+) -> tuple[bool, int | None, str | None]:
     base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), DEFAULT_SMARTLINK_BASE)
     index_url = f"{base_url}/api/index/upsert"
     api_key = os.getenv("SMARTLINK_API_KEY")
@@ -256,7 +262,7 @@ async def push_smartlink_to_index(smartlink: dict) -> tuple[bool, int | None, st
         logger.info("[smartlink-index] index url is not configured, skipping")
         return False, None, "config_missing"
 
-    payload = build_smartlink_index_payload(smartlink)
+    payload = build_smartlink_index_payload(smartlink, owner=owner)
     if not payload:
         logger.warning("[smartlink-index] payload invalid, skipping send")
         return False, None, "payload_invalid"
