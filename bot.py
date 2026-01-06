@@ -64,6 +64,7 @@ from db import (
     get_release_date,
     get_reminders_enabled,
     get_smartlink_by_id,
+    get_smartlink_by_slugs,
     list_smartlinks,
     get_tasks_state,
     get_updates_opt_in,
@@ -438,6 +439,13 @@ SMARTLINK_INDEX_BASE = normalize_base_url(
     "https://go.sreda.pw",
 )
 SMARTLINK_INDEX_URL = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
+COVER_PROXY_BASE = normalize_base_url(
+    os.getenv("COVER_PROXY_BASE")
+    or os.getenv("PUBLIC_BASE_URL")
+    or os.getenv("BOT_PUBLIC_BASE")
+    or os.getenv("RAILWAY_PUBLIC_DOMAIN"),
+    f"http://localhost:{PORT}",
+)
 # HTTP timeout must be numeric: aiogram adds it to polling_timeout internally.
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_TOTAL", "90"))
 POLLING_BACKOFF_CONFIG = BackoffConfig(
@@ -543,6 +551,7 @@ async def smartlink_api_handler(request: web.Request) -> web.Response:
         "title": smartlink.get("title"),
         "release_date": smartlink.get("release_date"),
         "cover_file_id": smartlink.get("cover_file_id"),
+        "cover_url": smartlink.get("cover_url"),
         "links": smartlink.get("links"),
         "caption_text": smartlink.get("caption_text"),
     }
@@ -565,21 +574,86 @@ async def smartlink_latest_api_handler(request: web.Request) -> web.Response:
         "title": smartlink.get("title"),
         "release_date": smartlink.get("release_date"),
         "cover_file_id": smartlink.get("cover_file_id"),
+        "cover_url": smartlink.get("cover_url"),
         "links": smartlink.get("links"),
         "caption_text": smartlink.get("caption_text"),
     }
     return web.json_response(response)
 
 
-async def start_health_server() -> web.AppRunner:
+async def cover_proxy_handler(request: web.Request) -> web.StreamResponse | web.Response:
+    bot: Bot | None = request.app.get("bot")
+    if bot is None:
+        return web.json_response({"error": "bot_unavailable"}, status=503)
+
+    artist_slug = request.match_info.get("artist_slug")
+    slug = request.match_info.get("slug")
+    smartlink_id = request.match_info.get("smartlink_id")
+
+    smartlink: dict | None = None
+    if smartlink_id:
+        try:
+            smartlink = await get_smartlink_by_id(int(smartlink_id))
+        except Exception:
+            smartlink = None
+
+    if not smartlink and artist_slug and slug:
+        smartlink = await get_smartlink_by_slugs(artist_slug, slug)
+
+    if not smartlink:
+        return web.Response(status=404, text="not found")
+
+    cover_file_id = (smartlink.get("cover_file_id") or "").strip()
+    if not cover_file_id:
+        source = smartlink.get("cover_source") or {}
+        cover_file_id = str(source.get("file_id") or "").strip()
+    if not cover_file_id:
+        return web.Response(status=404, text="cover not found")
+
+    try:
+        file = await bot.get_file(cover_file_id)
+    except Exception as e:
+        logger.exception("[cover-proxy] failed to get file file_id=%s", cover_file_id)
+        return web.Response(status=502, text="file lookup failed")
+
+    file_path = getattr(file, "file_path", None)
+    if not file_path:
+        return web.Response(status=502, text="file path missing")
+
+    download_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(download_url) as resp:
+                if resp.status != 200:
+                    return web.Response(status=resp.status, text="download failed")
+                headers = {
+                    "Cache-Control": "public, max-age=0, must-revalidate",
+                }
+                content_type = resp.headers.get("Content-Type") or "application/octet-stream"
+                stream = web.StreamResponse(status=200, headers={"Content-Type": content_type, **headers})
+                await stream.prepare(request)
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    await stream.write(chunk)
+                await stream.write_eof()
+                return stream
+        except Exception:
+            logger.exception("[cover-proxy] failed to stream cover smartlink_id=%s", smartlink.get("id"))
+            return web.Response(status=502, text="stream failed")
+
+async def start_health_server(bot: Bot | None = None) -> web.AppRunner:
     app = web.Application()
     app.add_routes(
         [
             web.get("/health", health_handler),
             web.get("/api/smartlink/{id}", smartlink_api_handler),
             web.get("/api/smartlink/latest", smartlink_latest_api_handler),
+            web.get("/api/cover/{artist_slug}/{slug}", cover_proxy_handler),
+            web.get(r"/api/cover/{smartlink_id:\\d+}", cover_proxy_handler),
         ]
     )
+    if bot:
+        app["bot"] = bot
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -1317,6 +1391,15 @@ def slugify(value: str) -> str:
     return value.strip("-")
 
 
+def build_cover_proxy_url(artist_slug: str, slug: str) -> str:
+    if not artist_slug or not slug:
+        return ""
+    base = COVER_PROXY_BASE
+    if not base:
+        return ""
+    return f"{base}/api/cover/{artist_slug}/{slug}"
+
+
 async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | None]:
     if not payload or not payload.get("artist_slug") or not payload.get("slug"):
         logger.warning("[smartlink-index] invalid payload slugs, skipping send")
@@ -1442,6 +1525,10 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         raw_cover_url = data.get("cover_url") if isinstance(data.get("cover_url"), str) else ""
         cover_url = raw_cover_url.strip() if raw_cover_url and _is_valid_url(raw_cover_url.strip()) else ""
         metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        artist_slug = slugify(artist)
+        slug = slugify(title)
+        if not cover_url and artist_slug and slug:
+            cover_url = build_cover_proxy_url(artist_slug, slug)
         links_clean = {
             k: v
             for k, v in links.items()
@@ -1487,9 +1574,19 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             links_clean,
             caption_text,
             bool(data.get("branding_disabled")),
+            cover_url=cover_url,
+            artist_slug=artist_slug,
+            slug=slug,
         )
-        artist_slug = slugify(artist)
-        slug = slugify(title)
+        artist_slug = artist_slug or slugify(artist) or f"artist-{smartlink_id}"
+        slug = slug or slugify(title) or f"release-{smartlink_id}"
+        cover_url = build_cover_proxy_url(artist_slug, slug)
+        if cover_url:
+            await update_smartlink_data(
+                smartlink_id,
+                tg_id,
+                {"cover_url": cover_url, "artist_slug": artist_slug, "slug": slug},
+            )
         smartlink = {
             "id": smartlink_id,
             "owner_tg_id": tg_id,
@@ -1769,6 +1866,9 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
     if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
         links = latest.get("links") or {}
         links["spotify"] = spotify_url
+        artist_slug = slugify(latest.get("artist", ""))
+        slug = slugify(latest.get("title", ""))
+        cover_url = build_cover_proxy_url(artist_slug, slug) if artist_slug and slug else (latest.get("cover_url") or "")
         smartlink_id = await save_smartlink(
             tg_id,
             latest.get("artist", ""),
@@ -1779,6 +1879,9 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             links,
             latest.get("caption_text", "") or "",
             bool(latest.get("branding_disabled")),
+            cover_url=cover_url,
+            artist_slug=artist_slug,
+            slug=slug,
         )
         artist_slug = slugify(latest.get("artist", ""))
         slug = slugify(latest.get("title", ""))
@@ -1786,6 +1889,13 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             artist_slug = f"artist-{smartlink_id}"
         if not slug:
             slug = f"release-{smartlink_id}"
+        cover_url = build_cover_proxy_url(artist_slug, slug)
+        if cover_url:
+            await update_smartlink_data(
+                smartlink_id,
+                tg_id,
+                {"cover_url": cover_url, "artist_slug": artist_slug, "slug": slug},
+            )
 
         smartlink = {
             "id": smartlink_id,
@@ -3961,6 +4071,11 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
         "cover_file_id": file_id,
         "cover_source": {"type": "telegram", "file_id": file_id},
     }
+    artist_slug = slugify(latest.get("artist", "")) or f"artist-{latest.get('id') or tg_id}"
+    slug = slugify(latest.get("title", "")) or f"release-{latest.get('id') or tg_id}"
+    cover_url = build_cover_proxy_url(artist_slug, slug)
+    if cover_url:
+        updates.update({"cover_url": cover_url, "artist_slug": artist_slug, "slug": slug})
 
     try:
         await update_smartlink_data(latest["id"], tg_id, updates)
@@ -4693,7 +4808,7 @@ async def main():
         "Starting bot in POLLING mode, "
         f"bot_id={me.id}, username=@{me.username}, pid={os.getpid()}"
     )
-    await start_health_server()
+    await start_health_server(bot)
     print("Dropping webhook and pending updates before polling...")
     await bot.delete_webhook(drop_pending_updates=True)
     try:

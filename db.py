@@ -146,7 +146,10 @@ async def init_db():
             caption_text TEXT,
             branding_disabled INTEGER DEFAULT 0,
             created_at TEXT,
-            branding_paid INTEGER DEFAULT 0
+            branding_paid INTEGER DEFAULT 0,
+            cover_url TEXT,
+            artist_slug TEXT,
+            slug TEXT
         )
         """)
         try:
@@ -167,6 +170,18 @@ async def init_db():
             pass
         try:
             await db.execute("ALTER TABLE smartlinks ADD COLUMN branding_paid INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE smartlinks ADD COLUMN cover_url TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE smartlinks ADD COLUMN artist_slug TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE smartlinks ADD COLUMN slug TEXT")
         except Exception:
             pass
         await db.execute("""
@@ -590,6 +605,8 @@ def _smartlink_row_to_dict(row) -> dict:
         cover_source = {}
     if not cover_source and (row[8] if len(row) > 8 else ""):
         cover_source = {"type": "telegram", "file_id": row[8]}
+    artist_slug = row[16] if len(row) > 16 else None
+    slug = row[17] if len(row) > 17 else None
     return {
         "id": row[0],
         "owner_tg_id": row[1],
@@ -606,6 +623,9 @@ def _smartlink_row_to_dict(row) -> dict:
         "branding_disabled": bool(row[12]) if len(row) > 12 else False,
         "created_at": row[13] if len(row) > 13 else None,
         "branding_paid": bool(row[14]) if len(row) > 14 else False,
+        "cover_url": row[15] if len(row) > 15 else None,
+        "artist_slug": artist_slug,
+        "slug": slug,
     }
 
 
@@ -622,12 +642,15 @@ async def save_smartlink(
     pre_save_enabled: bool = True,
     reminders_enabled: bool = True,
     project_id: int | None = None,
+    cover_url: str | None = None,
+    artist_slug: str | None = None,
+    slug: str | None = None,
 ) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """
-            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, cover_url, artist_slug, slug)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 owner_tg_id,
@@ -643,6 +666,9 @@ async def save_smartlink(
                 caption_text,
                 1 if branding_disabled else 0,
                 dt.datetime.utcnow().isoformat(),
+                cover_url,
+                artist_slug,
+                slug,
             ),
         )
         await db.commit()
@@ -661,7 +687,7 @@ async def update_smartlink_caption(smartlink_id: int, caption_text: str):
 async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT 1",
             (owner_tg_id,),
         )
         row = await cur.fetchone()
@@ -671,17 +697,34 @@ async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
 async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE id=?",
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug FROM smartlinks WHERE id=?",
             (smartlink_id,),
         )
         row = await cur.fetchone()
         return _smartlink_row_to_dict(row) if row else None
 
 
+async def get_smartlink_by_slugs(artist_slug: str, slug: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id,
+                   cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug
+            FROM smartlinks
+            WHERE lower(coalesce(artist_slug, '')) = lower(?) AND lower(coalesce(slug, '')) = lower(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (artist_slug, slug),
+        )
+        row = await cur.fetchone()
+    return _smartlink_row_to_dict(row) if row else None
+
+
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
             (owner_tg_id, limit, offset),
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -701,6 +744,7 @@ async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: di
         "release_date",
         "cover_file_id",
         "cover_source",
+        "cover_url",
         "links",
         "caption_text",
         "branding_disabled",
@@ -708,6 +752,8 @@ async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: di
         "pre_save_enabled",
         "reminders_enabled",
         "project_id",
+        "artist_slug",
+        "slug",
     }
     fields: list[str] = []
     params: list = []
@@ -801,7 +847,7 @@ async def mark_smartlink_notified(smartlink_id: int, subscriber_tg_id: int):
 async def get_smartlinks_with_release() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid FROM smartlinks WHERE release_date IS NOT NULL",
+            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug FROM smartlinks WHERE release_date IS NOT NULL",
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
 
