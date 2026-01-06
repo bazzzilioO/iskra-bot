@@ -1545,6 +1545,24 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             len(links_clean),
         )
 
+        cover_source_type = cover_source.get("type") if isinstance(cover_source, dict) else None
+        if cover_source_type == "telegram":
+            cover_file_id = str(cover_source.get("file_id") or "").strip()
+            if not cover_file_id:
+                await message.answer(
+                    "Обложка не выбрана или недоступна",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
+        elif cover_source_type:
+            await message.answer(
+                "Обложка не выбрана или недоступна",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+        else:
+            cover_source = {}
+
         missing_fields = [name for name, value in {"artist": artist, "title": title}.items() if not value]
         if missing_fields:
             logger.warning("[smartlink] missing fields tg_id=%s fields=%s", tg_id, missing_fields)
