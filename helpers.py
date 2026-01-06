@@ -181,38 +181,42 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
     cover_source_payload: dict | None = None
     cover_source_type = "none"
 
-    if cover_url:
-        cover_source_type = "external"
-    else:
-        cover_source = (smartlink or {}).get("cover_source")
-        if isinstance(cover_source, dict):
-            source_type = cover_source.get("type")
-            if source_type == "telegram":
-                file_id = str(cover_source.get("file_id") or "").strip()
-                if not file_id or file_id.isdigit():
-                    logger.warning(
-                        "[smartlink-index] telegram cover malformed file_id=%s", file_id
-                    )
-                    return None
-                cover_source_type = "telegram"
-                cover_source_payload = {"type": "telegram", "file_id": file_id}
-            else:
+    cover_source = (smartlink or {}).get("cover_source")
+    telegram_file_id: str | None = None
+
+    if isinstance(cover_source, dict):
+        source_type = cover_source.get("type")
+        if source_type == "telegram":
+            file_id = str(cover_source.get("file_id") or "").strip()
+            if not file_id or file_id.isdigit():
                 logger.warning(
-                    "[smartlink-index] cover source unsupported type=%s", source_type
+                    "[smartlink-index] telegram cover malformed file_id=%s", file_id
                 )
                 return None
+            telegram_file_id = file_id
         else:
-            cover_file_id = (smartlink or {}).get("cover_file_id")
-            if isinstance(cover_file_id, str):
-                cover_file_id = cover_file_id.strip()
-                if cover_file_id:
-                    if cover_file_id.isdigit():
-                        logger.warning(
-                            "[smartlink-index] telegram cover malformed file_id=%s", cover_file_id
-                        )
-                        return None
-                    cover_source_type = "telegram"
-                    cover_source_payload = {"type": "telegram", "file_id": cover_file_id}
+            logger.warning(
+                "[smartlink-index] cover source unsupported type=%s", source_type
+            )
+            return None
+
+    if not telegram_file_id:
+        cover_file_id = (smartlink or {}).get("cover_file_id")
+        if isinstance(cover_file_id, str):
+            cover_file_id = cover_file_id.strip()
+            if cover_file_id:
+                if cover_file_id.isdigit():
+                    logger.warning(
+                        "[smartlink-index] telegram cover malformed file_id=%s", cover_file_id
+                    )
+                    return None
+                telegram_file_id = cover_file_id
+
+    if telegram_file_id:
+        cover_source_type = "telegram"
+        cover_source_payload = {"type": "telegram", "file_id": telegram_file_id}
+    elif cover_url:
+        cover_source_type = "external"
 
     logger.info("[smartlink-index] cover source=%s", cover_source_type)
 
@@ -227,10 +231,10 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
         "links": links,
     }
 
-    if cover_url:
-        payload["cover_url"] = cover_url
-    elif cover_source_payload:
+    if cover_source_payload:
         payload["cover_source"] = cover_source_payload
+    elif cover_url:
+        payload["cover_url"] = cover_url
 
     return payload
 
