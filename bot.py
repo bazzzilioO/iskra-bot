@@ -3250,74 +3250,29 @@ async def smartlinks_edit_cb(callback):
             smartlink = candidate
 
     if smartlink:
-        await show_smartlink_view(callback.message, tg_id, smartlink.get("id"), page)
+        text = build_smartlink_view_text(smartlink)
+        await callback.message.answer(
+            text + "\n\nВыбери, что обновить:",
+            reply_markup=smartlink_edit_menu_kb(
+                smartlink.get("id"),
+                page,
+                smartlink.get("branding_disabled"),
+                smartlink.get("branding_paid"),
+            ),
+        )
         await callback.answer()
         return
 
-    ok, remote = await fetch_smartlink_from_index(artist_slug, slug)
-    if not ok:
-        await callback.answer("Не удалось открыть смартлинк (см. логи).", show_alert=True)
-        return
-    if not remote:
-        await callback.answer("Смартлинк не найден.", show_alert=True)
-        return
-
-    links = remote.get("links") if isinstance(remote.get("links"), dict) else {}
-    links = {k: v for k, v in (links or {}).items() if isinstance(k, str) and isinstance(v, str)}
-    cover_source = remote.get("cover_source") if isinstance(remote.get("cover_source"), dict) else {}
-    cover_file_id = str(remote.get("cover_file_id") or "").strip()
-    caption_text = remote.get("caption_text") or remote.get("caption") or ""
-    release_date_iso = str(remote.get("release_date") or "").strip()
-    cover_url = remote.get("cover_url")
-    cover_version_raw = remote.get("cover_version")
-    pre_save_enabled_raw = remote.get("pre_save_enabled")
-    reminders_enabled_raw = remote.get("reminders_enabled")
-
-    artist_slug_import, slug_import = get_smartlink_slugs(
-        {
-            "artist": remote.get("artist_name") or remote.get("artist") or "",
-            "title": remote.get("title") or "",
-            "artist_slug": artist_slug,
-            "slug": slug,
-        }
+    logger.warning(
+        "[smartlink-edit-legacy] smartlink not found tg_id=%s artist_slug=%s slug=%s",
+        tg_id,
+        artist_slug,
+        slug,
     )
-
-    try:
-        cover_version = int(cover_version_raw) if cover_version_raw is not None else 1
-    except Exception:
-        cover_version = 1
-
-    try:
-        new_id = await save_smartlink(
-            tg_id,
-            remote.get("artist_name") or remote.get("artist") or "",
-            remote.get("title") or "",
-            release_date_iso,
-            cover_file_id,
-            cover_source,
-            links,
-            caption_text,
-            bool(pre_save_enabled_raw)
-            if pre_save_enabled_raw is not None
-            else True,
-            bool(reminders_enabled_raw)
-            if reminders_enabled_raw is not None
-            else True,
-            remote.get("project_id"),
-            cover_url if cover_url else None,
-            artist_slug_import,
-            slug_import,
-            cover_version,
-        )
-    except Exception:
-        logger.exception(
-            "[smartlink-edit] import failed artist_slug=%s slug=%s", artist_slug, slug
-        )
-        await callback.answer("Не удалось импортировать смартлинк.", show_alert=True)
-        return
-
-    await show_smartlink_view(callback.message, tg_id, new_id, page)
-    await callback.answer()
+    await callback.answer(
+        "Смартлинк не найден в вашей базе. Откройте список ‘Мои смартлинки’ заново.",
+        show_alert=True,
+    )
 
 
 @dp.callback_query(F.data.startswith("smartlinks:list:"))

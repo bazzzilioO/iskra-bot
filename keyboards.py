@@ -380,17 +380,10 @@ def smartlinks_menu_kb() -> InlineKeyboardMarkup:
 
 def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
     smartlink_id = smartlink.get("id")
-    artist_slug = str(smartlink.get("artist_slug") or "").strip()
-    release_slug = str(smartlink.get("slug") or "").strip()
-    if artist_slug and release_slug:
-        edit_callback = f"smartlinks:edit:{artist_slug}:{release_slug}:{page}"
-    else:
-        edit_callback = f"smartlinks:edit_menu:{smartlink_id}:{page}"
-
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_id}:{page}")],
-            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=edit_callback)],
+            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink_id}")],
             [InlineKeyboardButton(text=f"📤 Экспорт ⭐{EXPORT_UNLOCK_PRICE}", callback_data=f"smartlinks:export:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"smartlinks:delete:{smartlink_id}:{page}")],
