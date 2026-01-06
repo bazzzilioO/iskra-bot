@@ -69,6 +69,7 @@ from db import (
     get_tasks_state,
     get_updates_opt_in,
     get_updates_opt_in_users,
+    bump_smartlink_cover_version,
     init_db,
     is_smartlink_subscribed,
     reset_all_data,
@@ -1603,6 +1604,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "created_at": dt.datetime.utcnow().isoformat(),
             "cover_url": cover_url,
             "metadata": metadata,
+            "cover_version": 1,
         }
         sync_payload = build_smartlink_index_payload(smartlink)
         if sync_payload:
@@ -1911,6 +1913,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "artist_slug": artist_slug,
             "slug": slug,
             "created_at": dt.datetime.utcnow().isoformat(),
+            "cover_version": 1,
         }
         try:
             await push_smartlink_to_index(smartlink)
@@ -3073,6 +3076,14 @@ async def smartlinks_reindex_cb(callback):
         return
 
     try:
+        await bump_smartlink_cover_version(smartlink_id, smartlink.get("owner_tg_id"))
+        smartlink = await get_smartlink_by_id(smartlink_id) or smartlink
+    except Exception:
+        logger.exception(
+            "[smartlink] cover version bump failed smartlink_id=%s", smartlink_id
+        )
+
+    try:
         success = await push_smartlink_to_index(smartlink)
     except Exception:
         logger.exception("[smartlink] reindex failed smartlink_id=%s", smartlink_id)
@@ -4080,6 +4091,15 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
     try:
         await update_smartlink_data(latest["id"], tg_id, updates)
         latest.update(updates)
+        try:
+            new_version = await bump_smartlink_cover_version(latest["id"], tg_id)
+            if new_version:
+                latest["cover_version"] = new_version
+        except Exception:
+            logger.exception(
+                "[cover-upgrade] failed to bump cover version smartlink_id=%s",
+                latest.get("id"),
+            )
         logger.info(
             "[cover-upgrade] success smartlink_id=%s file_id=%s", latest.get("id"), file_id
         )
@@ -4607,6 +4627,9 @@ async def any_message_router(message: Message):
 
         if updates:
             await update_smartlink_data(smartlink_id, tg_id, updates)
+            if {"cover_file_id", "cover_source", "cover_url"} & set(updates.keys()):
+                with contextlib.suppress(Exception):
+                    await bump_smartlink_cover_version(smartlink_id, tg_id)
         await form_clear(tg_id)
         updated = await get_smartlink_by_id(smartlink_id)
         if updated:

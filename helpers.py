@@ -220,6 +220,14 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
 
     logger.info("[smartlink-index] cover source=%s", cover_source_type)
 
+    cover_version_raw = (smartlink or {}).get("cover_version")
+    try:
+        cover_version = int(cover_version_raw)
+    except Exception:
+        cover_version = 1
+    if cover_version <= 0:
+        cover_version = 1
+
     payload = {
         "artist_slug": artist_slug,
         "slug": slug,
@@ -229,11 +237,12 @@ def build_smartlink_index_payload(smartlink: dict) -> dict | None:
         or "",
         "release_date": (smartlink or {}).get("release_date") or None,
         "links": links,
+        "cover_version": cover_version,
     }
 
     if cover_source_payload:
         payload["cover_source"] = cover_source_payload
-    elif cover_url:
+    if cover_url:
         payload["cover_url"] = cover_url
 
     return payload
