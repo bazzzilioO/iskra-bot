@@ -3262,24 +3262,30 @@ async def smartlinks_edit_cb(callback):
         await callback.answer("Смартлинк не найден.", show_alert=True)
         return
 
-    links = remote.get("links") or {}
-    if not isinstance(links, dict):
-        links = {}
-    cover_source = remote.get("cover_source")
-    if not isinstance(cover_source, dict):
-        cover_source = {}
+    links = remote.get("links") if isinstance(remote.get("links"), dict) else {}
+    links = {k: v for k, v in (links or {}).items() if isinstance(k, str) and isinstance(v, str)}
+    cover_source = remote.get("cover_source") if isinstance(remote.get("cover_source"), dict) else {}
     cover_file_id = str(remote.get("cover_file_id") or "").strip()
     caption_text = remote.get("caption_text") or remote.get("caption") or ""
     release_date_iso = str(remote.get("release_date") or "").strip()
     cover_url = remote.get("cover_url")
     cover_version_raw = remote.get("cover_version")
+    pre_save_enabled_raw = remote.get("pre_save_enabled")
+    reminders_enabled_raw = remote.get("reminders_enabled")
+
+    artist_slug_import, slug_import = get_smartlink_slugs(
+        {
+            "artist": remote.get("artist_name") or remote.get("artist") or "",
+            "title": remote.get("title") or "",
+            "artist_slug": artist_slug,
+            "slug": slug,
+        }
+    )
+
     try:
         cover_version = int(cover_version_raw) if cover_version_raw is not None else 1
     except Exception:
         cover_version = 1
-
-    pre_save_enabled_raw = remote.get("pre_save_enabled")
-    reminders_enabled_raw = remote.get("reminders_enabled")
 
     try:
         new_id = await save_smartlink(
@@ -3299,8 +3305,8 @@ async def smartlinks_edit_cb(callback):
             else True,
             remote.get("project_id"),
             cover_url if cover_url else None,
-            artist_slug,
-            slug,
+            artist_slug_import,
+            slug_import,
             cover_version,
         )
     except Exception:
