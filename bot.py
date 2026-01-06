@@ -93,6 +93,7 @@ from db import (
     was_qc_checked,
     save_smartlink_message_reference,
     get_smartlink_messages,
+    count_all_smartlinks,
 )
 from helpers import (
     escape_html,
@@ -900,6 +901,20 @@ async def fetch_smartlink_from_index(
 
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
     total = await count_smartlinks(tg_id)
+    all_total = await count_all_smartlinks()
+    if total == 0 and all_total > 0:
+        logger.error(
+            "[smartlinks-my] empty state for user with existing smartlinks tg_id=%s total_all=%s",
+            tg_id,
+            all_total,
+        )
+    else:
+        logger.info(
+            "[smartlinks-my] fetched count tg_id=%s total=%s total_all=%s",
+            tg_id,
+            total,
+            all_total,
+        )
     if total <= 0:
         await message.answer(
             "У тебя пока нет смартлинков. Создай первый через «➕ Создать смарт-линк».",
@@ -912,6 +927,10 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
     start = page * MY_SMARTLINKS_PAGE_SIZE
     items = await list_smartlinks(
         tg_id, limit=MY_SMARTLINKS_PAGE_SIZE, offset=start
+    )
+
+    logger.info(
+        "[smartlinks-my] returning items tg_id=%s page=%s count=%s", tg_id, page, len(items)
     )
 
     text = build_my_smartlinks_text(items, page, total_pages, start)

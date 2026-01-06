@@ -733,7 +733,15 @@ async def get_smartlink_by_slugs(artist_slug: str, slug: str) -> dict | None:
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE owner_tg_id=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            """
+            SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id,
+                   cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at,
+                   branding_paid, cover_url, artist_slug, slug, cover_version
+            FROM smartlinks
+            WHERE owner_tg_id=?
+            ORDER BY COALESCE(created_at, '') DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
             (owner_tg_id, limit, offset),
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
@@ -742,6 +750,13 @@ async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> 
 async def count_smartlinks(owner_tg_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT COUNT(*) FROM smartlinks WHERE owner_tg_id=?", (owner_tg_id,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+
+async def count_all_smartlinks() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM smartlinks")
         row = await cur.fetchone()
         return int(row[0]) if row else 0
 
