@@ -766,6 +766,7 @@ def build_my_smartlinks_kb(
     for idx, item in enumerate(items, start=start_index + 1):
         artist_slug = str(item.get("artist_slug") or "").strip()
         slug = str(item.get("slug") or "").strip()
+        smartlink_id = item.get("local_id")
         canonical_url = (
             f"{SMARTLINK_INDEX_BASE}/{artist_slug}/{slug}"
             if artist_slug and slug
@@ -774,11 +775,11 @@ def build_my_smartlinks_kb(
         row: list[InlineKeyboardButton] = []
         if canonical_url:
             row.append(InlineKeyboardButton(text=f"{idx}. 🌐 Открыть", url=canonical_url))
-        if artist_slug and slug:
+        if smartlink_id:
             row.append(
                 InlineKeyboardButton(
                     text="✏️ Редактировать",
-                    callback_data=f"smartlinks:edit:{artist_slug}:{slug}:{page}",
+                    callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}",
                 )
             )
         if row:
@@ -3223,45 +3224,8 @@ async def smartlinks_edit_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     parts = callback.data.split(":")
-    if len(parts) != 5:
-        await callback.answer("Не понял", show_alert=True)
-        return
-
-    artist_slug = parts[2].strip()
-    slug = parts[3].strip()
-    try:
-        page = int(parts[4])
-    except ValueError:
-        page = 0
-
-    if not artist_slug or not slug:
-        await callback.answer("Не понял", show_alert=True)
-        return
-
-    smartlink: dict | None = None
-    try:
-        candidate = await get_smartlink_by_slugs(artist_slug, slug)
-    except Exception:
-        logger.exception(
-            "[smartlink-edit] lookup failed artist_slug=%s slug=%s", artist_slug, slug
-        )
-    else:
-        if candidate and str(candidate.get("owner_tg_id")) == str(tg_id):
-            smartlink = candidate
-
-    if smartlink:
-        text = build_smartlink_view_text(smartlink)
-        await callback.message.answer(
-            text + "\n\nВыбери, что обновить:",
-            reply_markup=smartlink_edit_menu_kb(
-                smartlink.get("id"),
-                page,
-                smartlink.get("branding_disabled"),
-                smartlink.get("branding_paid"),
-            ),
-        )
-        await callback.answer()
-        return
+    artist_slug = parts[2].strip() if len(parts) > 2 else ""
+    slug = parts[3].strip() if len(parts) > 3 else ""
 
     logger.warning(
         "[smartlink-edit-legacy] smartlink not found tg_id=%s artist_slug=%s slug=%s",
