@@ -78,7 +78,7 @@ async def fetch_smartlink_from_index(artist_slug: str, slug: str) -> dict | None
     if not SMARTLINK_INDEX_BASE or not SMARTLINK_API_KEY or not artist_slug or not slug:
         return None
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {"Authorization": f"Bearer {SMARTLINK_API_KEY}"}
+    headers = {"X-API-Key": SMARTLINK_API_KEY}
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:

@@ -2,16 +2,126 @@ import datetime as dt
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Iterable
 
 import aiosqlite
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+SMARTLINK_D1_PATH = (
+    os.getenv("SMARTLINK_D1_PATH")
+    or os.getenv("SMARTLINK_D1_DB")
+    or os.getenv("SMARTLINK_DB_PATH")
+)
 DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_REMINDER_OFFSETS = "-7,-1,0,7"
 DEFAULT_REMINDER_TIME = "12:00"
 REMINDER_CLEAN_DAYS = 60
 logger = logging.getLogger(__name__)
+
+SMARTLINK_PUBLISH_QUEUE_TABLE = "smartlink_publish_queue"
+
+
+@asynccontextmanager
+async def _smartlink_d1_connection():
+    if not SMARTLINK_D1_PATH:
+        logger.error("[smartlink-d1] SMARTLINK_D1_PATH is not configured")
+        yield None
+        return
+    db = await aiosqlite.connect(SMARTLINK_D1_PATH)
+    db.row_factory = aiosqlite.Row
+    try:
+        yield db
+    finally:
+        await db.close()
+
+
+def _parse_json_value(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    return None
+
+
+def _coerce_bool(value: object | None, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return bool(value)
+
+
+async def _get_smartlink_owner_column(db: aiosqlite.Connection) -> str | None:
+    cur = await db.execute("PRAGMA table_info(smartlinks)")
+    rows = await cur.fetchall()
+    columns = {row[1] for row in rows}
+    for candidate in ("owner_tg_user_id", "owner_tg_id"):
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def _normalize_d1_smartlink(row: aiosqlite.Row) -> dict:
+    data = dict(row)
+    owner_raw = (
+        data.get("owner_tg_user_id")
+        or data.get("owner_tg_id")
+        or data.get("owner_id")
+    )
+    owner_tg_id = 0
+    if owner_raw is not None:
+        try:
+            owner_tg_id = int(owner_raw)
+        except Exception:
+            owner_tg_id = 0
+
+    artist_slug = str(data.get("artist_slug") or "").strip()
+    slug = str(data.get("slug") or "").strip()
+    links_raw = data.get("links_json") or data.get("links")
+    links = _parse_json_value(links_raw)
+    if not isinstance(links, dict):
+        links = {}
+
+    metadata_raw = data.get("metadata_json") or data.get("metadata")
+    metadata = _parse_json_value(metadata_raw)
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    cover_source_raw = data.get("cover_source_json") or data.get("cover_source")
+    cover_source = _parse_json_value(cover_source_raw)
+    if not isinstance(cover_source, dict):
+        cover_source = {}
+
+    cover_file_id = data.get("cover_file_id") or cover_source.get("file_id") or ""
+
+    smartlink = {
+        "id": f"{artist_slug}:{slug}" if artist_slug and slug else str(data.get("id") or ""),
+        "owner_tg_id": owner_tg_id,
+        "artist": data.get("artist") or data.get("artist_name") or "",
+        "title": data.get("title") or "",
+        "release_date": data.get("release_date") or "",
+        "cover_file_id": cover_file_id or "",
+        "cover_source": cover_source or {},
+        "links": links,
+        "caption_text": data.get("caption_text") or "",
+        "branding_disabled": _coerce_bool(data.get("branding_disabled")),
+        "branding_paid": _coerce_bool(data.get("branding_paid")),
+        "pre_save_enabled": _coerce_bool(data.get("pre_save_enabled"), default=True),
+        "reminders_enabled": _coerce_bool(data.get("reminders_enabled"), default=True),
+        "cover_url": data.get("cover_url"),
+        "artist_slug": artist_slug,
+        "slug": slug,
+        "cover_version": int(data.get("cover_version") or 1),
+        "metadata": metadata,
+    }
+    return smartlink
 
 
 def _parse_offsets(raw: str | None) -> list[int]:
@@ -184,6 +294,23 @@ async def init_db():
             PRIMARY KEY (smartlink_id, chat_id)
         )
         """)
+        await db.execute(
+            f"""
+        CREATE TABLE IF NOT EXISTS {SMARTLINK_PUBLISH_QUEUE_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist_slug TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            smartlink_json TEXT NOT NULL,
+            owner_json TEXT,
+            attempt INTEGER DEFAULT 0,
+            next_attempt_at TEXT NOT NULL,
+            last_error TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(artist_slug, slug)
+        )
+        """
+        )
         await db.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,6 +339,236 @@ async def init_db():
             PRIMARY KEY (tg_id, task_id, key)
         )
         """)
+        await db.commit()
+
+
+async def list_owned_smartlinks(
+    owner_tg_id: int | str,
+    limit: int,
+    offset: int,
+) -> list[dict] | None:
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return None
+        owner_col = await _get_smartlink_owner_column(db)
+        if not owner_col:
+            logger.error("[smartlink-d1] smartlinks owner column not found")
+            return None
+        try:
+            cur = await db.execute("PRAGMA table_info(smartlinks)")
+            rows = await cur.fetchall()
+            columns = {row[1] for row in rows}
+            if "updated_at" in columns and "created_at" in columns:
+                order_expr = "COALESCE(updated_at, created_at) DESC"
+            elif "updated_at" in columns:
+                order_expr = "updated_at DESC"
+            elif "created_at" in columns:
+                order_expr = "created_at DESC"
+            else:
+                order_expr = "rowid DESC"
+            query = (
+                f"SELECT * FROM smartlinks WHERE {owner_col}=? "
+                f"ORDER BY {order_expr} LIMIT ? OFFSET ?"
+            )
+            cur = await db.execute(query, (str(owner_tg_id), limit, offset))
+            rows = await cur.fetchall()
+            return [_normalize_d1_smartlink(row) for row in rows]
+        except Exception:
+            logger.exception("[smartlink-d1] failed to list smartlinks owner=%s", owner_tg_id)
+            return None
+
+
+async def count_owned_smartlinks(owner_tg_id: int | str) -> int | None:
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return None
+        owner_col = await _get_smartlink_owner_column(db)
+        if not owner_col:
+            logger.error("[smartlink-d1] smartlinks owner column not found")
+            return None
+        try:
+            cur = await db.execute(
+                f"SELECT COUNT(1) FROM smartlinks WHERE {owner_col}=?",
+                (str(owner_tg_id),),
+            )
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            logger.exception("[smartlink-d1] failed to count smartlinks owner=%s", owner_tg_id)
+            return None
+
+
+async def fetch_owned_smartlink_from_d1(
+    owner_tg_id: int | str,
+    artist_slug: str,
+    slug: str,
+) -> dict | None:
+    artist_slug = str(artist_slug or "").strip()
+    slug = str(slug or "").strip()
+    if not artist_slug or not slug:
+        return None
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return None
+        owner_col = await _get_smartlink_owner_column(db)
+        if not owner_col:
+            logger.error("[smartlink-d1] smartlinks owner column not found")
+            return None
+        try:
+            cur = await db.execute(
+                f"""
+                SELECT * FROM smartlinks
+                WHERE {owner_col}=? AND artist_slug=? AND slug=?
+                LIMIT 1
+                """,
+                (str(owner_tg_id), artist_slug, slug),
+            )
+            row = await cur.fetchone()
+            return _normalize_d1_smartlink(row) if row else None
+        except Exception:
+            logger.exception(
+                "[smartlink-d1] failed to fetch smartlink owner=%s artist_slug=%s slug=%s",
+                owner_tg_id,
+                artist_slug,
+                slug,
+            )
+            return None
+
+
+async def list_recent_smartlinks(limit: int) -> list[dict] | None:
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return None
+        try:
+            cur = await db.execute("PRAGMA table_info(smartlinks)")
+            rows = await cur.fetchall()
+            columns = {row[1] for row in rows}
+            if "updated_at" in columns and "created_at" in columns:
+                order_expr = "COALESCE(updated_at, created_at) DESC"
+            elif "updated_at" in columns:
+                order_expr = "updated_at DESC"
+            elif "created_at" in columns:
+                order_expr = "created_at DESC"
+            else:
+                order_expr = "rowid DESC"
+            query = f"SELECT * FROM smartlinks ORDER BY {order_expr} LIMIT ?"
+            cur = await db.execute(query, (limit,))
+            rows = await cur.fetchall()
+            return [_normalize_d1_smartlink(row) for row in rows]
+        except Exception:
+            logger.exception("[smartlink-d1] failed to list recent smartlinks")
+            return None
+
+
+def _serialize_json(payload: dict | None) -> str | None:
+    if payload is None:
+        return None
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def enqueue_smartlink_publish_retry(
+    artist_slug: str,
+    slug: str,
+    smartlink: dict,
+    owner: dict | None,
+    *,
+    delay_seconds: int,
+    last_error: str | None,
+) -> None:
+    now = dt.datetime.utcnow()
+    next_attempt_at = (now + dt.timedelta(seconds=delay_seconds)).isoformat()
+    created_at = now.isoformat()
+    smartlink_json = _serialize_json(smartlink)
+    owner_json = _serialize_json(owner)
+    if not smartlink_json:
+        logger.warning("[smartlink-publish] skip enqueue missing payload artist_slug=%s slug=%s", artist_slug, slug)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"""
+            INSERT INTO {SMARTLINK_PUBLISH_QUEUE_TABLE}
+                (artist_slug, slug, smartlink_json, owner_json, attempt, next_attempt_at, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
+            ON CONFLICT(artist_slug, slug) DO UPDATE SET
+                smartlink_json=excluded.smartlink_json,
+                owner_json=excluded.owner_json,
+                attempt=0,
+                next_attempt_at=excluded.next_attempt_at,
+                last_error=excluded.last_error,
+                updated_at=excluded.updated_at
+            """,
+            (
+                artist_slug,
+                slug,
+                smartlink_json,
+                owner_json,
+                next_attempt_at,
+                last_error,
+                created_at,
+                created_at,
+            ),
+        )
+        await db.commit()
+
+
+async def list_due_smartlink_publish_jobs(
+    now: dt.datetime,
+    limit: int = 10,
+) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            f"""
+            SELECT id, artist_slug, slug, smartlink_json, owner_json, attempt
+            FROM {SMARTLINK_PUBLISH_QUEUE_TABLE}
+            WHERE next_attempt_at <= ?
+            ORDER BY next_attempt_at
+            LIMIT ?
+            """,
+            (now.isoformat(), limit),
+        )
+        rows = await cur.fetchall()
+        jobs: list[dict] = []
+        for row in rows:
+            smartlink = _parse_json_value(row["smartlink_json"])
+            owner = _parse_json_value(row["owner_json"])
+            jobs.append(
+                {
+                    "id": row["id"],
+                    "artist_slug": row["artist_slug"],
+                    "slug": row["slug"],
+                    "smartlink": smartlink if isinstance(smartlink, dict) else {},
+                    "owner": owner if isinstance(owner, dict) else None,
+                    "attempt": int(row["attempt"] or 0),
+                }
+            )
+        return jobs
+
+
+async def update_smartlink_publish_job(
+    job_id: int,
+    attempt: int,
+    next_attempt_at: dt.datetime,
+    last_error: str | None,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"""
+            UPDATE {SMARTLINK_PUBLISH_QUEUE_TABLE}
+            SET attempt=?, next_attempt_at=?, last_error=?, updated_at=?
+            WHERE id=?
+            """,
+            (attempt, next_attempt_at.isoformat(), last_error, dt.datetime.utcnow().isoformat(), job_id),
+        )
+        await db.commit()
+
+
+async def delete_smartlink_publish_job(job_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"DELETE FROM {SMARTLINK_PUBLISH_QUEUE_TABLE} WHERE id=?",
+            (job_id,),
+        )
         await db.commit()
 
 
