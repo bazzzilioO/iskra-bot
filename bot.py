@@ -819,7 +819,6 @@ async def fetch_my_smartlinks_from_index(
     if SMARTLINK_API_KEY:
         headers["X-API-Key"] = SMARTLINK_API_KEY
     params = {
-        "owner_tg_id": str(tg_id),
         "owner_tg_user_id": str(tg_id),
         "page": page,
         "limit": limit,
