@@ -142,6 +142,36 @@ def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     return artist_slug, slug
 
 
+def build_smartlink_id(artist_slug: str, slug: str) -> str:
+    if not artist_slug or not slug:
+        return ""
+    return f"{artist_slug}:{slug}"
+
+
+def parse_smartlink_id(smartlink_id: int | str | None) -> tuple[str, str]:
+    if smartlink_id is None:
+        return "", ""
+    raw = str(smartlink_id)
+    if ":" not in raw:
+        return "", ""
+    artist_slug, slug = raw.split(":", 1)
+    return artist_slug.strip(), slug.strip()
+
+
+def build_smartlink_key(artist_slug: str, slug: str) -> str:
+    if not artist_slug or not slug:
+        return ""
+    return f"{artist_slug}|{slug}"
+
+
+def parse_smartlink_key(key: str | None) -> tuple[str, str]:
+    raw = (key or "").strip()
+    if "|" not in raw:
+        return "", ""
+    artist_slug, slug = raw.split("|", 1)
+    return artist_slug.strip(), slug.strip()
+
+
 def build_smartlink_index_payload(
     smartlink: dict, owner: dict | None = None
 ) -> dict | None:
