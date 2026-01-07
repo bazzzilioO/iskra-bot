@@ -4,7 +4,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
-from helpers import smartlink_pre_save_active
+from helpers import get_smartlink_slugs, smartlink_pre_save_active
 
 
 LINKS = {
@@ -380,10 +380,16 @@ def smartlinks_menu_kb() -> InlineKeyboardMarkup:
 
 def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
     smartlink_id = smartlink.get("id")
+    artist_slug, slug = get_smartlink_slugs(smartlink)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_id}:{page}")],
-            [InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Редактировать",
+                    callback_data=f"smartlinks:edit_menu:{artist_slug}:{slug}:{page}",
+                )
+            ],
             [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink_id}")],
             [InlineKeyboardButton(text=f"📤 Экспорт ⭐{EXPORT_UNLOCK_PRICE}", callback_data=f"smartlinks:export:{smartlink_id}:{page}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"smartlinks:delete:{smartlink_id}:{page}")],
@@ -393,7 +399,12 @@ def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
 
 
 def smartlink_edit_menu_kb(
-    smartlink_id: int, page: int, branding_disabled: bool = False, branding_paid: bool = False
+    artist_slug: str,
+    slug: str,
+    page: int,
+    smartlink_id: int | str | None = None,
+    branding_disabled: bool = False,
+    branding_paid: bool = False,
 ) -> InlineKeyboardMarkup:
     if branding_disabled:
         branding_text = "🏷 Брендинг ИСКРЫ: Выкл"
@@ -401,24 +412,79 @@ def smartlink_edit_menu_kb(
         branding_text = "🏷 Брендинг ИСКРЫ: Вкл"
     else:
         branding_text = "Убрать брендинг ⭐10"
+    smartlink_id_str = str(smartlink_id) if smartlink_id is not None else ""
+    back_callback = (
+        f"smartlinks:view:{smartlink_id}:{page}"
+        if smartlink_id_str.isdigit()
+        else f"smartlinks:my:{page}"
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Артист/Название", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:title")],
-            [InlineKeyboardButton(text="Дата релиза", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:date")],
-            [InlineKeyboardButton(text="Описание", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:caption")],
-            [InlineKeyboardButton(text="Обложка", callback_data=f"smartlinks:edit_field:{smartlink_id}:{page}:cover")],
-            [InlineKeyboardButton(text="Ссылки", callback_data=f"smartlinks:edit_links:{smartlink_id}:{page}")],
-            [InlineKeyboardButton(text=branding_text, callback_data=f"smartlinks:branding_toggle:{smartlink_id}:{page}")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:view:{smartlink_id}:{page}")],
+            [
+                InlineKeyboardButton(
+                    text="Артист/Название",
+                    callback_data=f"smartlinks:edit_field:{artist_slug}:{slug}:{page}:title",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Дата релиза",
+                    callback_data=f"smartlinks:edit_field:{artist_slug}:{slug}:{page}:date",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Описание",
+                    callback_data=f"smartlinks:edit_field:{artist_slug}:{slug}:{page}:caption",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Обложка",
+                    callback_data=f"smartlinks:edit_field:{artist_slug}:{slug}:{page}:cover",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Ссылки",
+                    callback_data=f"smartlinks:edit_links:{artist_slug}:{slug}:{page}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=branding_text,
+                    callback_data=f"smartlinks:branding_toggle:{artist_slug}:{slug}:{page}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Назад",
+                    callback_data=back_callback,
+                )
+            ],
         ]
     )
 
 
-def smartlink_links_menu_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
+def smartlink_links_menu_kb(artist_slug: str, slug: str, page: int) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for key, label in SMARTLINK_BUTTON_ORDER:
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlinks:edit_link:{smartlink_id}:{page}:{key}")])
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}")])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"smartlinks:edit_link:{artist_slug}:{slug}:{page}:{key}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="◀️ Назад",
+                callback_data=f"smartlinks:edit_menu:{artist_slug}:{slug}:{page}",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -450,16 +516,21 @@ def smartlink_export_paywall_kb(smartlink_id: int, page: int | None = None) -> I
     )
 
 
-def smartlink_branding_confirm_kb(smartlink_id: int, page: int) -> InlineKeyboardMarkup:
+def smartlink_branding_confirm_kb(artist_slug: str, slug: str, page: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text=f"⭐ Оплатить {BRANDING_DISABLE_PRICE} Stars",
-                    callback_data=f"smartlinks:branding_pay:{smartlink_id}:{page}",
+                    callback_data=f"smartlinks:branding_pay:{artist_slug}:{slug}:{page}",
                 )
             ],
-            [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"smartlinks:branding_cancel:{smartlink_id}:{page}")],
+            [
+                InlineKeyboardButton(
+                    text="◀️ Отмена",
+                    callback_data=f"smartlinks:branding_cancel:{artist_slug}:{slug}:{page}",
+                )
+            ],
         ]
     )
 
@@ -476,6 +547,7 @@ def build_smartlink_buttons(
     links = smartlink.get("links") or {}
     page_marker = page if page is not None else -1
     presave_active = smartlink_pre_save_active(smartlink)
+    artist_slug, slug = get_smartlink_slugs(smartlink)
 
     platform_rows: list[list[InlineKeyboardButton]] = []
 
@@ -516,7 +588,7 @@ def build_smartlink_buttons(
             [
                 InlineKeyboardButton(
                     text="✏️ Добавить/Изменить ссылки",
-                    callback_data=f"smartlinks:edit_links:{smartlink.get('id')}:{page_marker}",
+                    callback_data=f"smartlinks:edit_links:{artist_slug}:{slug}:{page_marker}",
                 )
             ]
         )
@@ -576,4 +648,3 @@ def build_donate_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Своя сумма", callback_data="donate:custom")],
         [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_focus")],
     ])
-
