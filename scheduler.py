@@ -1,20 +1,21 @@
 import asyncio
 import datetime as dt
+import os
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError
 
 from db import (
     cleanup_reminder_log,
     DEFAULT_TIMEZONE,
-    get_due_smartlink_reminders,
     get_reminder_users,
-    get_smartlink_by_id,
     get_smartlink_subscribers,
-    get_smartlinks_with_release,
     get_user_reminder_prefs,
+    list_smartlink_reminders,
+    list_smartlink_subscription_ids,
     mark_reminder_sent,
     mark_smartlink_reminder_sent,
     mark_smartlink_day_sent,
@@ -23,7 +24,12 @@ from db import (
     was_smartlink_reminder_sent,
     was_smartlink_day_sent,
 )
-from helpers import parse_date
+from helpers import normalize_base_url, parse_date, parse_smartlink_id, get_smartlink_slugs, build_smartlink_id
+
+SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
+SMARTLINK_INDEX_BASE = normalize_base_url(
+    os.getenv("SMARTLINK_INDEX_BASE") or os.getenv("GO_INDEX_BASE"),
+)
 
 REMINDER_INTERVAL_SECONDS = 300
 REMINDER_LAST_CLEAN: dt.date | None = None
@@ -66,6 +72,58 @@ def smartlink_reminder_text(offset: int, artist: str, title: str) -> str:
     return ""
 
 
+async def fetch_smartlink_from_index(artist_slug: str, slug: str) -> dict | None:
+    artist_slug = str(artist_slug or "").strip()
+    slug = str(slug or "").strip()
+    if not SMARTLINK_INDEX_BASE or not SMARTLINK_API_KEY or not artist_slug or not slug:
+        return None
+    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
+    headers = {"Authorization": f"Bearer {SMARTLINK_API_KEY}"}
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                if not (200 <= resp.status < 300):
+                    return None
+                payload = await resp.json()
+                if isinstance(payload, dict):
+                    for key in ("smartlink", "item", "data", "result"):
+                        value = payload.get(key)
+                        if isinstance(value, dict):
+                            return value
+                    return payload
+                if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                    return payload[0]
+    except Exception:
+        return None
+    return None
+
+
+def normalize_index_smartlink(item: dict) -> dict:
+    artist_slug, slug = get_smartlink_slugs(item)
+    cover_source = item.get("cover_source") if isinstance(item.get("cover_source"), dict) else {}
+    cover_file_id = item.get("cover_file_id") or cover_source.get("file_id") or ""
+    links = item.get("links") if isinstance(item.get("links"), dict) else {}
+    return {
+        "id": build_smartlink_id(artist_slug, slug),
+        "artist": item.get("artist") or item.get("artist_name") or "",
+        "title": item.get("title") or "",
+        "release_date": item.get("release_date") or "",
+        "cover_file_id": cover_file_id or "",
+        "cover_source": cover_source or {},
+        "links": links or {},
+        "caption_text": item.get("caption_text") or "",
+        "branding_disabled": bool(item.get("branding_disabled", False)),
+        "branding_paid": bool(item.get("branding_paid", False)),
+        "pre_save_enabled": bool(item.get("pre_save_enabled", True)),
+        "reminders_enabled": bool(item.get("reminders_enabled", True)),
+        "cover_url": item.get("cover_url"),
+        "artist_slug": artist_slug,
+        "slug": slug,
+        "cover_version": int(item.get("cover_version") or 1),
+    }
+
+
 async def process_reminders(bot: Bot):
     today = dt.date.today()
     global REMINDER_LAST_CLEAN
@@ -99,9 +157,15 @@ async def process_reminders(bot: Bot):
 
 
 async def process_smartlink_notifications(bot: Bot, send_smartlink_photo: Callable[..., Awaitable]):
-    smartlinks = await get_smartlinks_with_release()
-
-    for smartlink in smartlinks:
+    smartlink_ids = await list_smartlink_subscription_ids()
+    for smartlink_id in smartlink_ids:
+        artist_slug, slug = parse_smartlink_id(smartlink_id)
+        if not artist_slug or not slug:
+            continue
+        item = await fetch_smartlink_from_index(artist_slug, slug)
+        if not item:
+            continue
+        smartlink = normalize_index_smartlink(item)
         if not smartlink.get("reminders_enabled"):
             continue
         rd = parse_date(smartlink.get("release_date") or "")
@@ -142,20 +206,21 @@ async def process_smartlink_notifications(bot: Bot, send_smartlink_photo: Callab
 
 async def process_smartlink_release_day_reminders(bot: Bot, send_smartlink_photo: Callable[..., Awaitable]):
     today = dt.datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).date()
-    due = await get_due_smartlink_reminders(today.isoformat())
+    due = await list_smartlink_reminders()
 
     for smartlink_id, tg_id in due:
         try:
             if await was_smartlink_reminder_sent(tg_id, smartlink_id):
                 continue
-
-            try:
-                sid = int(smartlink_id)
-            except Exception:
+            artist_slug, slug = parse_smartlink_id(smartlink_id)
+            if not artist_slug or not slug:
                 continue
-
-            smartlink = await get_smartlink_by_id(sid)
-            if not smartlink:
+            item = await fetch_smartlink_from_index(artist_slug, slug)
+            if not item:
+                continue
+            smartlink = normalize_index_smartlink(item)
+            rd = parse_date(smartlink.get("release_date") or "")
+            if not rd or rd != today:
                 continue
 
             await send_smartlink_photo(

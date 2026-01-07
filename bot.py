@@ -44,9 +44,7 @@ from aiogram.types import (
 from aiogram.utils.backoff import Backoff, BackoffConfig
 from dotenv import load_dotenv
 from db import (
-    count_smartlinks,
     cycle_account_status as db_cycle_account_status,
-    delete_smartlink,
     ensure_user as db_ensure_user,
     add_smartlink_reminder,
     remove_smartlink_reminder,
@@ -61,24 +59,16 @@ from db import (
     get_important_tasks,
     get_focus_show_completed,
     get_last_update_notified,
-    get_latest_smartlink,
-    get_owned_smartlink,
     get_release_date,
     get_reminders_enabled,
-    get_smartlink_by_id,
-    get_smartlink_by_owner_slugs,
-    get_smartlink_by_slugs,
-    list_smartlinks,
     get_tasks_state,
     get_updates_opt_in,
     get_updates_opt_in_users,
-    bump_smartlink_cover_version,
     init_db,
     is_smartlink_subscribed,
     reset_all_data,
     reset_progress_only,
     save_qc_check,
-    save_smartlink,
     set_export_unlocked,
     set_experience,
     set_last_update_notified,
@@ -90,20 +80,20 @@ from db import (
     toggle_important_task,
     toggle_reminders_enabled,
     toggle_task_and_get_state,
-    update_smartlink_caption,
-    update_smartlink_data,
-    update_smartlink_data_by_slugs,
     was_qc_checked,
     save_smartlink_message_reference,
     get_smartlink_messages,
-    count_all_smartlinks,
 )
 from helpers import (
+    build_smartlink_id,
+    build_smartlink_key,
     escape_html,
     format_date_ru,
     parse_date,
     normalize_base_url,
     get_smartlink_slugs,
+    parse_smartlink_id,
+    parse_smartlink_key,
     build_smartlink_index_payload,
     push_smartlink_to_index,
     log_missing_index_token,
@@ -551,12 +541,8 @@ async def smartlink_api_handler(request: web.Request) -> web.Response:
         if api_key != SMARTLINK_API_KEY:
             return web.json_response({"error": "unauthorized"}, status=401)
 
-    try:
-        smartlink_id = int(request.match_info.get("id", ""))
-    except ValueError:
-        return web.json_response({"error": "not_found"}, status=404)
-
-    smartlink = await get_smartlink_by_id(smartlink_id)
+    smartlink_id = request.match_info.get("id", "")
+    smartlink = await fetch_smartlink_by_id(smartlink_id)
     if not smartlink:
         return web.json_response({"error": "not_found"}, status=404)
 
@@ -578,8 +564,10 @@ async def smartlink_latest_api_handler(request: web.Request) -> web.Response:
         api_key = request.headers.get("X-API-Key")
         if api_key != SMARTLINK_API_KEY:
             return web.json_response({"error": "unauthorized"}, status=401)
-
-    smartlink = await get_latest_smartlink()
+    owner_raw = request.query.get("owner_tg_user_id") or request.query.get("owner")
+    if not owner_raw or not owner_raw.isdigit():
+        return web.json_response({"error": "owner_required"}, status=400)
+    smartlink = await fetch_latest_smartlink_from_index(int(owner_raw))
     if not smartlink:
         return web.json_response({"error": "not_found"}, status=404)
 
@@ -607,13 +595,14 @@ async def cover_proxy_handler(request: web.Request) -> web.StreamResponse | web.
 
     smartlink: dict | None = None
     if smartlink_id:
-        try:
-            smartlink = await get_smartlink_by_id(int(smartlink_id))
-        except Exception:
-            smartlink = None
+        smartlink = await fetch_smartlink_by_id(smartlink_id)
 
     if not smartlink and artist_slug and slug:
-        smartlink = await get_smartlink_by_slugs(artist_slug, slug)
+        ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
+        if ok and isinstance(item, dict):
+            smartlink = normalize_index_smartlink(item, artist_slug=artist_slug, slug=slug)
+        else:
+            smartlink = None
 
     if not smartlink:
         return web.Response(status=404, text="not found")
@@ -816,10 +805,7 @@ async def fetch_my_smartlinks_from_index(
     limit: int,
 ) -> tuple[bool, list[dict] | None, int | None, int | None]:
     if not SMARTLINK_API_KEY:
-        logger.error(
-            "[smartlink-my] SMARTLINK_API_KEY missing; falling back to cache tg_id=%s",
-            tg_id,
-        )
+        logger.error("[smartlink-my] SMARTLINK_API_KEY missing; cannot fetch tg_id=%s", tg_id)
         return False, None, None, None
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks"
     headers = {
@@ -952,21 +938,20 @@ def parse_page_marker(marker: str | None, default: int = 0) -> int:
     return default
 
 
-async def resolve_legacy_smartlink_slugs(
-    tg_id: int, smartlink_id: int
-) -> tuple[str, str, dict | None]:
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
-    if not smartlink:
-        smartlink = await get_smartlink_by_id(smartlink_id)
-    if not smartlink:
-        return "", "", None
-    artist_slug, slug = get_smartlink_slugs(smartlink)
-    return artist_slug, slug, smartlink
+def extract_index_owner_id(item: dict) -> str:
+    for key in ("owner_tg_user_id", "owner_id", "owner_tg_id"):
+        value = item.get(key)
+        if value is None:
+            continue
+        raw = str(value).strip()
+        if raw:
+            return raw
+    return ""
 
 
 def normalize_index_smartlink(
     item: dict,
-    owner_tg_id: int,
+    owner_tg_id: int | None = None,
     artist_slug: str | None = None,
     slug: str | None = None,
 ) -> dict:
@@ -974,11 +959,16 @@ def normalize_index_smartlink(
     slug = (slug or item.get("slug") or "").strip()
     if not artist_slug or not slug:
         artist_slug, slug = get_smartlink_slugs(item)
+    owner_id = owner_tg_id
+    if owner_id is None:
+        owner_raw = extract_index_owner_id(item)
+        owner_id = int(owner_raw) if owner_raw.isdigit() else 0
     cover_source = item.get("cover_source") if isinstance(item.get("cover_source"), dict) else {}
     cover_file_id = item.get("cover_file_id") or cover_source.get("file_id") or ""
     links = item.get("links") if isinstance(item.get("links"), dict) else {}
     return {
-        "owner_tg_id": int(owner_tg_id),
+        "id": build_smartlink_id(artist_slug, slug),
+        "owner_tg_id": int(owner_id or 0),
         "artist": item.get("artist") or item.get("artist_name") or "",
         "title": item.get("title") or "",
         "release_date": item.get("release_date") or "",
@@ -997,48 +987,38 @@ def normalize_index_smartlink(
     }
 
 
-async def upsert_smartlink_cache(owner_tg_id: int, smartlink: dict) -> dict | None:
-    artist_slug, slug = get_smartlink_slugs(smartlink)
-    existing = await get_smartlink_by_owner_slugs(owner_tg_id, artist_slug, slug)
-    updates = {
-        "artist": smartlink.get("artist") or "",
-        "title": smartlink.get("title") or "",
-        "release_date": smartlink.get("release_date") or "",
-        "cover_file_id": smartlink.get("cover_file_id") or "",
-        "cover_source": smartlink.get("cover_source") or {},
-        "links": smartlink.get("links") or {},
-        "caption_text": smartlink.get("caption_text") or "",
-        "branding_disabled": bool(smartlink.get("branding_disabled", False)),
-        "branding_paid": bool(smartlink.get("branding_paid", False)),
-        "pre_save_enabled": bool(smartlink.get("pre_save_enabled", True)),
-        "reminders_enabled": bool(smartlink.get("reminders_enabled", True)),
-        "cover_url": smartlink.get("cover_url"),
-        "artist_slug": artist_slug,
-        "slug": slug,
-        "cover_version": int(smartlink.get("cover_version") or 1),
-    }
-    if existing and existing.get("id"):
-        await update_smartlink_data(existing["id"], owner_tg_id, updates)
-        return await get_smartlink_by_id(existing["id"])
+async def fetch_owned_smartlink_from_index(
+    tg_id: int, artist_slug: str, slug: str
+) -> dict | None:
+    ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
+    if not ok or not isinstance(item, dict):
+        return None
+    owner_id = extract_index_owner_id(item)
+    if owner_id and owner_id != str(tg_id):
+        return None
+    return normalize_index_smartlink(item, owner_tg_id=tg_id, artist_slug=artist_slug, slug=slug)
 
-    new_id = await save_smartlink(
-        owner_tg_id=owner_tg_id,
-        artist=updates["artist"],
-        title=updates["title"],
-        release_date_iso=updates["release_date"],
-        cover_file_id=updates["cover_file_id"],
-        cover_source=updates["cover_source"],
-        links=updates["links"],
-        caption_text=updates["caption_text"],
-        branding_disabled=updates["branding_disabled"],
-        pre_save_enabled=updates["pre_save_enabled"],
-        reminders_enabled=updates["reminders_enabled"],
-        cover_url=updates["cover_url"],
-        artist_slug=updates["artist_slug"],
-        slug=updates["slug"],
-        cover_version=updates["cover_version"],
+
+async def fetch_smartlink_by_id(smartlink_id: int | str) -> dict | None:
+    artist_slug, slug = parse_smartlink_id(smartlink_id)
+    if not artist_slug or not slug:
+        return None
+    ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
+    if not ok or not isinstance(item, dict):
+        return None
+    return normalize_index_smartlink(item, artist_slug=artist_slug, slug=slug)
+
+
+async def fetch_latest_smartlink_from_index(tg_id: int) -> dict | None:
+    index_ok, items, _total_count, _total_pages = await fetch_my_smartlinks_from_index(
+        tg_id, page=0, limit=1
     )
-    return await get_smartlink_by_id(new_id)
+    if not index_ok or not items:
+        return None
+    item = items[0] if isinstance(items[0], dict) else None
+    if not item:
+        return None
+    return normalize_index_smartlink(item, owner_tg_id=tg_id)
 
 
 async def update_smartlink_in_index(
@@ -1081,13 +1061,18 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
         tg_id, page, MY_SMARTLINKS_PAGE_SIZE
     )
     if index_ok and items is not None:
+        normalized_items = [
+            normalize_index_smartlink(item, owner_tg_id=tg_id)
+            for item in items
+            if isinstance(item, dict)
+        ]
         if total_pages is None:
             if total_count is not None:
                 total_pages = max(
                     1, (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE
                 )
             else:
-                if len(items) < MY_SMARTLINKS_PAGE_SIZE:
+                if len(normalized_items) < MY_SMARTLINKS_PAGE_SIZE:
                     total_pages = page + 1
                 else:
                     total_pages = page + 2
@@ -1097,55 +1082,19 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
         logger.info(
             "[smartlinks-my] index_list ok tg_id=%s count=%s page=%s",
             tg_id,
-            len(items),
+            len(normalized_items),
             page,
         )
-        text = build_my_smartlinks_text(items, page, total_pages, start)
-        kb = build_my_smartlinks_kb(items, page, total_pages, start)
+        text = build_my_smartlinks_text(normalized_items, page, total_pages, start)
+        kb = build_my_smartlinks_kb(normalized_items, page, total_pages, start)
         await message.answer(text, reply_markup=kb)
         return
 
-    logger.warning("[smartlinks-my] index_list failed, using cache tg_id=%s", tg_id)
-    total = await count_smartlinks(tg_id)
-    all_total = await count_all_smartlinks()
-    if total == 0 and all_total > 0:
-        logger.error(
-            "[smartlinks-my] empty state for user with existing smartlinks tg_id=%s total_all=%s",
-            tg_id,
-            all_total,
-        )
-    else:
-        logger.info(
-            "[smartlinks-my] fetched count tg_id=%s total=%s total_all=%s",
-            tg_id,
-            total,
-            all_total,
-        )
-    if total <= 0:
-        await message.answer(
-            "У тебя пока нет смартлинков. Создай первый через «➕ Создать смарт-линк».",
-            reply_markup=smartlinks_menu_kb(),
-        )
-        return
-
-    total_pages = max(1, (total + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    start = page * MY_SMARTLINKS_PAGE_SIZE
-    items = await list_smartlinks(
-        tg_id, limit=MY_SMARTLINKS_PAGE_SIZE, offset=start
+    logger.warning("[smartlinks-my] index_list failed tg_id=%s", tg_id)
+    await message.answer(
+        "❌ Не удалось получить список смартлинков из D1. Попробуй позже.",
+        reply_markup=smartlinks_menu_kb(),
     )
-
-    logger.info(
-        "[smartlinks-my] returning cached items tg_id=%s page=%s count=%s",
-        tg_id,
-        page,
-        len(items),
-    )
-
-    text = "⚠️ Web index temporarily unavailable, showing cached list.\n\n"
-    text += build_my_smartlinks_text(items, page, total_pages, start)
-    kb = build_my_smartlinks_kb(items, page, total_pages, start)
-    await message.answer(text, reply_markup=kb)
 
 
 
@@ -1155,42 +1104,16 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
 
 
 async def send_smartlink_list(message: Message, tg_id: int, page: int = 0):
-    total = await count_smartlinks(tg_id)
-    total_pages = max(1, (total + SMARTLINKS_PAGE_SIZE - 1) // SMARTLINKS_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    items = await list_smartlinks(tg_id, limit=SMARTLINKS_PAGE_SIZE, offset=page * SMARTLINKS_PAGE_SIZE)
-    text = build_smartlink_list_text(items, page, total_pages)
-
-    inline: list[list[InlineKeyboardButton]] = []
-    for idx, item in enumerate(items, start=1):
-        inline.append(
-            [
-                InlineKeyboardButton(text=f"{idx}. {item.get('artist') or 'Без артиста'} — {item.get('title') or 'Без названия'}", callback_data=f"smartlinks:view:{item.get('id')}:{page}")
-            ]
-        )
-        inline.append(
-            [
-                InlineKeyboardButton(
-                    text=f"📤 Экспорт ⭐{EXPORT_UNLOCK_PRICE}", callback_data=f"smartlinks:export:{item.get('id')}:{page}"
-                )
-            ]
-        )
-
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"smartlinks:list:{page - 1}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"smartlinks:list:{page + 1}"))
-    if nav_row:
-        inline.append(nav_row)
-
-    inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="smartlinks:menu")])
-
-    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=inline))
+    await message.answer(
+        "Локальные черновики отключены. Список доступен в «📎 Мои смартлинки».",
+        reply_markup=smartlinks_menu_kb(),
+    )
 
 
-async def show_smartlink_view(message: Message, tg_id: int, smartlink_id: int, page: int):
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+async def show_smartlink_view(
+    message: Message, tg_id: int, artist_slug: str, slug: str, page: int
+):
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await message.answer("Смартлинк не найден.", reply_markup=smartlinks_menu_kb())
         return
@@ -1993,20 +1916,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
                 reply_markup=await user_menu_keyboard(tg_id),
             )
 
-        smartlink_id = await save_smartlink(
-            tg_id,
-            artist,
-            title,
-            release_iso,
-            cover_file_id,
-            cover_source,
-            links_clean,
-            caption_text,
-            bool(data.get("branding_disabled")),
-            cover_url=cover_url,
-            artist_slug=artist_slug,
-            slug=slug,
-        )
+        smartlink_id = build_smartlink_id(artist_slug, slug)
         smartlink = {
             "id": smartlink_id,
             "owner_tg_id": tg_id,
@@ -2293,7 +2203,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
         await message.answer("Не нашёл ссылку Spotify для этого UPC.", reply_markup=await user_menu_keyboard(tg_id))
         return
 
-    latest = await get_latest_smartlink(tg_id)
+    latest = await fetch_latest_smartlink_from_index(tg_id)
     if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
         links = latest.get("links") or {}
         links["spotify"] = spotify_url
@@ -2301,58 +2211,31 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
         artist_slug = slugify(latest.get("artist", "")) or f"artist-{fallback_suffix}"
         slug = slugify(latest.get("title", "")) or f"release-{fallback_suffix}"
         cover_url = build_cover_proxy_url(artist_slug, slug) if artist_slug and slug else (latest.get("cover_url") or "")
-        smartlink_id = await save_smartlink(
-            tg_id,
-            latest.get("artist", ""),
-            latest.get("title", ""),
-            latest.get("release_date") or "",
-            latest.get("cover_file_id", ""),
-            latest.get("cover_source") or {},
-            links,
-            latest.get("caption_text", "") or "",
-            bool(latest.get("branding_disabled")),
-            cover_url=cover_url,
-            artist_slug=artist_slug,
-            slug=slug,
-        )
-
         smartlink = {
-            "id": smartlink_id,
-            "owner_tg_id": tg_id,
-            "artist": latest.get("artist", ""),
-            "title": latest.get("title", ""),
-            "release_date": latest.get("release_date") or "",
-            "cover_file_id": latest.get("cover_file_id", ""),
-            "cover_source": latest.get("cover_source") or {},
+            **latest,
             "links": links,
-            "caption_text": latest.get("caption_text", "") or "",
-            "branding_disabled": bool(latest.get("branding_disabled")),
+            "cover_url": cover_url,
             "artist_slug": artist_slug,
             "slug": slug,
-            "created_at": dt.datetime.utcnow().isoformat(),
-            "cover_version": 1,
+            "id": build_smartlink_id(artist_slug, slug),
         }
-        try:
-            push_ok, push_status, push_error = await push_smartlink_to_index(
-                smartlink, owner=build_owner_payload(message.from_user)
-            )
-        except Exception:
-            logger.exception(
-                "[smartlink] indexing failed smartlink_id=%s artist_slug=%s slug=%s",
-                smartlink_id,
+        index_ok, status, error = await update_smartlink_in_index(
+            artist_slug,
+            slug,
+            smartlink,
+            owner=build_owner_payload(message.from_user),
+        )
+        if not index_ok:
+            logger.warning(
+                "[smartlink] upc index update failed artist_slug=%s slug=%s status=%s error=%s",
                 artist_slug,
                 slug,
+                status,
+                error,
             )
-        else:
-            if not push_ok:
-                logger.warning(
-                    "[smartlink] indexing failed smartlink_id=%s status=%s error=%s",
-                    smartlink_id,
-                    push_status,
-                    push_error,
-                )
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or smartlink
         allow_remind = smartlink_can_remind(smartlink)
-        subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
+        subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
         await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
         await message.answer("Добавил Spotify по UPC. Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
         return
@@ -2364,14 +2247,36 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
     await start_smartlink_form(message, tg_id, initial_links={"spotify": spotify_url})
 
 
-async def apply_caption_update(message: Message, tg_id: int, smartlink_id: int, caption_text: str):
-    await update_smartlink_caption(smartlink_id, caption_text)
-    smartlink = await get_smartlink_by_id(smartlink_id)
+async def apply_caption_update(
+    message: Message,
+    tg_id: int,
+    artist_slug: str,
+    slug: str,
+    caption_text: str,
+):
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
         await form_clear(tg_id)
         return
-    updated = await update_smartlink_message(message.bot, smartlink_id)
+    updated_payload = {**smartlink, "caption_text": caption_text}
+    index_ok, status, error = await update_smartlink_in_index(
+        artist_slug,
+        slug,
+        updated_payload,
+        owner=build_owner_payload(message.from_user),
+    )
+    if not index_ok:
+        logger.warning(
+            "[smartlink-caption] index update failed artist_slug=%s slug=%s status=%s error=%s",
+            artist_slug,
+            slug,
+            status,
+            error,
+        )
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or updated_payload
+    smartlink_id = smartlink.get("id")
+    updated = await update_smartlink_message(message.bot, smartlink_id) if smartlink_id else False
     if not updated:
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
@@ -2483,7 +2388,7 @@ async def _store_smartlink_message(message: Message, smartlink: dict, chat_id: i
 
 
 async def update_smartlink_message(bot: Bot, smartlink_id: int | str) -> bool:
-    smartlink = await get_smartlink_by_id(smartlink_id)
+    smartlink = await fetch_smartlink_by_id(smartlink_id)
     if not smartlink:
         logger.warning("[smartlink-update] smartlink not found smartlink_id=%s", smartlink_id)
         return False
@@ -3171,14 +3076,18 @@ async def successful_payment(message: Message):
         tg_id = message.from_user.id
         await ensure_user(tg_id)
         payload = sp.invoice_payload or ""
-        try:
-            smartlink_id = int(payload.split("_")[-1])
-        except Exception:
-            smartlink_id = None
-        if smartlink_id is not None:
-            await update_smartlink_data(
-                smartlink_id, tg_id, {"branding_disabled": True, "branding_paid": True}
-            )
+        smartlink_key = payload.replace("smartlink_branding_", "", 1)
+        artist_slug, slug = parse_smartlink_key(smartlink_key)
+        if artist_slug and slug:
+            smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
+            if smartlink:
+                updated_payload = {**smartlink, "branding_disabled": True, "branding_paid": True}
+                await update_smartlink_in_index(
+                    artist_slug,
+                    slug,
+                    updated_payload,
+                    owner=build_owner_payload(message.from_user),
+                )
         await message.answer(
             "Готово! Брендинг ИСКРЫ отключён для этого смарт-линка. Если нужно — его можно снова включить бесплатно.",
             reply_markup=await user_menu_keyboard(tg_id),
@@ -3409,8 +3318,8 @@ async def smartlinks_edit_cb(callback):
     if not artist_slug or not slug:
         await callback.answer("Не понял", show_alert=True)
         return
-    local = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
-    if not local:
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
+    if not smartlink:
         logger.warning(
             "[smartlink-edit] not found artist_slug=%s slug=%s tg_id=%s",
             artist_slug,
@@ -3422,16 +3331,16 @@ async def smartlinks_edit_cb(callback):
             show_alert=True,
         )
         return
-    text = build_smartlink_view_text(local)
+    text = build_smartlink_view_text(smartlink)
     await callback.message.answer(
         text + "\n\nВыбери, что обновить:",
         reply_markup=smartlink_edit_menu_kb(
             artist_slug,
             slug,
             page,
-            local.get("id"),
-            local.get("branding_disabled"),
-            local.get("branding_paid"),
+            smartlink.get("id"),
+            smartlink.get("branding_disabled"),
+            smartlink.get("branding_paid"),
         ),
     )
     await callback.answer()
@@ -3457,13 +3366,12 @@ async def smartlinks_view_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    try:
-        smartlink_id = int(parts[2])
-    except ValueError:
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
         await callback.answer("Не понял", show_alert=True)
         return
     page = int(parts[3])
-    await show_smartlink_view(callback.message, tg_id, smartlink_id, page)
+    await show_smartlink_view(callback.message, tg_id, artist_slug, slug, page)
     await callback.answer()
 
 
@@ -3475,13 +3383,12 @@ async def smartlinks_open_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    try:
-        smartlink_id = int(parts[2])
-    except ValueError:
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
         await callback.answer("Не понял", show_alert=True)
         return
     page = int(parts[3])
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
@@ -3497,12 +3404,11 @@ async def smartlinks_choose_cb(callback):
     if len(parts) != 3:
         await callback.answer("Не понял", show_alert=True)
         return
-    try:
-        smartlink_id = int(parts[2])
-    except ValueError:
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
@@ -3518,13 +3424,12 @@ async def smartlinks_refresh_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    try:
-        smartlink_id = int(parts[2])
-    except ValueError:
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
         await callback.answer("Не понял", show_alert=True)
         return
     page = int(parts[3])
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
@@ -3535,20 +3440,39 @@ async def smartlinks_refresh_cb(callback):
         await callback.answer("Добавь ссылку BandLink, чтобы обновить площадки автоматически.", show_alert=True)
         return
     except Exception:
-        logger.exception("[smartlink] bandlink refresh failed smartlink_id=%s", smartlink_id)
+        logger.exception(
+            "[smartlink] bandlink refresh failed artist_slug=%s slug=%s",
+            artist_slug,
+            slug,
+        )
         await callback.answer("Не получилось обновить ссылки. Попробуй позже или добавь вручную.", show_alert=True)
         return
 
     if updated_links != (smartlink.get("links") or {}):
-        await update_smartlink_data(smartlink_id, tg_id, {"links": updated_links})
-        smartlink = await get_owned_smartlink(tg_id, smartlink_id) or smartlink
+        updated_payload = {**smartlink, "links": updated_links}
+        index_ok, status, error = await update_smartlink_in_index(
+            artist_slug,
+            slug,
+            updated_payload,
+            owner=build_owner_payload(callback.from_user),
+        )
+        if not index_ok:
+            logger.warning(
+                "[smartlink-edit-links] index update failed artist_slug=%s slug=%s status=%s error=%s",
+                artist_slug,
+                slug,
+                status,
+                error,
+            )
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or updated_payload
 
     allow_remind = smartlink_can_remind(smartlink)
-    subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
+    subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
     kb = build_smartlink_keyboard(smartlink, subscribed=subscribed, can_remind=allow_remind, page=page)
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
-    schedule_smartlink_update(callback.message.bot, smartlink_id)
+    if smartlink.get("id"):
+        schedule_smartlink_update(callback.message.bot, smartlink.get("id"))
     await callback.answer("Карточка обновлена")
 
 
@@ -3564,54 +3488,35 @@ async def smartlinks_reindex_cb(callback):
         await callback.answer("Не понял", show_alert=True)
         return
 
-    try:
-        smartlink_id = int(parts[2])
-    except ValueError:
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
         await callback.answer("Не понял", show_alert=True)
         return
-    try:
-        smartlink = await get_smartlink_by_id(smartlink_id)
-    except Exception:
-        logger.exception("[smartlink] db fetch failed smartlink_id=%s", smartlink_id)
-        await callback.answer("❌ Ошибка БД. Попробуй позже.", show_alert=True)
-        return
 
-    if not smartlink:
+    ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
+    if not ok or not isinstance(item, dict):
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
+    smartlink = normalize_index_smartlink(item, artist_slug=artist_slug, slug=slug)
 
-    try:
-        await bump_smartlink_cover_version(smartlink_id, smartlink.get("owner_tg_id"))
-        smartlink = await get_smartlink_by_id(smartlink_id) or smartlink
-    except Exception:
-        logger.exception(
-            "[smartlink] cover version bump failed smartlink_id=%s", smartlink_id
-        )
-        await callback.answer("❌ Ошибка БД. Попробуй позже.", show_alert=True)
-        return
-
-    try:
-        success, status, error = await push_smartlink_to_index(
-            smartlink, owner=build_owner_payload(callback.from_user)
-        )
-    except Exception:
-        logger.exception("[smartlink] reindex failed smartlink_id=%s", smartlink_id)
-        await callback.answer("❌ Ошибка воркера. Попробуй позже.", show_alert=True)
-        return
-
-    if success and status == 202:
-        await callback.answer("⏳ Обновление запущено. Проверим чуть позже.", show_alert=True)
-    elif success:
-        schedule_smartlink_update(callback.message.bot, smartlink_id)
+    index_ok, status, error = await update_smartlink_in_index(
+        artist_slug,
+        slug,
+        smartlink,
+        owner=build_owner_payload(callback.from_user),
+    )
+    if index_ok:
+        schedule_smartlink_update(callback.message.bot, smartlink.get("id"))
         await callback.answer("✅ Web обновлён", show_alert=True)
     else:
         logger.warning(
-            "[smartlink] reindex worker error smartlink_id=%s status=%s error=%s",
-            smartlink_id,
+            "[smartlink] reindex failed artist_slug=%s slug=%s status=%s error=%s",
+            artist_slug,
+            slug,
             status,
             error,
         )
-        await callback.answer("❌ Ошибка воркера. Попробуй позже.", show_alert=True)
+        await callback.answer("❌ Ошибка обновления. Попробуй позже.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("smartlinks:delete:"))
@@ -3622,11 +3527,13 @@ async def smartlinks_delete_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink_id = int(parts[2])
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
     page = int(parts[3])
-    await delete_smartlink(smartlink_id, tg_id)
-    await callback.answer("Удалено")
-    await send_smartlink_list(callback.message, tg_id, page=page)
+    await callback.answer("Удаление доступно в веб-кабинете.", show_alert=True)
+    await send_my_smartlinks(callback.message, tg_id, page=page)
 
 
 @dp.callback_query(F.data.startswith("smartlinks:edit_menu:"))
@@ -3639,16 +3546,8 @@ async def smartlinks_edit_menu_cb(callback):
     page = parse_page_marker(parts[4] if len(parts) > 4 else None, default=0)
 
     smartlink = None
-    if len(parts) == 4 and artist_slug.isdigit():
-        page = parse_page_marker(parts[3], default=0)
-        legacy_artist, legacy_slug, smartlink = await resolve_legacy_smartlink_slugs(
-            tg_id, int(artist_slug)
-        )
-        artist_slug = legacy_artist
-        slug = legacy_slug
-
     if artist_slug and slug:
-        smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
 
     if not smartlink:
         logger.error(
@@ -3685,17 +3584,8 @@ async def smartlinks_edit_field_cb(callback):
     field = parts[5] if len(parts) > 5 else ""
 
     smartlink = None
-    if len(parts) == 5 and artist_slug.isdigit():
-        page = parse_page_marker(parts[3], default=0)
-        field = parts[4]
-        legacy_artist, legacy_slug, smartlink = await resolve_legacy_smartlink_slugs(
-            tg_id, int(artist_slug)
-        )
-        artist_slug = legacy_artist
-        slug = legacy_slug
-
     if artist_slug and slug:
-        smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
 
     if not smartlink or not field:
         logger.warning(
@@ -3750,16 +3640,8 @@ async def smartlinks_edit_links_cb(callback):
     page = parse_page_marker(parts[4] if len(parts) > 4 else None, default=0)
 
     smartlink = None
-    if len(parts) == 4 and artist_slug.isdigit():
-        page = parse_page_marker(parts[3], default=0)
-        legacy_artist, legacy_slug, smartlink = await resolve_legacy_smartlink_slugs(
-            tg_id, int(artist_slug)
-        )
-        artist_slug = legacy_artist
-        slug = legacy_slug
-
     if artist_slug and slug:
-        smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
 
     if not smartlink:
         logger.warning(
@@ -3787,16 +3669,8 @@ async def smartlinks_branding_toggle_cb(callback):
     page = parse_page_marker(parts[4] if len(parts) > 4 else None, default=0)
 
     smartlink = None
-    if len(parts) == 4 and artist_slug.isdigit():
-        page = parse_page_marker(parts[3], default=0)
-        legacy_artist, legacy_slug, smartlink = await resolve_legacy_smartlink_slugs(
-            tg_id, int(artist_slug)
-        )
-        artist_slug = legacy_artist
-        slug = legacy_slug
-
     if artist_slug and slug:
-        smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         logger.warning(
             "[smartlink-edit-branding] smartlink not found tg_id=%s artist_slug=%s slug=%s",
@@ -3834,20 +3708,19 @@ async def smartlinks_branding_toggle_cb(callback):
             tg_id,
             status,
         )
-        updated = await upsert_smartlink_cache(tg_id, updated_payload)
-        if updated:
-            text = build_smartlink_view_text(updated)
-            await callback.message.answer(
-                text + "\n\nВыбери, что обновить:",
-                reply_markup=smartlink_edit_menu_kb(
-                    artist_slug,
-                    slug,
-                    page,
-                    updated.get("id"),
-                    updated.get("branding_disabled"),
-                    updated.get("branding_paid"),
-                ),
-            )
+        updated = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or updated_payload
+        text = build_smartlink_view_text(updated)
+        await callback.message.answer(
+            text + "\n\nВыбери, что обновить:",
+            reply_markup=smartlink_edit_menu_kb(
+                artist_slug,
+                slug,
+                page,
+                updated.get("id"),
+                updated.get("branding_disabled"),
+                updated.get("branding_paid"),
+            ),
+        )
         await callback.answer("Брендинг включён")
         return
 
@@ -3877,20 +3750,19 @@ async def smartlinks_branding_toggle_cb(callback):
             tg_id,
             status,
         )
-        updated = await upsert_smartlink_cache(tg_id, updated_payload)
-        if updated:
-            text = build_smartlink_view_text(updated)
-            await callback.message.answer(
-                text + "\n\nВыбери, что обновить:",
-                reply_markup=smartlink_edit_menu_kb(
-                    artist_slug,
-                    slug,
-                    page,
-                    updated.get("id"),
-                    updated.get("branding_disabled"),
-                    updated.get("branding_paid"),
-                ),
-            )
+        updated = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or updated_payload
+        text = build_smartlink_view_text(updated)
+        await callback.message.answer(
+            text + "\n\nВыбери, что обновить:",
+            reply_markup=smartlink_edit_menu_kb(
+                artist_slug,
+                slug,
+                page,
+                updated.get("id"),
+                updated.get("branding_disabled"),
+                updated.get("branding_paid"),
+            ),
+        )
         await callback.answer("Брендинг отключён")
         return
 
@@ -3911,16 +3783,8 @@ async def smartlinks_branding_cancel_cb(callback):
     page = parse_page_marker(parts[4] if len(parts) > 4 else None, default=0)
 
     smartlink = None
-    if len(parts) == 4 and artist_slug.isdigit():
-        page = parse_page_marker(parts[3], default=0)
-        legacy_artist, legacy_slug, smartlink = await resolve_legacy_smartlink_slugs(
-            tg_id, int(artist_slug)
-        )
-        artist_slug = legacy_artist
-        slug = legacy_slug
-
     if artist_slug and slug:
-        smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         logger.warning(
             "[smartlink-edit-branding] cancel not found tg_id=%s artist_slug=%s slug=%s",
@@ -3955,16 +3819,8 @@ async def smartlinks_branding_pay_cb(callback):
     page = parse_page_marker(parts[4] if len(parts) > 4 else None, default=0)
 
     smartlink = None
-    if len(parts) == 4 and artist_slug.isdigit():
-        page = parse_page_marker(parts[3], default=0)
-        legacy_artist, legacy_slug, smartlink = await resolve_legacy_smartlink_slugs(
-            tg_id, int(artist_slug)
-        )
-        artist_slug = legacy_artist
-        slug = legacy_slug
-
     if artist_slug and slug:
-        smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         logger.warning(
             "[smartlink-edit-branding] pay not found tg_id=%s artist_slug=%s slug=%s",
@@ -4003,28 +3859,28 @@ async def smartlinks_branding_pay_cb(callback):
             tg_id,
             status,
         )
-        updated = await upsert_smartlink_cache(tg_id, updated_payload)
-        if updated:
-            text = build_smartlink_view_text(updated)
-            await callback.message.answer(
-                text + "\n\nВыбери, что обновить:",
-                reply_markup=smartlink_edit_menu_kb(
-                    artist_slug,
-                    slug,
-                    page,
-                    updated.get("id"),
-                    updated.get("branding_disabled"),
-                    updated.get("branding_paid"),
-                ),
-            )
+        updated = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or updated_payload
+        text = build_smartlink_view_text(updated)
+        await callback.message.answer(
+            text + "\n\nВыбери, что обновить:",
+            reply_markup=smartlink_edit_menu_kb(
+                artist_slug,
+                slug,
+                page,
+                updated.get("id"),
+                updated.get("branding_disabled"),
+                updated.get("branding_paid"),
+            ),
+        )
         await callback.answer("Брендинг уже оплачен")
         return
 
     prices = [LabeledPrice(label="Отключение брендинга ИСКРЫ", amount=BRANDING_DISABLE_PRICE)]
+    smartlink_key = build_smartlink_key(artist_slug, slug)
     await callback.message.answer_invoice(
         title="Отключить брендинг ИСКРЫ",
         description="Брендинг уберётся только у этого смарт-линка.",
-        payload=f"smartlink_branding_{smartlink.get('id')}",
+        payload=f"smartlink_branding_{smartlink_key}",
         provider_token="",
         currency="XTR",
         prices=prices,
@@ -4046,17 +3902,8 @@ async def smartlinks_edit_link_cb(callback):
         return
 
     smartlink = None
-    if len(parts) == 5 and artist_slug.isdigit():
-        page = parse_page_marker(parts[3], default=0)
-        platform = parts[4]
-        legacy_artist, legacy_slug, smartlink = await resolve_legacy_smartlink_slugs(
-            tg_id, int(artist_slug)
-        )
-        artist_slug = legacy_artist
-        slug = legacy_slug
-
     if artist_slug and slug:
-        smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+        smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         logger.warning(
             "[smartlink-edit-link] smartlink not found tg_id=%s artist_slug=%s slug=%s",
@@ -4090,7 +3937,7 @@ async def smartlinks_edit_link_cb(callback):
 async def smartlink_open_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
-    existing = await get_latest_smartlink(tg_id)
+    existing = await fetch_latest_smartlink_from_index(tg_id)
     if not existing:
         inline_keyboard = []
         if SPOTIFY_UPC_ENABLED:
@@ -4285,12 +4132,21 @@ async def smartlink_prefill_continue_cb(callback):
 async def smartlink_caption_edit_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
-    existing = await get_latest_smartlink(tg_id)
+    existing = await fetch_latest_smartlink_from_index(tg_id)
     if not existing:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
+    artist_slug, slug = get_smartlink_slugs(existing)
     await form_start(tg_id, "smartlink_caption_edit")
-    await form_set(tg_id, 0, {"smartlink_id": existing.get("id"), "caption_text": existing.get("caption_text", "")})
+    await form_set(
+        tg_id,
+        0,
+        {
+            "artist_slug": artist_slug,
+            "slug": slug,
+            "caption_text": existing.get("caption_text", ""),
+        },
+    )
     await callback.message.answer(
         smartlink_step_prompt(4) + "\n\n(Отмена: /cancel)",
         reply_markup=smartlink_step_kb(),
@@ -4336,18 +4192,25 @@ async def smartlink_toggle_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     parts = callback.data.split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
+    if len(parts) != 3:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink_id = int(parts[2])
-    smartlink = await get_smartlink_by_id(smartlink_id)
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Ссылка не найдена", show_alert=True)
+        return
+    ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
+    if ok and isinstance(item, dict):
+        smartlink = normalize_index_smartlink(item, artist_slug=artist_slug, slug=slug)
+    else:
+        smartlink = None
     if not smartlink:
         await callback.answer("Ссылка не найдена", show_alert=True)
         return
     if not smartlink_can_remind(smartlink):
         await callback.answer("Релиз уже сегодня или прошёл", show_alert=True)
         return
-
+    smartlink_id = build_smartlink_id(artist_slug, slug)
     current = await get_release_reminder_state(tg_id, smartlink_id, True)
     if current:
         await remove_smartlink_reminder(tg_id, smartlink_id)
@@ -4369,12 +4232,15 @@ async def smartlink_release_reminder_cb(callback):
     if len(parts) != 3 or parts[2] != "toggle":
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink_id_raw = parts[1]
-    if not smartlink_id_raw.isdigit():
+    artist_slug, slug = parse_smartlink_key(parts[1])
+    if not artist_slug or not slug:
         await callback.answer("Ссылка не найдена", show_alert=True)
         return
-    smartlink_id = int(smartlink_id_raw)
-    smartlink = await get_smartlink_by_id(smartlink_id)
+    ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
+    if ok and isinstance(item, dict):
+        smartlink = normalize_index_smartlink(item, artist_slug=artist_slug, slug=slug)
+    else:
+        smartlink = None
     if not smartlink:
         await callback.answer("Ссылка не найдена", show_alert=True)
         return
@@ -4382,7 +4248,7 @@ async def smartlink_release_reminder_cb(callback):
     if not allow_remind:
         await callback.answer("Релиз уже сегодня или прошёл", show_alert=True)
         return
-
+    smartlink_id = build_smartlink_id(artist_slug, slug)
     current = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
     if current:
         await remove_smartlink_reminder(tg_id, smartlink_id)
@@ -4453,12 +4319,13 @@ async def smartlink_skip_cb(callback):
         return
 
     if form_name == "smartlink_caption_edit":
-        smartlink_id = data.get("smartlink_id")
-        if not smartlink_id:
+        artist_slug = (data.get("artist_slug") or "").strip()
+        slug = (data.get("slug") or "").strip()
+        if not artist_slug or not slug:
             await callback.answer("Смартлинк не найден", show_alert=True)
             await form_clear(tg_id)
             return
-        await apply_caption_update(callback.message, tg_id, smartlink_id, "")
+        await apply_caption_update(callback.message, tg_id, artist_slug, slug, "")
         await callback.answer("Пропустил")
         return
 
@@ -4479,12 +4346,15 @@ async def smartlinks_copy_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     parts = callback.data.split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
+    if len(parts) != 3:
         await callback.answer("Не понял", show_alert=True)
         return
 
-    smartlink_id = int(parts[2])
-    smartlink = await get_smartlink_by_id(smartlink_id)
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await callback.answer("Ссылка не найдена", show_alert=True)
         return
@@ -4503,17 +4373,21 @@ async def smartlinks_export_format_cb(callback):
         await callback.answer("Не понял", show_alert=True)
         return
 
-    smartlink_id = int(parts[2])
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_key = parts[2]
     page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
     variant = parts[4]
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
     if not await get_export_unlocked(tg_id):
         await callback.message.answer(
             f"Открыть экспорт смарт-линка (Telegram/VK/PR/ссылки)?\nСтоимость: ⭐ {EXPORT_UNLOCK_PRICE}",
-            reply_markup=smartlink_export_paywall_kb(smartlink_id, page),
+            reply_markup=smartlink_export_paywall_kb(smartlink_key, page),
         )
         await callback.answer()
         return
@@ -4537,7 +4411,10 @@ async def smartlinks_export_back_cb(callback):
         await callback.answer()
         return
 
-    smartlink_id = int(parts[2])
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
     page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
     try:
         await callback.message.delete()
@@ -4545,7 +4422,7 @@ async def smartlinks_export_back_cb(callback):
         pass
 
     if page >= 0:
-        await show_smartlink_view(callback.message, tg_id, smartlink_id, page)
+        await show_smartlink_view(callback.message, tg_id, artist_slug, slug, page)
     await callback.answer()
 
 
@@ -4557,9 +4434,12 @@ async def smartlinks_export_pay_cb(callback):
     if len(parts) != 4:
         await callback.answer("Не понял", show_alert=True)
         return
-    smartlink_id = int(parts[2])
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
     page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
@@ -4587,14 +4467,17 @@ async def smartlinks_export_cancel_cb(callback):
     if len(parts) != 4:
         await callback.answer()
         return
-    smartlink_id = int(parts[2])
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
     page = int(parts[3]) if parts[3].lstrip("-").isdigit() else -1
     try:
         await callback.message.delete()
     except Exception:
         pass
     if page >= 0:
-        await show_smartlink_view(callback.message, tg_id, smartlink_id, page)
+        await show_smartlink_view(callback.message, tg_id, artist_slug, slug, page)
     await callback.answer()
 
 
@@ -4607,23 +4490,27 @@ async def smartlinks_export_cb(callback):
         await callback.answer("Не понял", show_alert=True)
         return
 
-    smartlink_id = int(parts[2])
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    smartlink_key = parts[2]
     page = int(parts[3]) if len(parts) == 4 and parts[3].lstrip("-").isdigit() else -1
-    smartlink = await get_owned_smartlink(tg_id, smartlink_id)
+    smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
     if not smartlink:
         await callback.answer("Смартлинк не найден", show_alert=True)
         return
     if not await get_export_unlocked(tg_id):
         await callback.message.answer(
             f"Открыть экспорт смарт-линка (Telegram/VK/PR/ссылки)?\nСтоимость: ⭐ {EXPORT_UNLOCK_PRICE}",
-            reply_markup=smartlink_export_paywall_kb(smartlink_id, page),
+            reply_markup=smartlink_export_paywall_kb(smartlink_key, page),
         )
         await callback.answer()
         return
 
     header = build_smartlink_view_text(smartlink)
     await callback.message.answer(
-        header + "\n\nВыбери формат:", reply_markup=smartlink_export_kb(smartlink_id, page)
+        header + "\n\nВыбери формат:", reply_markup=smartlink_export_kb(smartlink_key, page)
     )
     await callback.answer()
 
@@ -4782,7 +4669,7 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
         return False
 
     tg_id = message.from_user.id
-    latest = await get_latest_smartlink(tg_id)
+    latest = await fetch_latest_smartlink_from_index(tg_id)
 
     if not latest:
         logger.info("[cover-upgrade] skip: no smartlink context tg_id=%s", tg_id)
@@ -4815,47 +4702,30 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
     if cover_url:
         updates.update({"cover_url": cover_url, "artist_slug": artist_slug, "slug": slug})
 
-    try:
-        await update_smartlink_data(latest["id"], tg_id, updates)
-        latest.update(updates)
-        try:
-            new_version = await bump_smartlink_cover_version(latest["id"], tg_id)
-            if new_version:
-                latest["cover_version"] = new_version
-        except Exception:
-            logger.exception(
-                "[cover-upgrade] failed to bump cover version smartlink_id=%s",
-                latest.get("id"),
-            )
-        logger.info(
-            "[cover-upgrade] success smartlink_id=%s file_id=%s", latest.get("id"), file_id
-        )
-    except Exception:
-        logger.exception(
-            "[cover-upgrade] failed to save cover smartlink_id=%s", latest.get("id")
+    updated_payload = {**latest, **updates}
+    updated_payload["cover_version"] = int(latest.get("cover_version") or 1) + 1
+    index_ok, status, error = await update_smartlink_in_index(
+        artist_slug,
+        slug,
+        updated_payload,
+        owner=build_owner_payload(message.from_user),
+    )
+    if not index_ok:
+        logger.warning(
+            "[cover-upgrade] index update failed artist_slug=%s slug=%s status=%s error=%s",
+            artist_slug,
+            slug,
+            status,
+            error,
         )
         return True
-
-    try:
-        push_ok, push_status, push_error = await push_smartlink_to_index(
-            latest, owner=build_owner_payload(message.from_user)
-        )
-    except Exception:
-        logger.exception(
-            "[cover-upgrade] indexing failed smartlink_id=%s", latest.get("id")
-        )
-    else:
-        if not push_ok:
-            logger.warning(
-                "[cover-upgrade] indexing failed smartlink_id=%s status=%s error=%s",
-                latest.get("id"),
-                push_status,
-                push_error,
-            )
+    latest = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or updated_payload
+    logger.info(
+        "[cover-upgrade] success smartlink_id=%s file_id=%s", latest.get("id"), file_id
+    )
 
     if latest.get("id"):
-        if latest.get("id") is not None:
-            schedule_smartlink_update(message.bot, latest.get("id"))
+        schedule_smartlink_update(message.bot, latest.get("id"))
 
     return True
 
@@ -5001,7 +4871,7 @@ async def any_message_router(message: Message):
             )
 
         total = len(merged_links)
-        latest = await get_latest_smartlink(tg_id)
+        latest = await fetch_latest_smartlink_from_index(tg_id)
         temp_data = {"metadata": merged_metadata, "preferred_source": merged_metadata.get("preferred_source")}
         selected_meta = pick_selected_metadata(temp_data)
         cover_source = selected_meta.get("cover_url") or (merged_metadata or {}).get("cover_url") or ""
@@ -5249,8 +5119,9 @@ async def any_message_router(message: Message):
 
     if form_name == "smartlink_caption_edit":
         data = form.get("data") or {}
-        smartlink_id = data.get("smartlink_id")
-        if not smartlink_id:
+        artist_slug = (data.get("artist_slug") or "").strip()
+        slug = (data.get("slug") or "").strip()
+        if not artist_slug or not slug:
             await form_clear(tg_id)
             await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
             return
@@ -5267,23 +5138,18 @@ async def any_message_router(message: Message):
                 )
                 return
             caption_text = txt
-        await apply_caption_update(message, tg_id, smartlink_id, caption_text)
+        await apply_caption_update(message, tg_id, artist_slug, slug, caption_text)
         return
 
     if form_name == "smartlink_edit":
         info = form.get("data") or {}
         artist_slug = (info.get("artist_slug") or "").strip()
         slug = (info.get("slug") or "").strip()
-        smartlink_id = info.get("smartlink_id")
         page = int(info.get("page") or 0)
         field = info.get("field")
         smartlink = None
         if artist_slug and slug:
-            smartlink = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
-        elif smartlink_id:
-            smartlink = await get_owned_smartlink(tg_id, smartlink_id)
-            if smartlink:
-                artist_slug, slug = get_smartlink_slugs(smartlink)
+            smartlink = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug)
         if not smartlink or not field:
             await form_clear(tg_id)
             await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
@@ -5380,26 +5246,6 @@ async def any_message_router(message: Message):
             updated_payload["artist_slug"] = artist_slug
             updated_payload["slug"] = slug
 
-            updated_db = await update_smartlink_data_by_slugs(
-                tg_id,
-                smartlink.get("artist_slug") or artist_slug,
-                smartlink.get("slug") or slug,
-                updated_payload,
-            )
-            if not updated_db:
-                logger.warning(
-                    "[smartlink-edit] db update failed artist_slug=%s slug=%s tg_id=%s",
-                    artist_slug,
-                    slug,
-                    tg_id,
-                )
-                await form_clear(tg_id)
-                await message.answer(
-                    "Не удалось обновить смартлинк. Попробуй ещё раз позже.",
-                    reply_markup=await user_menu_keyboard(tg_id),
-                )
-                return
-
             index_ok, status, error = await update_smartlink_in_index(
                 artist_slug,
                 slug,
@@ -5423,8 +5269,14 @@ async def any_message_router(message: Message):
                     status,
                     (error or "")[:300],
                 )
+                await form_clear(tg_id)
+                await message.answer(
+                    "Не удалось обновить смартлинк. Попробуй ещё раз позже.",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
 
-            updated = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+            updated = await fetch_owned_smartlink_from_index(tg_id, artist_slug, slug) or updated_payload
             await form_clear(tg_id)
             if updated:
                 if updated.get("id"):
