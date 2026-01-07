@@ -1243,7 +1243,6 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
     text = build_my_smartlinks_text(items, page, total_pages, start_index)
     kb = build_my_smartlinks_kb(items, page, total_pages, start_index)
     await message.answer(text, reply_markup=kb)
-        )
         return
 
     text = build_my_smartlinks_text(items, page, total_pages, offset)
