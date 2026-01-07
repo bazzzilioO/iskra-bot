@@ -851,77 +851,36 @@ def build_my_smartlinks_kb(
 
 async def fetch_my_smartlinks_from_index(
     tg_id: int,
-    page: int,
-    limit: int,
-) -> tuple[bool, list[dict] | None, int | None, int | None]:
-    if not SMARTLINK_INDEX_BASE:
-        logger.error("[smartlink-my] SMARTLINK_INDEX_BASE missing; cannot fetch tg_id=%s", tg_id)
-        return False, None, None, None
-    if not SMARTLINK_API_KEY:
-        logger.error("[smartlink-my] SMARTLINK_API_KEY missing; cannot fetch tg_id=%s", tg_id)
-        return False, None, None, None
-    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks"
-    headers = {
-        "X-API-Key": SMARTLINK_API_KEY,
-        "X-TG-USER-ID": str(tg_id),
-    }
+    page: int = 0,
+    limit: int = 10,
+) -> tuple[bool, list[dict] | None, int]:
+    url = f"{SMARTLINK_INDEX_BASE}/api/index/my"
+    headers = {}
+    if SMARTLINK_API_KEY:
+        headers["X-API-Key"] = SMARTLINK_API_KEY
+
     params = {
         "owner_tg_user_id": str(tg_id),
-        "page": page,
-        "limit": limit,
+        "page": str(max(0, page)),
+        "limit": str(limit),
     }
+
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=headers, params=params) as resp:
                 body = await resp.text()
                 if not (200 <= resp.status < 300):
-                    log_missing_index_token(resp.status, body, "fetch_my_smartlinks_from_index")
-                    logger.warning(
-                        "[smartlink-my] index_list failed status=%s body=%s",
-                        resp.status,
-                        body,
-                    )
-                    return False, None, None, None
-                try:
-                    payload = await resp.json()
-                except Exception:
-                    logger.warning(
-                        "[smartlink-my] failed to parse body status=%s body=%s",
-                        resp.status,
-                        body,
-                    )
-                    return False, None, None, None
-                if isinstance(payload, dict) and payload.get("ok") is False:
-                    log_missing_index_token(resp.status, body, "fetch_my_smartlinks_from_index")
-                    logger.warning("[smartlink-my] index_list ok=false body=%s", body)
-                    return False, None, None, None
+                    logger.warning("[smartlink-my] status=%s body=%s", resp.status, body)
+                    return False, None, 1
+                data = await resp.json()
+                items = data.get("items") or []
+                total_pages = int(data.get("total_pages") or 1)
+                return True, items, max(1, total_pages)
+    except Exception as e:
+        logger.exception("[smartlink-my] error: %s", e)
+        return False, None, 1
 
-                items: list[dict] = []
-                total_count: int | None = None
-                total_pages: int | None = None
-                if isinstance(payload, list):
-                    items = payload
-                elif isinstance(payload, dict):
-                    for key in ("items", "data", "smartlinks", "result"):
-                        value = payload.get(key)
-                        if isinstance(value, list):
-                            items = value
-                            break
-                    for key in ("total", "count", "total_count"):
-                        value = payload.get(key)
-                        if isinstance(value, int):
-                            total_count = value
-                            break
-                    for key in ("total_pages", "pages"):
-                        value = payload.get(key)
-                        if isinstance(value, int):
-                            total_pages = value
-                            break
-                return True, items or [], total_count, total_pages
-    except Exception as err:
-        logger.warning("[smartlink-my] index_list request error: %s", err)
-        return False, None, None, None
 
 
 async def fetch_smartlink_from_index(
@@ -1267,51 +1226,23 @@ async def confirm_smartlink_indexed(
 
 
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
-    PAGE_SIZE = MY_SMARTLINKS_PAGE_SIZE
-
-    rows = await db_fetch_all(
-        """
-        SELECT id, artist_slug, slug, title, updated_at
-        FROM smartlinks
-        WHERE owner_tg_user_id = ?
-        ORDER BY updated_at DESC
-        LIMIT ? OFFSET ?
-        """,
-        (str(tg_id), PAGE_SIZE, page * PAGE_SIZE)
+    ok, items, total_pages = await fetch_my_smartlinks_from_index(
+        tg_id,
+        page=page,
+        limit=MY_SMARTLINKS_PAGE_SIZE,
     )
-
-    if not rows:
-        await message.answer("У тебя пока нет смартлинков.")
-        return
-
-    total_count = await db_fetch_value(
-        "SELECT COUNT(*) FROM smartlinks WHERE owner_tg_user_id = ?",
-        (str(tg_id),)
-    )
-
-    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
-
-    text_lines = []
-    for i, row in enumerate(rows, start=1 + page * PAGE_SIZE):
-        text_lines.append(f"{i}. {row['artist_slug'].upper()} — {row['title']}")
-
-    text = "🔗 Мои смартлинки:\n\n" + "\n".join(text_lines)
-
-    await message.answer(
-        text,
-        reply_markup=my_smartlinks_keyboard(rows, page, total_pages)
-    )
-    return
-
-    total_pages = max(1, (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-
-    offset = page * MY_SMARTLINKS_PAGE_SIZE
-    items = await list_owned_smartlinks(tg_id, MY_SMARTLINKS_PAGE_SIZE, offset)
-    if items is None:
+    if not ok or items is None:
         await message.answer(
             "❌ Не удалось получить список смартлинков из D1. Попробуй позже.",
             reply_markup=smartlinks_menu_kb(),
+        )
+        return
+
+    page = max(0, min(page, total_pages - 1))
+    start_index = page * MY_SMARTLINKS_PAGE_SIZE
+    text = build_my_smartlinks_text(items, page, total_pages, start_index)
+    kb = build_my_smartlinks_kb(items, page, total_pages, start_index)
+    await message.answer(text, reply_markup=kb)
         )
         return
 
