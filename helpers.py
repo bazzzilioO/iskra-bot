@@ -22,6 +22,19 @@ logger = logging.getLogger(__name__)
 DEFAULT_SMARTLINK_BASE = "https://go.sreda.pw"
 
 
+def log_missing_index_token(status: int | None, body: str | None, context: str) -> bool:
+    normalized_body = (body or "").lower()
+    if status == 500 or "missing_index_token" in normalized_body:
+        logger.fatal(
+            "[smartlink-index] missing index token context=%s status=%s body=%s",
+            context,
+            status,
+            body,
+        )
+        return True
+    return False
+
+
 def normalize_base_url(base: str | None, default: str = DEFAULT_SMARTLINK_BASE) -> str:
     base = (base or "").strip()
     if not base:
@@ -313,6 +326,8 @@ async def push_smartlink_to_index(
                         truncated_body,
                     )
                     last_status = resp.status
+                    if log_missing_index_token(resp.status, body, "push_smartlink_to_index"):
+                        return False, resp.status, truncated_body
                     if 200 <= resp.status < 300:
                         return True, resp.status, None
                     last_error = truncated_body
