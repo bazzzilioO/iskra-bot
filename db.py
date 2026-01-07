@@ -25,7 +25,7 @@ SMARTLINK_PUBLISH_QUEUE_TABLE = "smartlink_publish_queue"
 @asynccontextmanager
 async def _smartlink_d1_connection():
     if not SMARTLINK_D1_PATH:
-        logger.error("[smartlink-d1] SMARTLINK_D1_PATH is not configured")
+        logger.debug("[smartlink-d1] SMARTLINK_D1_PATH not configured; skipping D1 connection")
         yield None
         return
     db = await aiosqlite.connect(SMARTLINK_D1_PATH)
