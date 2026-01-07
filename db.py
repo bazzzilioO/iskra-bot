@@ -14,6 +14,8 @@ REMINDER_CLEAN_DAYS = 60
 logger = logging.getLogger(__name__)
 
 _SMARTLINK_LEGACY_OWNER_COLUMNS: list[str] | None = None
+_SMARTLINK_COLUMNS: set[str] | None = None
+_SMARTLINK_COLUMN_TYPES: dict[str, str] | None = None
 
 
 async def _get_smartlink_legacy_owner_columns(db: aiosqlite.Connection) -> list[str]:
@@ -26,6 +28,80 @@ async def _get_smartlink_legacy_owner_columns(db: aiosqlite.Connection) -> list[
     candidates = ("legacy_owner_id", "owner_id", "user_id", "tg_id", "chat_id")
     _SMARTLINK_LEGACY_OWNER_COLUMNS = [col for col in candidates if col in column_names]
     return _SMARTLINK_LEGACY_OWNER_COLUMNS
+
+
+async def _get_smartlink_columns(db: aiosqlite.Connection) -> set[str]:
+    global _SMARTLINK_COLUMNS
+    if _SMARTLINK_COLUMNS is not None:
+        return _SMARTLINK_COLUMNS
+    cur = await db.execute("PRAGMA table_info(smartlinks)")
+    rows = await cur.fetchall()
+    _SMARTLINK_COLUMNS = {row[1] for row in rows}
+    return _SMARTLINK_COLUMNS
+
+
+async def _get_smartlink_column_types(db: aiosqlite.Connection) -> dict[str, str]:
+    global _SMARTLINK_COLUMN_TYPES
+    if _SMARTLINK_COLUMN_TYPES is not None:
+        return _SMARTLINK_COLUMN_TYPES
+    cur = await db.execute("PRAGMA table_info(smartlinks)")
+    rows = await cur.fetchall()
+    _SMARTLINK_COLUMN_TYPES = {row[1]: (row[2] or "").lower() for row in rows}
+    return _SMARTLINK_COLUMN_TYPES
+
+
+def _smartlink_select_fields(columns: set[str]) -> str:
+    def column_or_null(name: str, alias: str | None = None) -> str:
+        if name in columns:
+            return f"{name} AS {alias or name}"
+        return f"NULL AS {alias or name}"
+
+    if "owner_tg_user_id" in columns and "owner_tg_id" in columns:
+        owner_expr = "COALESCE(owner_tg_user_id, owner_tg_id) AS owner_tg_id"
+    elif "owner_tg_user_id" in columns:
+        owner_expr = "owner_tg_user_id AS owner_tg_id"
+    elif "owner_tg_id" in columns:
+        owner_expr = "owner_tg_id AS owner_tg_id"
+    else:
+        owner_expr = "NULL AS owner_tg_id"
+
+    if "cover_source" in columns and "cover_source_json" in columns:
+        cover_source_expr = "COALESCE(cover_source, cover_source_json) AS cover_source_json"
+    elif "cover_source" in columns:
+        cover_source_expr = "cover_source AS cover_source_json"
+    elif "cover_source_json" in columns:
+        cover_source_expr = "cover_source_json AS cover_source_json"
+    else:
+        cover_source_expr = "NULL AS cover_source_json"
+
+    fields = [
+        column_or_null("id"),
+        owner_expr,
+        column_or_null("artist"),
+        column_or_null("title"),
+        column_or_null("release_date"),
+        column_or_null("pre_save_enabled"),
+        column_or_null("reminders_enabled"),
+        column_or_null("project_id"),
+        column_or_null("cover_file_id"),
+        cover_source_expr,
+        column_or_null("links_json"),
+        column_or_null("caption_text"),
+        column_or_null("branding_disabled"),
+        column_or_null("created_at"),
+        column_or_null("branding_paid"),
+        column_or_null("cover_url"),
+        column_or_null("artist_slug"),
+        column_or_null("slug"),
+        column_or_null("cover_version"),
+    ]
+    return ", ".join(fields)
+
+
+def _smartlink_slugs_clause(columns: set[str]) -> str:
+    if "artist_slug" in columns and "slug" in columns:
+        return "lower(coalesce(artist_slug, '')) = lower(?) AND lower(coalesce(slug, '')) = lower(?)"
+    return "1=0"
 
 
 async def _migrate_legacy_smartlink_owners(
@@ -55,12 +131,24 @@ async def _migrate_legacy_smartlink_owners(
 
 async def _smartlink_owner_filter(
     db: aiosqlite.Connection, owner_tg_id: int
-) -> tuple[str, list[int]]:
+) -> tuple[str, list[object]]:
+    columns = await _get_smartlink_columns(db)
+    if "owner_tg_user_id" in columns:
+        return "owner_tg_user_id=?", [str(owner_tg_id)]
+
     legacy_columns = await _get_smartlink_legacy_owner_columns(db)
-    if legacy_columns:
+    clauses: list[str] = []
+    params: list[int] = []
+    if "owner_tg_id" in columns:
+        clauses.append("owner_tg_id=?")
+        params.append(owner_tg_id)
+    if legacy_columns and "owner_tg_id" in columns:
         await _migrate_legacy_smartlink_owners(db, owner_tg_id, legacy_columns)
-    clauses = ["owner_tg_id=?"] + [f"{column}=?" for column in legacy_columns]
-    params = [owner_tg_id for _ in clauses]
+    for column in legacy_columns:
+        clauses.append(f"{column}=?")
+        params.append(owner_tg_id)
+    if not clauses:
+        return "(1=0)", []
     return f"({' OR '.join(clauses)})", params
 
 
@@ -643,7 +731,8 @@ async def reset_all_data(tg_id: int):
         await db.execute("DELETE FROM smartlink_subscriptions WHERE subscriber_tg_id=?", (tg_id,))
         await db.execute("DELETE FROM smartlink_reminders WHERE tg_id=?", (tg_id,))
         await db.execute("DELETE FROM smartlink_reminder_sends WHERE tg_id=?", (tg_id,))
-        await db.execute("DELETE FROM smartlinks WHERE owner_tg_id=?", (tg_id,))
+        owner_clause, owner_params = await _smartlink_owner_filter(db, tg_id)
+        await db.execute(f"DELETE FROM smartlinks WHERE {owner_clause}", owner_params)
         await db.execute(
             "UPDATE users SET release_date=NULL, reminders_enabled=1 WHERE tg_id=?",
             (tg_id,)
@@ -705,38 +794,95 @@ async def save_smartlink(
     artist_slug: str | None = None,
     slug: str | None = None,
     cover_version: int = 1,
-) -> int:
+) -> int | str:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+
+        id_type = column_types.get("id", "")
+        id_is_text = "text" in id_type
+        smartlink_id = None
+        if id_is_text:
+            if not artist_slug or not slug:
+                raise ValueError("artist_slug and slug are required for TEXT smartlink id")
+            smartlink_id = f"{artist_slug}:{slug}"
+
+        insert_columns: list[str] = []
+        values: list = []
+
+        if "id" in columns and id_is_text:
+            insert_columns.append("id")
+            values.append(smartlink_id)
+        if "owner_tg_user_id" in columns:
+            insert_columns.append("owner_tg_user_id")
+            values.append(str(owner_tg_id))
+        elif "owner_tg_id" in columns:
+            insert_columns.append("owner_tg_id")
+            values.append(owner_tg_id)
+        if "artist" in columns:
+            insert_columns.append("artist")
+            values.append(artist)
+        if "title" in columns:
+            insert_columns.append("title")
+            values.append(title)
+        if "release_date" in columns:
+            insert_columns.append("release_date")
+            values.append(release_date_iso)
+        if "pre_save_enabled" in columns:
+            insert_columns.append("pre_save_enabled")
+            values.append(1 if pre_save_enabled else 0)
+        if "reminders_enabled" in columns:
+            insert_columns.append("reminders_enabled")
+            values.append(1 if reminders_enabled else 0)
+        if "project_id" in columns:
+            insert_columns.append("project_id")
+            values.append(project_id)
+        if "cover_file_id" in columns:
+            insert_columns.append("cover_file_id")
+            values.append(cover_file_id)
+        if "cover_source" in columns:
+            insert_columns.append("cover_source")
+            values.append(json.dumps(cover_source or {}, ensure_ascii=False))
+        elif "cover_source_json" in columns:
+            insert_columns.append("cover_source_json")
+            values.append(json.dumps(cover_source or {}, ensure_ascii=False))
+        if "links_json" in columns:
+            insert_columns.append("links_json")
+            values.append(json.dumps(links, ensure_ascii=False))
+        if "caption_text" in columns:
+            insert_columns.append("caption_text")
+            values.append(caption_text)
+        if "branding_disabled" in columns:
+            insert_columns.append("branding_disabled")
+            values.append(1 if branding_disabled else 0)
+        if "created_at" in columns:
+            insert_columns.append("created_at")
+            values.append(dt.datetime.utcnow().isoformat())
+        if "cover_url" in columns:
+            insert_columns.append("cover_url")
+            values.append(cover_url)
+        if "artist_slug" in columns:
+            insert_columns.append("artist_slug")
+            values.append(artist_slug)
+        if "slug" in columns:
+            insert_columns.append("slug")
+            values.append(slug)
+        if "cover_version" in columns:
+            insert_columns.append("cover_version")
+            values.append(cover_version)
+
+        if not insert_columns:
+            raise RuntimeError("smartlinks table has no supported columns")
+
+        placeholders = ", ".join(["?"] * len(insert_columns))
         cur = await db.execute(
-            """
-            INSERT INTO smartlinks (owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, cover_url, artist_slug, slug, cover_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                owner_tg_id,
-                artist,
-                title,
-                release_date_iso,
-                1 if pre_save_enabled else 0,
-                1 if reminders_enabled else 0,
-                project_id,
-                cover_file_id,
-                json.dumps(cover_source or {}, ensure_ascii=False),
-                json.dumps(links, ensure_ascii=False),
-                caption_text,
-                1 if branding_disabled else 0,
-                dt.datetime.utcnow().isoformat(),
-                cover_url,
-                artist_slug,
-                slug,
-                cover_version,
-            ),
+            f"INSERT INTO smartlinks ({', '.join(insert_columns)}) VALUES ({placeholders})",
+            values,
         )
         await db.commit()
-        return cur.lastrowid
+        return smartlink_id if id_is_text else cur.lastrowid
 
 
-async def update_smartlink_caption(smartlink_id: int, caption_text: str):
+async def update_smartlink_caption(smartlink_id: int | str, caption_text: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE smartlinks SET caption_text=? WHERE id=?",
@@ -747,19 +893,24 @@ async def update_smartlink_caption(smartlink_id: int, caption_text: str):
 
 async def get_latest_smartlink(owner_tg_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        select_fields = _smartlink_select_fields(columns)
         owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        order_by = "COALESCE(created_at, '') DESC, id DESC" if "created_at" in columns else "id DESC"
         cur = await db.execute(
-            f"SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE {owner_clause} ORDER BY id DESC LIMIT 1",
+            f"SELECT {select_fields} FROM smartlinks WHERE {owner_clause} ORDER BY {order_by} LIMIT 1",
             owner_params,
         )
         row = await cur.fetchone()
         return _smartlink_row_to_dict(row) if row else None
 
 
-async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
+async def get_smartlink_by_id(smartlink_id: int | str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        select_fields = _smartlink_select_fields(columns)
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE id=?",
+            f"SELECT {select_fields} FROM smartlinks WHERE id=?",
             (smartlink_id,),
         )
         row = await cur.fetchone()
@@ -768,12 +919,16 @@ async def get_smartlink_by_id(smartlink_id: int) -> dict | None:
 
 async def get_smartlink_by_slugs(artist_slug: str, slug: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        select_fields = _smartlink_select_fields(columns)
+        slugs_clause = _smartlink_slugs_clause(columns)
+        if slugs_clause == "1=0":
+            return None
         cur = await db.execute(
-            """
-            SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id,
-                   cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version
+            f"""
+            SELECT {select_fields}
             FROM smartlinks
-            WHERE lower(coalesce(artist_slug, '')) = lower(?) AND lower(coalesce(slug, '')) = lower(?)
+            WHERE {slugs_clause}
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -787,15 +942,18 @@ async def get_smartlink_by_owner_slugs(
     owner_tg_id: int, artist_slug: str, slug: str
 ) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        select_fields = _smartlink_select_fields(columns)
+        slugs_clause = _smartlink_slugs_clause(columns)
+        if slugs_clause == "1=0":
+            return None
         owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
         cur = await db.execute(
             f"""
-            SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id,
-                   cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version
+            SELECT {select_fields}
             FROM smartlinks
             WHERE {owner_clause}
-              AND lower(coalesce(artist_slug, '')) = lower(?)
-              AND lower(coalesce(slug, '')) = lower(?)
+              AND {slugs_clause}
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -807,15 +965,16 @@ async def get_smartlink_by_owner_slugs(
 
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        select_fields = _smartlink_select_fields(columns)
         owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        order_by = "COALESCE(created_at, '') DESC, id DESC" if "created_at" in columns else "id DESC"
         cur = await db.execute(
             f"""
-            SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id,
-                   cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at,
-                   branding_paid, cover_url, artist_slug, slug, cover_version
+            SELECT {select_fields}
             FROM smartlinks
             WHERE {owner_clause}
-            ORDER BY COALESCE(created_at, '') DESC, id DESC
+            ORDER BY {order_by}
             LIMIT ? OFFSET ?
             """,
             (*owner_params, limit, offset),
@@ -833,11 +992,13 @@ async def count_smartlinks(owner_tg_id: int) -> int:
         return int(row[0]) if row else 0
 
 
-async def get_owned_smartlink(owner_tg_id: int, smartlink_id: int) -> dict | None:
+async def get_owned_smartlink(owner_tg_id: int, smartlink_id: int | str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        select_fields = _smartlink_select_fields(columns)
         owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
         cur = await db.execute(
-            f"SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE id=? AND {owner_clause}",
+            f"SELECT {select_fields} FROM smartlinks WHERE id=? AND {owner_clause}",
             (smartlink_id, *owner_params),
         )
         row = await cur.fetchone()
@@ -851,55 +1012,135 @@ async def count_all_smartlinks() -> int:
         return int(row[0]) if row else 0
 
 
-async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: dict) -> bool:
-    allowed = {
-        "artist",
-        "title",
-        "release_date",
-        "cover_file_id",
-        "cover_source",
-        "cover_url",
-        "cover_version",
-        "links",
-        "caption_text",
-        "branding_disabled",
-        "branding_paid",
-        "pre_save_enabled",
-        "reminders_enabled",
-        "project_id",
-        "artist_slug",
-        "slug",
-    }
-    fields: list[str] = []
-    params: list = []
-
-    for key, value in updates.items():
-        if key not in allowed:
-            continue
-        if key == "links":
-            fields.append("links_json=?")
-            params.append(json.dumps(value or {}, ensure_ascii=False))
-        elif key == "cover_source":
-            fields.append("cover_source_json=?")
-            params.append(json.dumps(value or {}, ensure_ascii=False))
-        elif key == "branding_disabled":
-            fields.append("branding_disabled=?")
-            params.append(1 if value else 0)
-        elif key == "branding_paid":
-            fields.append("branding_paid=?")
-            params.append(1 if value else 0)
-        else:
-            fields.append(f"{key}=?")
-            params.append(value)
-
-    if not fields:
-        return False
-
-    params.extend([smartlink_id, owner_tg_id])
-
+async def update_smartlink_data(
+    smartlink_id: int | str, owner_tg_id: int, updates: dict
+) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        allowed = {
+            "artist",
+            "title",
+            "release_date",
+            "cover_file_id",
+            "cover_source",
+            "cover_url",
+            "cover_version",
+            "links",
+            "caption_text",
+            "branding_disabled",
+            "branding_paid",
+            "pre_save_enabled",
+            "reminders_enabled",
+            "project_id",
+            "artist_slug",
+            "slug",
+        }
+        fields: list[str] = []
+        params: list = []
+
+        for key, value in updates.items():
+            if key not in allowed:
+                continue
+            if key == "links":
+                if "links_json" in columns:
+                    fields.append("links_json=?")
+                    params.append(json.dumps(value or {}, ensure_ascii=False))
+            elif key == "cover_source":
+                cover_column = "cover_source" if "cover_source" in columns else "cover_source_json"
+                if cover_column in columns:
+                    fields.append(f"{cover_column}=?")
+                    params.append(json.dumps(value or {}, ensure_ascii=False))
+            elif key == "branding_disabled":
+                fields.append("branding_disabled=?")
+                params.append(1 if value else 0)
+            elif key == "branding_paid":
+                fields.append("branding_paid=?")
+                params.append(1 if value else 0)
+            else:
+                if key in columns:
+                    fields.append(f"{key}=?")
+                    params.append(value)
+
+        if not fields:
+            return False
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        params.extend([smartlink_id, *owner_params])
         await db.execute(
-            f"UPDATE smartlinks SET {', '.join(fields)} WHERE id=? AND owner_tg_id=?",
+            f"UPDATE smartlinks SET {', '.join(fields)} WHERE id=? AND {owner_clause}",
+            params,
+        )
+        await db.commit()
+    return True
+
+
+async def update_smartlink_data_by_slugs(
+    owner_tg_id: int, artist_slug: str, slug: str, updates: dict
+) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        column_types = await _get_smartlink_column_types(db)
+        allowed = {
+            "artist",
+            "title",
+            "release_date",
+            "cover_file_id",
+            "cover_source",
+            "cover_url",
+            "cover_version",
+            "links",
+            "caption_text",
+            "branding_disabled",
+            "branding_paid",
+            "pre_save_enabled",
+            "reminders_enabled",
+            "project_id",
+            "artist_slug",
+            "slug",
+        }
+        fields: list[str] = []
+        params: list = []
+
+        for key, value in updates.items():
+            if key not in allowed:
+                continue
+            if key == "links":
+                if "links_json" in columns:
+                    fields.append("links_json=?")
+                    params.append(json.dumps(value or {}, ensure_ascii=False))
+            elif key == "cover_source":
+                cover_column = "cover_source" if "cover_source" in columns else "cover_source_json"
+                if cover_column in columns:
+                    fields.append(f"{cover_column}=?")
+                    params.append(json.dumps(value or {}, ensure_ascii=False))
+            elif key == "branding_disabled":
+                fields.append("branding_disabled=?")
+                params.append(1 if value else 0)
+            elif key == "branding_paid":
+                fields.append("branding_paid=?")
+                params.append(1 if value else 0)
+            else:
+                if key in columns:
+                    fields.append(f"{key}=?")
+                    params.append(value)
+
+        if ("artist_slug" in updates or "slug" in updates) and "id" in columns:
+            id_type = column_types.get("id", "")
+            if "text" in id_type:
+                new_artist = updates.get("artist_slug", artist_slug)
+                new_slug = updates.get("slug", slug)
+                if new_artist and new_slug:
+                    fields.append("id=?")
+                    params.append(f"{new_artist}:{new_slug}")
+
+        if not fields:
+            return False
+        slugs_clause = _smartlink_slugs_clause(columns)
+        if slugs_clause == "1=0":
+            return False
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        params.extend([*owner_params, artist_slug, slug])
+        await db.execute(
+            f"UPDATE smartlinks SET {', '.join(fields)} WHERE {owner_clause} AND {slugs_clause}",
             params,
         )
         await db.commit()
@@ -907,13 +1148,26 @@ async def update_smartlink_data(smartlink_id: int, owner_tg_id: int, updates: di
 
 
 async def bump_smartlink_cover_version(
-    smartlink_id: int, owner_tg_id: int | None = None
+    smartlink_id: int | str, owner_tg_id: int | None = None
 ) -> int | None:
     params: list = [smartlink_id]
     where = "id=?"
     if owner_tg_id is not None:
-        where += " AND owner_tg_id=?"
-        params.append(owner_tg_id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+            where += f" AND {owner_clause}"
+            params.extend(owner_params)
+            await db.execute(
+                f"UPDATE smartlinks SET cover_version=COALESCE(cover_version, 1) + 1 WHERE {where}",
+                params,
+            )
+            await db.commit()
+
+            cur = await db.execute(
+                f"SELECT cover_version FROM smartlinks WHERE {where}", params
+            )
+            row = await cur.fetchone()
+            return int(row[0]) if row else None
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -927,9 +1181,13 @@ async def bump_smartlink_cover_version(
         return int(row[0]) if row else None
 
 
-async def delete_smartlink(smartlink_id: int, owner_tg_id: int) -> None:
+async def delete_smartlink(smartlink_id: int | str, owner_tg_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM smartlinks WHERE id=? AND owner_tg_id=?", (smartlink_id, owner_tg_id))
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        await db.execute(
+            f"DELETE FROM smartlinks WHERE id=? AND {owner_clause}",
+            (smartlink_id, *owner_params),
+        )
         await db.execute("DELETE FROM smartlink_subscriptions WHERE smartlink_id=?", (smartlink_id,))
         await db.execute("DELETE FROM smartlink_reminders WHERE smartlink_id=?", (smartlink_id,))
         await db.execute("DELETE FROM smartlink_reminder_sends WHERE smartlink_id=?", (smartlink_id,))
@@ -982,8 +1240,10 @@ async def mark_smartlink_notified(smartlink_id: int, subscriber_tg_id: int):
 
 async def get_smartlinks_with_release() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
+        columns = await _get_smartlink_columns(db)
+        select_fields = _smartlink_select_fields(columns)
         cur = await db.execute(
-            "SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id, cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version FROM smartlinks WHERE release_date IS NOT NULL",
+            f"SELECT {select_fields} FROM smartlinks WHERE release_date IS NOT NULL",
         )
         return [_smartlink_row_to_dict(row) for row in await cur.fetchall()]
 
