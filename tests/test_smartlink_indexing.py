@@ -25,6 +25,7 @@ async def _start_test_server(handler):
 class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         os.environ.pop("SMARTLINK_INDEX_BASE", None)
+        os.environ.pop("SMARTLINK_API_KEY", None)
 
     def test_build_payload_without_cover(self):
         payload = build_smartlink_index_payload(
@@ -80,12 +81,14 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         async def handler(request):
+            captured["auth"] = request.headers.get("Authorization")
             captured["payload"] = await request.json()
             return web.json_response({"ok": True})
 
         port, cleanup = await _start_test_server(handler)
         self.addAsyncCleanup(cleanup)
         os.environ["SMARTLINK_INDEX_BASE"] = f"http://localhost:{port}"
+        os.environ["SMARTLINK_API_KEY"] = "test-key"
 
         smartlink = {
             "artist": "Test Artist",
@@ -97,6 +100,7 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual(status, 200)
         self.assertIsNone(error)
+        self.assertEqual(captured.get("auth"), "Bearer test-key")
         self.assertIn("payload", captured)
         self.assertNotIn("cover_source", captured["payload"])
         self.assertEqual(captured["payload"].get("artist_slug"), "test-artist")
@@ -113,6 +117,7 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         port, cleanup = await _start_test_server(handler)
         self.addAsyncCleanup(cleanup)
         os.environ["SMARTLINK_INDEX_BASE"] = f"http://localhost:{port}"
+        os.environ["SMARTLINK_API_KEY"] = "test-key"
 
         smartlink = {
             "artist": "Retry Artist",
