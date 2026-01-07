@@ -4,7 +4,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
-from helpers import build_smartlink_key, get_smartlink_slugs, smartlink_pre_save_active
+from helpers import build_smartlink_id, build_smartlink_key, get_smartlink_slugs, smartlink_pre_save_active
 
 
 LINKS = {
@@ -380,16 +380,16 @@ def smartlinks_menu_kb() -> InlineKeyboardMarkup:
 def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
-    smartlink_db_id = smartlink.get("d1_id")
+    smartlink_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug)
     rows = [
         [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_key}:{page}")],
     ]
-    if smartlink_db_id is not None:
+    if smartlink_id:
         rows.append(
             [
                 InlineKeyboardButton(
                     text="✏️ Редактировать",
-                    callback_data=f"smartlinks:edit_menu:{smartlink_db_id}:{page}",
+                    callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}",
                 )
             ]
         )
@@ -551,7 +551,7 @@ def build_smartlink_buttons(
     presave_active = smartlink_pre_save_active(smartlink)
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
-    smartlink_db_id = smartlink.get("d1_id")
+    smartlink_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug)
 
     platform_rows: list[list[InlineKeyboardButton]] = []
 
@@ -588,12 +588,12 @@ def build_smartlink_buttons(
         rows.append(
             [InlineKeyboardButton(text="🔄 Обновить ссылки", callback_data=f"smartlinks:refresh:{smartlink_key}:{page_marker}")]
         )
-        if smartlink_db_id is not None:
+        if smartlink_id:
             rows.append(
                 [
                     InlineKeyboardButton(
                         text="✏️ Добавить/Изменить ссылки",
-                        callback_data=f"smartlinks:edit_links:{smartlink_db_id}:{page_marker}",
+                        callback_data=f"smartlinks:edit_links:{smartlink_id}:{page_marker}",
                     )
                 ]
             )
