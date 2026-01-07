@@ -173,6 +173,39 @@ def build_focus_caption(
     text, _ = build_focus(tasks_state, experience, important, focus_task_id, show_completed)
     return text
 
+    async def update_smartlink_via_worker(
+    *,
+    tg_user,
+    artist_slug: str,
+    slug: str,
+    patch: dict,
+) -> bool:
+    ok, current = await fetch_smartlink_from_index(artist_slug, slug)
+    if not ok or not current:
+        return False
+
+    payload = {
+        "artist_slug": artist_slug,
+        "slug": slug,
+        "title": current.get("title") or "",  # upsert требует title
+        "artist_name": current.get("artist_name"),
+        "release_date": current.get("release_date"),
+        "links": current.get("links") or {},
+        "cover_source": current.get("cover_source"),
+        "cover_url": current.get("cover_url"),
+        "cover_version": current.get("cover_version", 0),
+        "owner": {
+            "tg_user_id": str(tg_user.id),
+            "username": tg_user.username,
+            "display_name": (tg_user.full_name or "").strip() or None,
+        },
+    }
+
+    # применяем изменения
+    payload.update(patch)
+
+    success, status, error = await sync_smartlink_to_web(payload)
+    return bool(success)
 
 def build_smartlink_caption(
     smartlink: dict, release_today: bool = False, show_listen_label: bool | None = None
@@ -782,13 +815,14 @@ def build_my_smartlinks_kb(
         row: list[InlineKeyboardButton] = []
         if canonical_url:
             row.append(InlineKeyboardButton(text=f"{idx}. 🌐 Открыть", url=canonical_url))
-        if smartlink_id:
-            row.append(
-                InlineKeyboardButton(
-                    text="✏️ Редактировать",
-                    callback_data=f"smartlinks:edit:{smartlink_id}:{page}",
-                )
-            )
+      if artist_slug and slug:
+    row.append(
+        InlineKeyboardButton(
+            text="✏️ Редактировать",
+            callback_data=f"smartlinks:edit_menu:{artist_slug}:{slug}:{page}",
+        )
+    )
+
         if row:
             inline.append(row)
 
@@ -1223,41 +1257,32 @@ async def confirm_smartlink_indexed(
 
 
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
-    if smartlink_index_ready():
-        index_ok, raw_items, total_count, total_pages = await fetch_my_smartlinks_from_index(
-            tg_id,
-            page=page,
-            limit=MY_SMARTLINKS_PAGE_SIZE,
+    ok, items = await fetch_my_smartlinks_from_index(tg_id)
+    if not ok or items is None:
+        await message.answer(
+            "❌ Не удалось получить список смартлинков из D1. Попробуй позже.",
+            reply_markup=smartlinks_menu_kb(),
         )
-        if index_ok and raw_items is not None:
-            items: list[dict] = []
-            for item in raw_items:
-                if not isinstance(item, dict):
-                    continue
-                owner_id = extract_index_owner_tg_user_id(item)
-                if owner_id and owner_id != str(tg_id):
-                    continue
-                items.append(normalize_index_smartlink(item, owner_tg_user_id=str(tg_id)))
+        return
 
-            inferred_total = (page * MY_SMARTLINKS_PAGE_SIZE) + len(items)
-            total_count = total_count if total_count is not None else inferred_total
-            total_pages = (
-                total_pages
-                if total_pages is not None
-                else max(1, (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
-            )
-            page = max(0, min(page, total_pages - 1))
-            start = page * MY_SMARTLINKS_PAGE_SIZE
-            logger.info(
-                "[smartlinks-my] source=index count=%s tg_id=%s page=%s",
-                total_count,
-                tg_id,
-                page,
-            )
-            text = build_my_smartlinks_text(items, page, total_pages, start)
-            kb = build_my_smartlinks_kb(items, page, total_pages, start)
-            await message.answer(text, reply_markup=kb)
-            return
+    total = len(items)
+    if total == 0:
+        await message.answer(
+            "У тебя пока нет смартлинков. Создай первый через «➕ Создать смарт-линк».",
+            reply_markup=smartlinks_menu_kb(),
+        )
+        return
+
+    total_pages = max(1, (total + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * MY_SMARTLINKS_PAGE_SIZE
+    page_items = items[start : start + MY_SMARTLINKS_PAGE_SIZE]
+
+    text = build_my_smartlinks_text(page_items, page, total_pages, start)
+    kb = build_my_smartlinks_kb(page_items, page, total_pages, start)
+    await message.answer(text, reply_markup=kb)
+
 
         logger.warning("[smartlinks-my] index_list failed tg_id=%s", tg_id)
     else:
@@ -3851,34 +3876,38 @@ async def smartlinks_delete_cb(callback):
 async def smartlinks_edit_menu_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
-    smartlink_id, tail = parse_smartlink_callback_data(callback.data, 1)
-    page = parse_page_marker(tail[0] if tail else None, default=0)
 
-    smartlink = None
-    if smartlink_id:
-        smartlink = await fetch_owned_smartlink_by_smartlink_id(tg_id, smartlink_id)
-
-    if not smartlink:
-        logger.error(
-            "[smartlink-edit-menu] smartlink not found tg_id=%s id=%s",
-            tg_id,
-            smartlink_id,
-        )
-        await callback.answer("Смартлинк не найден или временно недоступен", show_alert=True)
+    parts = callback.data.split(":")
+    # smartlinks:edit_menu:{artist_slug}:{slug}:{page}
+    if len(parts) != 5:
+        await callback.answer("Не понял", show_alert=True)
         return
-    artist_slug = str(smartlink.get("artist_slug") or "").strip()
-    slug = str(smartlink.get("slug") or "").strip()
-    resolved_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug) or smartlink_id
-    text = build_smartlink_view_text(smartlink)
+
+    artist_slug = parts[2]
+    slug = parts[3]
+    page = int(parts[4])
+
+    ok, item = await fetch_smartlink_from_index(artist_slug, slug)
+    if not ok or not item:
+        await callback.answer("Смартлинк не найден", show_alert=True)
+        return
+
+    # ownership check (чтобы нельзя было редактить чужое)
+    owner = item.get("owner") or {}
+    owner_tg = str(owner.get("tg_user_id") or "")
+    if owner_tg and owner_tg != str(tg_id):
+        await callback.answer("Это не твой смартлинк", show_alert=True)
+        return
+
+    text = build_smartlink_view_text(item)
+
     await callback.message.answer(
         text + "\n\nВыбери, что обновить:",
         reply_markup=smartlink_edit_menu_kb(
-            artist_slug,
-            slug,
+            f"{artist_slug}:{slug}",  # <- передаём “virtual id”
             page,
-            resolved_id,
-            smartlink.get("branding_disabled"),
-            smartlink.get("branding_paid"),
+            False,
+            False,
         ),
     )
     await callback.answer()
@@ -3894,7 +3923,7 @@ async def smartlinks_edit_field_cb(callback):
 
     smartlink = None
     if smartlink_id:
-        smartlink = await fetch_owned_smartlink_by_smartlink_id(tg_id, smartlink_id)
+        smartlink = await fetch_owned_smartlink_by_smartlink_id(tg_id, artist_slug:slug)
 
     if not smartlink or not field:
         logger.warning(
@@ -3909,7 +3938,7 @@ async def smartlinks_edit_field_cb(callback):
     await form_set(
         tg_id,
         0,
-        {"smartlink_id": smartlink_id, "page": page, "field": field, "data": {}},
+        {"artist_slug:slug": artist_slug:slug, "page": page, "field": field, "data": {}},
     )
 
     if field == "title":
