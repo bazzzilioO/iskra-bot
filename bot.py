@@ -106,6 +106,7 @@ from helpers import (
     get_smartlink_slugs,
     build_smartlink_index_payload,
     push_smartlink_to_index,
+    log_missing_index_token,
     safe_edit,
     safe_edit_caption,
     smartlink_can_remind,
@@ -821,7 +822,10 @@ async def fetch_my_smartlinks_from_index(
         )
         return False, None, None, None
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks"
-    headers = {"Authorization": f"Bearer {SMARTLINK_API_KEY}"}
+    headers = {
+        "Authorization": f"Bearer {SMARTLINK_API_KEY}",
+        "X-TG-USER-ID": str(tg_id),
+    }
     params = {
         "owner_tg_user_id": str(tg_id),
         "page": page,
@@ -833,6 +837,7 @@ async def fetch_my_smartlinks_from_index(
             async with session.get(url, headers=headers, params=params) as resp:
                 body = await resp.text()
                 if not (200 <= resp.status < 300):
+                    log_missing_index_token(resp.status, body, "fetch_my_smartlinks_from_index")
                     logger.warning(
                         "[smartlink-my] index_list failed status=%s body=%s",
                         resp.status,
@@ -849,6 +854,7 @@ async def fetch_my_smartlinks_from_index(
                     )
                     return False, None, None, None
                 if isinstance(payload, dict) and payload.get("ok") is False:
+                    log_missing_index_token(resp.status, body, "fetch_my_smartlinks_from_index")
                     logger.warning("[smartlink-my] index_list ok=false body=%s", body)
                     return False, None, None, None
 
@@ -902,6 +908,7 @@ async def fetch_smartlink_from_index(
             async with session.get(url, headers=headers) as resp:
                 body = await resp.text()
                 if not (200 <= resp.status < 300):
+                    log_missing_index_token(resp.status, body, "fetch_smartlink_from_index")
                     logger.warning(
                         "[smartlink-fetch] response status=%s body=%s", resp.status, body
                     )
@@ -1063,6 +1070,7 @@ async def update_smartlink_in_index(
                 truncated_body = body[:1000] if body else body
                 if 200 <= resp.status < 300:
                     return True, resp.status, None
+                log_missing_index_token(resp.status, body, "update_smartlink_in_index")
                 return False, resp.status, truncated_body
     except Exception as err:
         return False, None, str(err)
@@ -1827,6 +1835,7 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
                     body = None
                 truncated_body = body[:1000] if body else body
                 logger.info("[smartlink-index] worker response status=%s body=%s", status, truncated_body)
+                log_missing_index_token(status, body, "sync_smartlink_to_web")
                 if 200 <= status < 300:
                     return True, status, None
                 return False, status, body
