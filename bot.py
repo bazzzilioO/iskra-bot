@@ -448,11 +448,11 @@ NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30")
 SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
 SMARTLINK_INDEX_BASE = normalize_base_url(
     os.getenv("SMARTLINK_INDEX_BASE") or os.getenv("GO_INDEX_BASE"),
-    "https://go.sreda.pw",
+    None,
 )
 SMARTLINK_INDEX_URL = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
-SMARTLINK_PUBLIC_BASE = normalize_base_url(
-    os.getenv("SMARTLINK_PUBLIC_BASE") or SMARTLINK_INDEX_BASE,
+SMARTLINK_WEB_BASE = normalize_base_url(
+    os.getenv("SMARTLINK_WEB_BASE") or os.getenv("SMARTLINK_PUBLIC_BASE"),
     "https://go.sreda.pw",
 )
 SMARTLINK_PUBLISH_RETRY_DELAYS = [60, 300, 900, 3600]
@@ -1103,6 +1103,55 @@ async def update_smartlink_in_index(
             slug,
             err,
             reason,
+        )
+        return False, None, str(err)
+
+
+async def confirm_smartlink_indexed(
+    artist_slug: str, slug: str
+) -> tuple[bool, int | None, str | None]:
+    if not SMARTLINK_INDEX_BASE:
+        return False, None, "config_missing"
+    if not SMARTLINK_API_KEY:
+        logger.error(
+            "[smartlink-index] SMARTLINK_API_KEY missing; skipping confirm artist_slug=%s slug=%s",
+            artist_slug,
+            slug,
+        )
+        return False, None, "missing_api_key"
+    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
+    headers = {"X-API-Key": SMARTLINK_API_KEY}
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers=headers) as resp:
+                body = await resp.text()
+                truncated_body = body[:1000] if body else body
+                if log_missing_index_token(resp.status, body, "confirm_smartlink_indexed"):
+                    return False, resp.status, truncated_body
+                if resp.status == 404:
+                    logger.error(
+                        "[smartlink-index] confirm not found artist_slug=%s slug=%s",
+                        artist_slug,
+                        slug,
+                    )
+                    return False, resp.status, "not_found"
+                if 200 <= resp.status < 300:
+                    return True, resp.status, None
+                logger.warning(
+                    "[smartlink-index] confirm failed artist_slug=%s slug=%s status=%s body=%s",
+                    artist_slug,
+                    slug,
+                    resp.status,
+                    truncated_body,
+                )
+                return False, resp.status, truncated_body
+    except Exception as err:
+        logger.warning(
+            "[smartlink-index] confirm error artist_slug=%s slug=%s error=%s",
+            artist_slug,
+            slug,
+            err,
         )
         return False, None, str(err)
 
@@ -1768,7 +1817,7 @@ def build_cover_proxy_url(artist_slug: str, slug: str) -> str:
 def build_smartlink_web_url(artist_slug: str, slug: str) -> str:
     if not artist_slug or not slug:
         return ""
-    return f"{SMARTLINK_PUBLIC_BASE}/{artist_slug}/{slug}"
+    return f"{SMARTLINK_WEB_BASE}/{artist_slug}/{slug}"
 
 
 async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | None]:
@@ -1783,6 +1832,9 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
     if not SMARTLINK_API_KEY:
         logger.error("[smartlink-index] SMARTLINK_API_KEY missing; skipping sync")
         return False, None, "missing_api_key"
+    if not SMARTLINK_INDEX_BASE:
+        logger.error("[smartlink-index] SMARTLINK_INDEX_BASE missing; skipping sync")
+        return False, None, "config_missing"
 
     url = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
     headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
@@ -2003,6 +2055,20 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         else:
             publish_status = sync_status
             publish_error = sync_error
+        confirm_ok = False
+        confirm_status: int | None = None
+        confirm_error: str | None = None
+        if sync_ok:
+            confirm_ok, confirm_status, confirm_error = await confirm_smartlink_indexed(
+                artist_slug, slug
+            )
+            if not confirm_ok:
+                logger.error(
+                    "[smartlink] index confirm failed smartlink_id=%s status=%s error=%s",
+                    smartlink_id,
+                    confirm_status,
+                    confirm_error,
+                )
         allow_remind = smartlink_can_remind(smartlink)
         subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
         try:
@@ -2012,6 +2078,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
                 smartlink,
                 subscribed=subscribed,
                 allow_remind=allow_remind,
+                show_web_url=confirm_ok,
             )
         except Exception:
             logger.exception(
@@ -2022,14 +2089,19 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             await _send_smartlink_fallback(message.bot, tg_id, smartlink)
         platforms_text = ", ".join(platform_label(k) for k, v in links_clean.items() if v)
         rd_text = format_date_ru(parse_date(release_iso)) if release_iso else "—"
-        web_url = build_smartlink_web_url(artist_slug, slug) if sync_ok and publish_ok else ""
+        web_url = build_smartlink_web_url(artist_slug, slug) if confirm_ok else ""
+        web_status = "🌐 Web: публикация не удалась"
+        if sync_ok and publish_ok and confirm_ok:
+            web_status = f"🌐 Web: {web_url}"
+        elif sync_ok and publish_ok and not confirm_ok:
+            web_status = "🌐 Web: опубликовано, индекс обновляется (до 30 сек)"
         summary_lines = [
             "Смартлинк готов ✅" if sync_ok else "Смартлинк не сохранён ❌",
             f"Артист: {artist or '—'}",
             f"Релиз: {title or '—'}",
             f"Дата: {rd_text if rd_text else '—'}",
             f"Площадки: {platforms_text or '—'}",
-            (f"🌐 Web: {web_url}" if web_url else "🌐 Web: публикация не удалась"),
+            web_status,
             (
                 "🔄 Sync: ok"
                 if sync_ok
@@ -2443,7 +2515,7 @@ async def update_smartlink_message(bot: Bot, smartlink_id: int | str) -> bool:
         return False
 
     artist_slug, slug = get_smartlink_slugs(smartlink)
-    web_url = build_smartlink_web_url(artist_slug, slug) if SMARTLINK_PUBLIC_BASE else None
+    web_url = build_smartlink_web_url(artist_slug, slug) if SMARTLINK_WEB_BASE else None
     allow_remind = smartlink_can_remind(smartlink)
     updated_any = False
 
@@ -2623,10 +2695,15 @@ async def send_smartlink_photo(
     allow_remind: bool = False,
     page: int | None = None,
     store_message: bool | None = None,
+    show_web_url: bool = True,
 ):
     try:
         artist_slug, slug = get_smartlink_slugs(smartlink)
-        web_url = build_smartlink_web_url(artist_slug, slug) if SMARTLINK_PUBLIC_BASE else None
+        web_url = (
+            build_smartlink_web_url(artist_slug, slug)
+            if show_web_url and SMARTLINK_WEB_BASE
+            else None
+        )
         is_admin = bool(ADMIN_TG_ID and str(chat_id) == str(ADMIN_TG_ID))
         caption = build_smartlink_caption(smartlink, release_today=release_today)
         kb = build_smartlink_keyboard(
