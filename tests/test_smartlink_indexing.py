@@ -7,9 +7,9 @@ from aiohttp import web
 from helpers import build_smartlink_index_payload, push_smartlink_to_index
 
 
-async def _start_test_server(handler):
+async def _start_test_server(handler, *, method: str = "POST", path: str = "/api/index/upsert"):
     app = web.Application()
-    app.router.add_post("/api/index/upsert", handler)
+    app.router.add_route(method, path, handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "localhost", 0)
@@ -81,6 +81,7 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         async def handler(request):
+            captured["api_key"] = request.headers.get("X-API-Key")
             captured["auth"] = request.headers.get("Authorization")
             captured["payload"] = await request.json()
             return web.json_response({"ok": True})
@@ -100,7 +101,8 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertEqual(status, 200)
         self.assertIsNone(error)
-        self.assertEqual(captured.get("auth"), "Bearer test-key")
+        self.assertEqual(captured.get("api_key"), "test-key")
+        self.assertIsNone(captured.get("auth"))
         self.assertIn("payload", captured)
         self.assertNotIn("cover_source", captured["payload"])
         self.assertEqual(captured["payload"].get("artist_slug"), "test-artist")
@@ -111,7 +113,7 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         async def handler(request):
             attempts.append(1)
             if len(attempts) < 2:
-                return web.Response(status=500, text="temporary")
+                return web.Response(status=502, text="temporary")
             return web.json_response({"ok": True})
 
         port, cleanup = await _start_test_server(handler)
@@ -130,6 +132,45 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIsNone(error)
         self.assertGreaterEqual(len(attempts), 2)
+
+    async def test_update_smartlink_sends_api_key(self):
+        captured = {}
+
+        async def handler(request):
+            captured["api_key"] = request.headers.get("X-API-Key")
+            captured["auth"] = request.headers.get("Authorization")
+            return web.json_response({"ok": True})
+
+        port, cleanup = await _start_test_server(
+            handler,
+            method="PUT",
+            path="/api/smartlinks/{artist_slug}/{slug}",
+        )
+        self.addAsyncCleanup(cleanup)
+        os.environ["SMARTLINK_INDEX_BASE"] = f"http://localhost:{port}"
+        os.environ["SMARTLINK_API_KEY"] = "test-key"
+
+        import importlib
+        import bot as bot_module
+
+        importlib.reload(bot_module)
+
+        smartlink = {
+            "artist": "Test Artist",
+            "title": "Test Song",
+            "links": {"spotify": "https://example.com"},
+        }
+
+        ok, status, error = await bot_module.update_smartlink_in_index(
+            "test-artist",
+            "test-song",
+            smartlink,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(status, 200)
+        self.assertIsNone(error)
+        self.assertEqual(captured.get("api_key"), "test-key")
+        self.assertIsNone(captured.get("auth"))
 
 
 if __name__ == "__main__":

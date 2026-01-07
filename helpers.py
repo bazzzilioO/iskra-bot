@@ -331,7 +331,7 @@ async def push_smartlink_to_index(
         return False, None, "missing_api_key"
 
     headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
-    headers["Authorization"] = f"Bearer {api_key}"
+    headers["X-API-Key"] = api_key
 
     timeout = aiohttp.ClientTimeout(total=15)
     redacted_payload = json.dumps(payload, ensure_ascii=False)
