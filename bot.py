@@ -1267,21 +1267,41 @@ async def confirm_smartlink_indexed(
 
 
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
-    # Лучшее решение: источник истины = D1, фильтр = owner_tg_user_id
-    total_count = await count_owned_smartlinks(tg_id)
-    if total_count is None:
-        await message.answer(
-            "❌ Не удалось получить список смартлинков из D1. Попробуй позже.",
-            reply_markup=smartlinks_menu_kb(),
-        )
+    PAGE_SIZE = MY_SMARTLINKS_PAGE_SIZE
+
+    rows = await db_fetch_all(
+        """
+        SELECT id, artist_slug, slug, title, updated_at
+        FROM smartlinks
+        WHERE owner_tg_user_id = ?
+        ORDER BY updated_at DESC
+        LIMIT ? OFFSET ?
+        """,
+        (str(tg_id), PAGE_SIZE, page * PAGE_SIZE)
+    )
+
+    if not rows:
+        await message.answer("У тебя пока нет смартлинков.")
         return
 
-    if total_count == 0:
-        await message.answer(
-            "У тебя пока нет смартлинков. Создай первый через «➕ Создать смарт-линк».",
-            reply_markup=smartlinks_menu_kb(),
-        )
-        return
+    total_count = await db_fetch_value(
+        "SELECT COUNT(*) FROM smartlinks WHERE owner_tg_user_id = ?",
+        (str(tg_id),)
+    )
+
+    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
+
+    text_lines = []
+    for i, row in enumerate(rows, start=1 + page * PAGE_SIZE):
+        text_lines.append(f"{i}. {row['artist_slug'].upper()} — {row['title']}")
+
+    text = "🔗 Мои смартлинки:\n\n" + "\n".join(text_lines)
+
+    await message.answer(
+        text,
+        reply_markup=my_smartlinks_keyboard(rows, page, total_pages)
+    )
+    return
 
     total_pages = max(1, (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
@@ -2331,7 +2351,7 @@ async def show_import_confirmation(
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:import_confirm")],
-            [InlineKeyboardButton(text="✏️ Изменить", callback_data="smartlink:import_edit")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:{row['id']}")],
             [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
         ]
     )
