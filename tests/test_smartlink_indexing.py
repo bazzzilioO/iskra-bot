@@ -7,9 +7,18 @@ from aiohttp import web
 from helpers import build_smartlink_index_payload, push_smartlink_to_index
 
 
-async def _start_test_server(handler, *, method: str = "POST", path: str = "/api/index/upsert"):
+async def _start_test_server(
+    handler,
+    *,
+    method: str = "POST",
+    path: str = "/api/index/upsert",
+    extra_routes: list[tuple[str, str, callable]] | None = None,
+):
     app = web.Application()
     app.router.add_route(method, path, handler)
+    if extra_routes:
+        for route_method, route_path, route_handler in extra_routes:
+            app.router.add_route(route_method, route_path, route_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "localhost", 0)
@@ -86,7 +95,15 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
             captured["payload"] = await request.json()
             return web.json_response({"ok": True})
 
-        port, cleanup = await _start_test_server(handler)
+        async def confirm_handler(request):
+            return web.json_response({"ok": True})
+
+        port, cleanup = await _start_test_server(
+            handler,
+            extra_routes=[
+                ("GET", "/api/smartlinks/{artist_slug}/{slug}", confirm_handler),
+            ],
+        )
         self.addAsyncCleanup(cleanup)
         os.environ["SMARTLINK_INDEX_BASE"] = f"http://localhost:{port}"
         os.environ["SMARTLINK_API_KEY"] = "test-key"
@@ -116,7 +133,15 @@ class SmartlinkIndexingTests(unittest.IsolatedAsyncioTestCase):
                 return web.Response(status=502, text="temporary")
             return web.json_response({"ok": True})
 
-        port, cleanup = await _start_test_server(handler)
+        async def confirm_handler(request):
+            return web.json_response({"ok": True})
+
+        port, cleanup = await _start_test_server(
+            handler,
+            extra_routes=[
+                ("GET", "/api/smartlinks/{artist_slug}/{slug}", confirm_handler),
+            ],
+        )
         self.addAsyncCleanup(cleanup)
         os.environ["SMARTLINK_INDEX_BASE"] = f"http://localhost:{port}"
         os.environ["SMARTLINK_API_KEY"] = "test-key"

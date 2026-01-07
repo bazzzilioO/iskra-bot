@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 
 DEFAULT_SMARTLINK_BASE = "https://go.sreda.pw"
+SMARTLINK_WEB_BASE = None
 
 
 def log_missing_index_token(status: int | None, body: str | None, context: str) -> bool:
@@ -35,13 +36,18 @@ def log_missing_index_token(status: int | None, body: str | None, context: str) 
     return False
 
 
-def normalize_base_url(base: str | None, default: str = DEFAULT_SMARTLINK_BASE) -> str:
+def normalize_base_url(base: str | None, default: str | None = DEFAULT_SMARTLINK_BASE) -> str:
     base = (base or "").strip()
     if not base:
+        if default is None:
+            return ""
         base = default
     if not re.match(r"^https?://", base):
         base = f"https://{base}"
     return base.rstrip("/")
+
+
+SMARTLINK_WEB_BASE = normalize_base_url(os.getenv("SMARTLINK_WEB_BASE"), DEFAULT_SMARTLINK_BASE)
 
 
 def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
@@ -266,7 +272,7 @@ def build_smartlink_index_payload(
     if telegram_file_id:
         cover_source_type = "telegram"
         cover_source_payload = {"type": "telegram", "file_id": telegram_file_id}
-        cover_url = f"{DEFAULT_SMARTLINK_BASE}/api/cover/{artist_slug}/{slug}"
+        cover_url = f"{SMARTLINK_WEB_BASE}/api/cover/{artist_slug}/{slug}"
     elif cover_url:
         cover_source_type = "external"
     else:
@@ -315,10 +321,10 @@ def build_smartlink_index_payload(
 async def push_smartlink_to_index(
     smartlink: dict, owner: dict | None = None
 ) -> tuple[bool, int | None, str | None]:
-    base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), DEFAULT_SMARTLINK_BASE)
+    base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), None)
     index_url = f"{base_url}/api/index/upsert"
     api_key = os.getenv("SMARTLINK_API_KEY")
-    if not index_url:
+    if not base_url:
         logger.info("[smartlink-index] index url is not configured, skipping")
         return False, None, "config_missing"
 
@@ -359,7 +365,12 @@ async def push_smartlink_to_index(
                     if log_missing_index_token(resp.status, body, "push_smartlink_to_index"):
                         return False, resp.status, truncated_body
                     if 200 <= resp.status < 300:
-                        return True, resp.status, None
+                        verified, verify_status, verify_error = await _verify_index_entry(
+                            session, base_url, payload["artist_slug"], payload["slug"], headers
+                        )
+                        if verified:
+                            return True, resp.status, None
+                        return False, verify_status, verify_error
                     last_error = truncated_body
                     if resp.status < 500:
                         return False, resp.status, truncated_body
@@ -379,3 +390,48 @@ async def push_smartlink_to_index(
             await asyncio.sleep(backoff_seconds)
 
     return False, last_status, last_error
+
+
+async def _verify_index_entry(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    artist_slug: str,
+    slug: str,
+    headers: dict,
+) -> tuple[bool, int | None, str | None]:
+    verify_url = f"{base_url}/api/smartlinks/{artist_slug}/{slug}"
+    try:
+        async with session.get(verify_url, headers=headers) as resp:
+            status = resp.status
+            try:
+                body = await resp.text()
+            except Exception:
+                body = None
+            truncated_body = body[:1000] if body else body
+            if log_missing_index_token(status, body, "verify_index_entry"):
+                return False, status, truncated_body
+            if status == 404:
+                logger.error(
+                    "[smartlink-index] verify failed: not found artist_slug=%s slug=%s",
+                    artist_slug,
+                    slug,
+                )
+                return False, status, "not_found"
+            if 200 <= status < 300:
+                return True, status, None
+            logger.warning(
+                "[smartlink-index] verify failed artist_slug=%s slug=%s status=%s body=%s",
+                artist_slug,
+                slug,
+                status,
+                truncated_body,
+            )
+            return False, status, truncated_body
+    except Exception as err:
+        logger.warning(
+            "[smartlink-index] verify error artist_slug=%s slug=%s error=%s",
+            artist_slug,
+            slug,
+            err,
+        )
+        return False, None, str(err)
