@@ -58,29 +58,9 @@ def _coerce_bool(value: object | None, *, default: bool = False) -> bool:
     return bool(value)
 
 
-async def _get_smartlink_owner_column(db: aiosqlite.Connection) -> str | None:
-    cur = await db.execute("PRAGMA table_info(smartlinks)")
-    rows = await cur.fetchall()
-    columns = {row[1] for row in rows}
-    for candidate in ("owner_tg_user_id", "owner_tg_id"):
-        if candidate in columns:
-            return candidate
-    return None
-
-
 def _normalize_d1_smartlink(row: aiosqlite.Row) -> dict:
     data = dict(row)
-    owner_raw = (
-        data.get("owner_tg_user_id")
-        or data.get("owner_tg_id")
-        or data.get("owner_id")
-    )
-    owner_tg_id = 0
-    if owner_raw is not None:
-        try:
-            owner_tg_id = int(owner_raw)
-        except Exception:
-            owner_tg_id = 0
+    owner_tg_user_id = str(data.get("owner_tg_user_id") or "").strip()
 
     artist_slug = str(data.get("artist_slug") or "").strip()
     slug = str(data.get("slug") or "").strip()
@@ -103,7 +83,8 @@ def _normalize_d1_smartlink(row: aiosqlite.Row) -> dict:
 
     smartlink = {
         "id": f"{artist_slug}:{slug}" if artist_slug and slug else str(data.get("id") or ""),
-        "owner_tg_id": owner_tg_id,
+        "d1_id": data.get("id"),
+        "owner_tg_user_id": owner_tg_user_id,
         "artist": data.get("artist") or data.get("artist_name") or "",
         "title": data.get("title") or "",
         "release_date": data.get("release_date") or "",
@@ -119,6 +100,7 @@ def _normalize_d1_smartlink(row: aiosqlite.Row) -> dict:
         "artist_slug": artist_slug,
         "slug": slug,
         "cover_version": int(data.get("cover_version") or 1),
+        "cover_updated_at": data.get("cover_updated_at"),
         "metadata": metadata,
     }
     return smartlink
@@ -343,63 +325,69 @@ async def init_db():
 
 
 async def list_owned_smartlinks(
-    owner_tg_id: int | str,
+    owner_tg_user_id: int | str,
     limit: int,
     offset: int,
 ) -> list[dict] | None:
     async with _smartlink_d1_connection() as db:
         if not db:
             return None
-        owner_col = await _get_smartlink_owner_column(db)
-        if not owner_col:
-            logger.error("[smartlink-d1] smartlinks owner column not found")
-            return None
         try:
-            cur = await db.execute("PRAGMA table_info(smartlinks)")
-            rows = await cur.fetchall()
-            columns = {row[1] for row in rows}
-            if "updated_at" in columns and "created_at" in columns:
-                order_expr = "COALESCE(updated_at, created_at) DESC"
-            elif "updated_at" in columns:
-                order_expr = "updated_at DESC"
-            elif "created_at" in columns:
-                order_expr = "created_at DESC"
-            else:
-                order_expr = "rowid DESC"
             query = (
-                f"SELECT * FROM smartlinks WHERE {owner_col}=? "
-                f"ORDER BY {order_expr} LIMIT ? OFFSET ?"
+                "SELECT * FROM smartlinks WHERE owner_tg_user_id=? "
+                "ORDER BY updated_at DESC LIMIT ? OFFSET ?"
             )
-            cur = await db.execute(query, (str(owner_tg_id), limit, offset))
+            logger.info(
+                "[smartlink-d1] list query=%s tg_id=%s limit=%s offset=%s",
+                query,
+                owner_tg_user_id,
+                limit,
+                offset,
+            )
+            cur = await db.execute(query, (str(owner_tg_user_id), limit, offset))
             rows = await cur.fetchall()
-            return [_normalize_d1_smartlink(row) for row in rows]
+            items = [_normalize_d1_smartlink(row) for row in rows]
+            logger.info(
+                "[smartlink-d1] list result tg_id=%s count=%s",
+                owner_tg_user_id,
+                len(items),
+            )
+            return items
         except Exception:
-            logger.exception("[smartlink-d1] failed to list smartlinks owner=%s", owner_tg_id)
+            logger.exception("[smartlink-d1] failed to list smartlinks owner=%s", owner_tg_user_id)
             return None
 
 
-async def count_owned_smartlinks(owner_tg_id: int | str) -> int | None:
+async def count_owned_smartlinks(owner_tg_user_id: int | str) -> int | None:
     async with _smartlink_d1_connection() as db:
         if not db:
             return None
-        owner_col = await _get_smartlink_owner_column(db)
-        if not owner_col:
-            logger.error("[smartlink-d1] smartlinks owner column not found")
-            return None
         try:
+            query = "SELECT COUNT(1) FROM smartlinks WHERE owner_tg_user_id=?"
+            logger.info(
+                "[smartlink-d1] count query=%s tg_id=%s",
+                query,
+                owner_tg_user_id,
+            )
             cur = await db.execute(
-                f"SELECT COUNT(1) FROM smartlinks WHERE {owner_col}=?",
-                (str(owner_tg_id),),
+                query,
+                (str(owner_tg_user_id),),
             )
             row = await cur.fetchone()
-            return int(row[0]) if row else 0
+            count = int(row[0]) if row else 0
+            logger.info(
+                "[smartlink-d1] count result tg_id=%s count=%s",
+                owner_tg_user_id,
+                count,
+            )
+            return count
         except Exception:
-            logger.exception("[smartlink-d1] failed to count smartlinks owner=%s", owner_tg_id)
+            logger.exception("[smartlink-d1] failed to count smartlinks owner=%s", owner_tg_user_id)
             return None
 
 
 async def fetch_owned_smartlink_from_d1(
-    owner_tg_id: int | str,
+    owner_tg_user_id: int | str,
     artist_slug: str,
     slug: str,
 ) -> dict | None:
@@ -410,27 +398,75 @@ async def fetch_owned_smartlink_from_d1(
     async with _smartlink_d1_connection() as db:
         if not db:
             return None
-        owner_col = await _get_smartlink_owner_column(db)
-        if not owner_col:
-            logger.error("[smartlink-d1] smartlinks owner column not found")
-            return None
         try:
-            cur = await db.execute(
-                f"""
+            query = """
                 SELECT * FROM smartlinks
-                WHERE {owner_col}=? AND artist_slug=? AND slug=?
+                WHERE owner_tg_user_id=? AND artist_slug=? AND slug=?
                 LIMIT 1
-                """,
-                (str(owner_tg_id), artist_slug, slug),
+                """
+            logger.info(
+                "[smartlink-d1] fetch_by_slug query=%s tg_id=%s artist_slug=%s slug=%s",
+                "SELECT * FROM smartlinks WHERE owner_tg_user_id=? AND artist_slug=? AND slug=? LIMIT 1",
+                owner_tg_user_id,
+                artist_slug,
+                slug,
+            )
+            cur = await db.execute(
+                query,
+                (str(owner_tg_user_id), artist_slug, slug),
             )
             row = await cur.fetchone()
-            return _normalize_d1_smartlink(row) if row else None
+            smartlink = _normalize_d1_smartlink(row) if row else None
+            logger.info(
+                "[smartlink-d1] fetch_by_slug result tg_id=%s found=%s",
+                owner_tg_user_id,
+                bool(smartlink),
+            )
+            return smartlink
         except Exception:
             logger.exception(
                 "[smartlink-d1] failed to fetch smartlink owner=%s artist_slug=%s slug=%s",
-                owner_tg_id,
+                owner_tg_user_id,
                 artist_slug,
                 slug,
+            )
+            return None
+
+
+async def fetch_owned_smartlink_by_id(
+    owner_tg_user_id: int | str,
+    smartlink_id: int | str,
+) -> dict | None:
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return None
+        try:
+            query = """
+                SELECT * FROM smartlinks
+                WHERE id=? AND owner_tg_user_id=?
+                LIMIT 1
+                """
+            logger.info(
+                "[smartlink-d1] fetch_by_id query=%s tg_id=%s id=%s",
+                "SELECT * FROM smartlinks WHERE id=? AND owner_tg_user_id=? LIMIT 1",
+                owner_tg_user_id,
+                smartlink_id,
+            )
+            cur = await db.execute(query, (smartlink_id, str(owner_tg_user_id)))
+            row = await cur.fetchone()
+            smartlink = _normalize_d1_smartlink(row) if row else None
+            logger.info(
+                "[smartlink-d1] fetch_by_id result tg_id=%s id=%s found=%s",
+                owner_tg_user_id,
+                smartlink_id,
+                bool(smartlink),
+            )
+            return smartlink
+        except Exception:
+            logger.exception(
+                "[smartlink-d1] failed to fetch smartlink owner=%s id=%s",
+                owner_tg_user_id,
+                smartlink_id,
             )
             return None
 
