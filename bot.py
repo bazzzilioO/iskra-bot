@@ -66,6 +66,7 @@ from db import (
     get_release_date,
     get_reminders_enabled,
     get_smartlink_by_id,
+    get_smartlink_by_owner_slugs,
     get_smartlink_by_slugs,
     list_smartlinks,
     get_tasks_state,
@@ -768,7 +769,8 @@ def build_my_smartlinks_kb(
     for idx, item in enumerate(items, start=start_index + 1):
         artist_slug = str(item.get("artist_slug") or "").strip()
         slug = str(item.get("slug") or "").strip()
-        smartlink_id = item.get("id")
+        if not artist_slug or not slug:
+            artist_slug, slug = get_smartlink_slugs(item)
         canonical_url = (
             f"{SMARTLINK_INDEX_BASE}/{artist_slug}/{slug}"
             if artist_slug and slug
@@ -777,11 +779,11 @@ def build_my_smartlinks_kb(
         row: list[InlineKeyboardButton] = []
         if canonical_url:
             row.append(InlineKeyboardButton(text=f"{idx}. 🌐 Открыть", url=canonical_url))
-        if smartlink_id is not None:
+        if artist_slug and slug:
             row.append(
                 InlineKeyboardButton(
                     text="✏️ Редактировать",
-                    callback_data=f"smartlinks:edit_menu:{smartlink_id}:{page}",
+                    callback_data=f"smartlinks:edit:{artist_slug}:{slug}:p{page}",
                 )
             )
         if row:
@@ -800,14 +802,22 @@ def build_my_smartlinks_kb(
     return InlineKeyboardMarkup(inline_keyboard=inline)
 
 
+def normalize_owner_id(value: object | None) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
 async def fetch_my_smartlinks_from_index(
     tg_id: int,
-) -> tuple[bool, list[dict] | None]:
-    url = f"{SMARTLINK_INDEX_BASE}/api/my"
+    page: int,
+    limit: int,
+) -> tuple[bool, list[dict] | None, int | None, int | None]:
+    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks"
     headers = {}
     if SMARTLINK_API_KEY:
         headers["X-API-Key"] = SMARTLINK_API_KEY
-    params = {"tg_user_id": str(tg_id)}
+    params = {"owner_tg_id": str(tg_id), "page": page, "limit": limit}
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -815,11 +825,11 @@ async def fetch_my_smartlinks_from_index(
                 body = await resp.text()
                 if not (200 <= resp.status < 300):
                     logger.warning(
-                        "[smartlink-my] worker response status=%s body=%s",
+                        "[smartlink-my] index_list failed status=%s body=%s",
                         resp.status,
                         body,
                     )
-                    return False, None
+                    return False, None, None, None
                 try:
                     payload = await resp.json()
                 except Exception:
@@ -828,14 +838,14 @@ async def fetch_my_smartlinks_from_index(
                         resp.status,
                         body,
                     )
-                    return False, None
+                    return False, None, None, None
                 if isinstance(payload, dict) and payload.get("ok") is False:
-                    logger.warning(
-                        "[smartlink-my] worker returned ok=false body=%s", body
-                    )
-                    return False, None
+                    logger.warning("[smartlink-my] index_list ok=false body=%s", body)
+                    return False, None, None, None
 
                 items: list[dict] = []
+                total_count: int | None = None
+                total_pages: int | None = None
                 if isinstance(payload, list):
                     items = payload
                 elif isinstance(payload, dict):
@@ -844,21 +854,31 @@ async def fetch_my_smartlinks_from_index(
                         if isinstance(value, list):
                             items = value
                             break
-                return True, items or []
+                    for key in ("total", "count", "total_count"):
+                        value = payload.get(key)
+                        if isinstance(value, int):
+                            total_count = value
+                            break
+                    for key in ("total_pages", "pages"):
+                        value = payload.get(key)
+                        if isinstance(value, int):
+                            total_pages = value
+                            break
+                return True, items or [], total_count, total_pages
     except Exception as err:
-        logger.warning("[smartlink-my] request error: %s", err)
-        return False, None
+        logger.warning("[smartlink-my] index_list request error: %s", err)
+        return False, None, None, None
 
 
 async def fetch_smartlink_from_index(
     artist_slug: str, slug: str
-) -> tuple[bool, dict | None]:
+) -> tuple[bool, dict | None, int | None]:
     artist_slug = str(artist_slug or "").strip()
     slug = str(slug or "").strip()
     if not SMARTLINK_INDEX_BASE or not artist_slug or not slug:
-        return False, None
+        return False, None, None
 
-    url = f"{SMARTLINK_INDEX_BASE}/api/index/{artist_slug}/{slug}"
+    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
     headers = {}
     if SMARTLINK_API_KEY:
         headers["X-API-Key"] = SMARTLINK_API_KEY
@@ -871,7 +891,7 @@ async def fetch_smartlink_from_index(
                     logger.warning(
                         "[smartlink-fetch] response status=%s body=%s", resp.status, body
                     )
-                    return False, None
+                    return False, None, resp.status
                 try:
                     payload = await resp.json()
                 except Exception:
@@ -880,7 +900,7 @@ async def fetch_smartlink_from_index(
                         resp.status,
                         body,
                     )
-                    return False, None
+                    return False, None, resp.status
 
                 item: dict | None = None
                 if isinstance(payload, dict):
@@ -894,13 +914,158 @@ async def fetch_smartlink_from_index(
                 elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
                     item = payload[0]
 
-                return True, item
+                return True, item, resp.status
     except Exception as err:
         logger.warning("[smartlink-fetch] request error: %s", err)
-        return False, None
+        return False, None, None
+
+
+def parse_page_marker(marker: str | None, default: int = 0) -> int:
+    if not marker:
+        return default
+    marker = marker.strip()
+    if marker.startswith("p") and marker[1:].lstrip("-").isdigit():
+        return int(marker[1:])
+    if marker.lstrip("-").isdigit():
+        return int(marker)
+    return default
+
+
+def normalize_index_smartlink(
+    item: dict,
+    owner_tg_id: int,
+    artist_slug: str | None = None,
+    slug: str | None = None,
+) -> dict:
+    artist_slug = (artist_slug or item.get("artist_slug") or "").strip()
+    slug = (slug or item.get("slug") or "").strip()
+    if not artist_slug or not slug:
+        artist_slug, slug = get_smartlink_slugs(item)
+    cover_source = item.get("cover_source") if isinstance(item.get("cover_source"), dict) else {}
+    cover_file_id = item.get("cover_file_id") or cover_source.get("file_id") or ""
+    links = item.get("links") if isinstance(item.get("links"), dict) else {}
+    return {
+        "owner_tg_id": int(owner_tg_id),
+        "artist": item.get("artist") or item.get("artist_name") or "",
+        "title": item.get("title") or "",
+        "release_date": item.get("release_date") or "",
+        "cover_file_id": cover_file_id or "",
+        "cover_source": cover_source or {},
+        "links": links or {},
+        "caption_text": item.get("caption_text") or "",
+        "branding_disabled": bool(item.get("branding_disabled", False)),
+        "branding_paid": bool(item.get("branding_paid", False)),
+        "pre_save_enabled": bool(item.get("pre_save_enabled", True)),
+        "reminders_enabled": bool(item.get("reminders_enabled", True)),
+        "cover_url": item.get("cover_url"),
+        "artist_slug": artist_slug,
+        "slug": slug,
+        "cover_version": int(item.get("cover_version") or 1),
+    }
+
+
+async def upsert_smartlink_cache(owner_tg_id: int, smartlink: dict) -> dict | None:
+    artist_slug, slug = get_smartlink_slugs(smartlink)
+    existing = await get_smartlink_by_owner_slugs(owner_tg_id, artist_slug, slug)
+    updates = {
+        "artist": smartlink.get("artist") or "",
+        "title": smartlink.get("title") or "",
+        "release_date": smartlink.get("release_date") or "",
+        "cover_file_id": smartlink.get("cover_file_id") or "",
+        "cover_source": smartlink.get("cover_source") or {},
+        "links": smartlink.get("links") or {},
+        "caption_text": smartlink.get("caption_text") or "",
+        "branding_disabled": bool(smartlink.get("branding_disabled", False)),
+        "branding_paid": bool(smartlink.get("branding_paid", False)),
+        "pre_save_enabled": bool(smartlink.get("pre_save_enabled", True)),
+        "reminders_enabled": bool(smartlink.get("reminders_enabled", True)),
+        "cover_url": smartlink.get("cover_url"),
+        "artist_slug": artist_slug,
+        "slug": slug,
+        "cover_version": int(smartlink.get("cover_version") or 1),
+    }
+    if existing and existing.get("id"):
+        await update_smartlink_data(existing["id"], owner_tg_id, updates)
+        return await get_smartlink_by_id(existing["id"])
+
+    new_id = await save_smartlink(
+        owner_tg_id=owner_tg_id,
+        artist=updates["artist"],
+        title=updates["title"],
+        release_date_iso=updates["release_date"],
+        cover_file_id=updates["cover_file_id"],
+        cover_source=updates["cover_source"],
+        links=updates["links"],
+        caption_text=updates["caption_text"],
+        branding_disabled=updates["branding_disabled"],
+        pre_save_enabled=updates["pre_save_enabled"],
+        reminders_enabled=updates["reminders_enabled"],
+        cover_url=updates["cover_url"],
+        artist_slug=updates["artist_slug"],
+        slug=updates["slug"],
+        cover_version=updates["cover_version"],
+    )
+    return await get_smartlink_by_id(new_id)
+
+
+async def update_smartlink_in_index(
+    artist_slug: str,
+    slug: str,
+    smartlink: dict,
+    owner: dict | None = None,
+) -> tuple[bool, int | None, str | None]:
+    if not SMARTLINK_INDEX_BASE:
+        return False, None, "config_missing"
+    index_url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
+    headers = {"Content-Type": "application/json"}
+    if SMARTLINK_API_KEY:
+        headers["X-API-Key"] = SMARTLINK_API_KEY
+    payload = build_smartlink_index_payload(smartlink, owner=owner)
+    if not payload:
+        return False, None, "payload_invalid"
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.put(index_url, headers=headers, json=payload) as resp:
+                body = await resp.text()
+                truncated_body = body[:1000] if body else body
+                if 200 <= resp.status < 300:
+                    return True, resp.status, None
+                return False, resp.status, truncated_body
+    except Exception as err:
+        return False, None, str(err)
 
 
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
+    index_ok, items, total_count, total_pages = await fetch_my_smartlinks_from_index(
+        tg_id, page, MY_SMARTLINKS_PAGE_SIZE
+    )
+    if index_ok and items is not None:
+        if total_pages is None:
+            if total_count is not None:
+                total_pages = max(
+                    1, (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE
+                )
+            else:
+                if len(items) < MY_SMARTLINKS_PAGE_SIZE:
+                    total_pages = page + 1
+                else:
+                    total_pages = page + 2
+        total_pages = max(1, total_pages)
+        page = max(0, min(page, total_pages - 1))
+        start = page * MY_SMARTLINKS_PAGE_SIZE
+        logger.info(
+            "[smartlinks-my] index_list ok tg_id=%s count=%s page=%s",
+            tg_id,
+            len(items),
+            page,
+        )
+        text = build_my_smartlinks_text(items, page, total_pages, start)
+        kb = build_my_smartlinks_kb(items, page, total_pages, start)
+        await message.answer(text, reply_markup=kb)
+        return
+
+    logger.warning("[smartlinks-my] index_list failed, using cache tg_id=%s", tg_id)
     total = await count_smartlinks(tg_id)
     all_total = await count_all_smartlinks()
     if total == 0 and all_total > 0:
@@ -931,10 +1096,14 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
     )
 
     logger.info(
-        "[smartlinks-my] returning items tg_id=%s page=%s count=%s", tg_id, page, len(items)
+        "[smartlinks-my] returning cached items tg_id=%s page=%s count=%s",
+        tg_id,
+        page,
+        len(items),
     )
 
-    text = build_my_smartlinks_text(items, page, total_pages, start)
+    text = "⚠️ Web index temporarily unavailable, showing cached list.\n\n"
+    text += build_my_smartlinks_text(items, page, total_pages, start)
     kb = build_my_smartlinks_kb(items, page, total_pages, start)
     await message.answer(text, reply_markup=kb)
 
@@ -3213,17 +3382,105 @@ async def smartlinks_edit_cb(callback):
     parts = callback.data.split(":")
     artist_slug = parts[2].strip() if len(parts) > 2 else ""
     slug = parts[3].strip() if len(parts) > 3 else ""
+    page = parse_page_marker(parts[4] if len(parts) > 4 else None, default=0)
 
-    logger.warning(
-        "[smartlink-edit-legacy] smartlink not found tg_id=%s artist_slug=%s slug=%s",
-        tg_id,
-        artist_slug,
-        slug,
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
+
+    index_ok, item, status = await fetch_smartlink_from_index(artist_slug, slug)
+    if index_ok and item:
+        owner = item.get("owner") if isinstance(item.get("owner"), dict) else {}
+        owner_tg = owner.get("tg_user_id") or owner.get("id") or owner.get("tg_id")
+        if owner_tg and normalize_owner_id(owner_tg) != normalize_owner_id(tg_id):
+            logger.warning(
+                "[smartlink-edit] index_get forbidden artist_slug=%s slug=%s tg_id=%s owner_tg=%s",
+                artist_slug,
+                slug,
+                tg_id,
+                owner_tg,
+            )
+            await callback.answer("Это не ваш смартлинк.", show_alert=True)
+            return
+
+        logger.info(
+            "[smartlink-edit] index_get ok artist_slug=%s slug=%s tg_id=%s",
+            artist_slug,
+            slug,
+            tg_id,
+        )
+        normalized = normalize_index_smartlink(item, tg_id, artist_slug, slug)
+        await form_start(tg_id, "smartlink_edit_context")
+        await form_set(
+            tg_id,
+            0,
+            {
+                "artist_slug": artist_slug,
+                "slug": slug,
+                "page": page,
+                "smartlink": normalized,
+            },
+        )
+        cached = await upsert_smartlink_cache(tg_id, normalized)
+        if not cached or not cached.get("id"):
+            logger.error(
+                "[smartlink-edit] cache upsert failed artist_slug=%s slug=%s tg_id=%s",
+                artist_slug,
+                slug,
+                tg_id,
+            )
+            await callback.answer(
+                "Не удалось подготовить редактирование. Откройте список заново.",
+                show_alert=True,
+            )
+            return
+        text = build_smartlink_view_text(cached)
+        await callback.message.answer(
+            text + "\n\nВыбери, что обновить:",
+            reply_markup=smartlink_edit_menu_kb(
+                cached["id"],
+                page,
+                cached.get("branding_disabled"),
+                cached.get("branding_paid"),
+            ),
+        )
+        await callback.answer()
+        return
+
+    if status == 404:
+        logger.warning(
+            "[smartlink-edit] index_get 404 artist_slug=%s slug=%s tg_id=%s",
+            artist_slug,
+            slug,
+            tg_id,
+        )
+    else:
+        logger.warning(
+            "[smartlink-edit] index_get failed artist_slug=%s slug=%s tg_id=%s status=%s",
+            artist_slug,
+            slug,
+            tg_id,
+            status,
+        )
+
+    local = await get_smartlink_by_owner_slugs(tg_id, artist_slug, slug)
+    if not local:
+        await callback.answer(
+            "Смартлинк не найден. Откройте список ‘Мои смартлинки’ заново.",
+            show_alert=True,
+        )
+        return
+    text = build_smartlink_view_text(local)
+    await callback.message.answer(
+        text + "\n\nВыбери, что обновить:",
+        reply_markup=smartlink_edit_menu_kb(
+            local["id"],
+            page,
+            local.get("branding_disabled"),
+            local.get("branding_paid"),
+        ),
     )
-    await callback.answer(
-        "Смартлинк не найден в вашей базе. Откройте список ‘Мои смартлинки’ заново.",
-        show_alert=True,
-    )
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("smartlinks:list:"))
@@ -3527,14 +3784,41 @@ async def smartlinks_branding_toggle_cb(callback):
     branding_paid = bool(smartlink.get("branding_paid"))
 
     if smartlink.get("branding_disabled"):
-        await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": False})
-        updated = await get_smartlink_by_id(smartlink_id)
+        updated_payload = {**smartlink, "branding_disabled": False}
+        artist_slug, slug = get_smartlink_slugs(updated_payload)
+        updated_payload["artist_slug"] = artist_slug
+        updated_payload["slug"] = slug
+        index_ok, status, error = await update_smartlink_in_index(
+            artist_slug,
+            slug,
+            updated_payload,
+            owner=build_owner_payload(callback.from_user),
+        )
+        if not index_ok:
+            logger.warning(
+                "[smartlink-edit] index_put failed artist_slug=%s slug=%s tg_id=%s status=%s error=%s",
+                artist_slug,
+                slug,
+                tg_id,
+                status,
+                (error or "")[:300],
+            )
+            await callback.answer("Не получилось обновить. Попробуй позже.", show_alert=True)
+            return
+        logger.info(
+            "[smartlink-edit] index_put ok artist_slug=%s slug=%s tg_id=%s status=%s",
+            artist_slug,
+            slug,
+            tg_id,
+            status,
+        )
+        updated = await upsert_smartlink_cache(tg_id, updated_payload)
         if updated:
             text = build_smartlink_view_text(updated)
             await callback.message.answer(
                 text + "\n\nВыбери, что обновить:",
                 reply_markup=smartlink_edit_menu_kb(
-                    smartlink_id,
+                    updated["id"],
                     page,
                     updated.get("branding_disabled"),
                     updated.get("branding_paid"),
@@ -3544,14 +3828,41 @@ async def smartlinks_branding_toggle_cb(callback):
         return
 
     if branding_paid:
-        await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": True})
-        updated = await get_smartlink_by_id(smartlink_id)
+        updated_payload = {**smartlink, "branding_disabled": True}
+        artist_slug, slug = get_smartlink_slugs(updated_payload)
+        updated_payload["artist_slug"] = artist_slug
+        updated_payload["slug"] = slug
+        index_ok, status, error = await update_smartlink_in_index(
+            artist_slug,
+            slug,
+            updated_payload,
+            owner=build_owner_payload(callback.from_user),
+        )
+        if not index_ok:
+            logger.warning(
+                "[smartlink-edit] index_put failed artist_slug=%s slug=%s tg_id=%s status=%s error=%s",
+                artist_slug,
+                slug,
+                tg_id,
+                status,
+                (error or "")[:300],
+            )
+            await callback.answer("Не получилось обновить. Попробуй позже.", show_alert=True)
+            return
+        logger.info(
+            "[smartlink-edit] index_put ok artist_slug=%s slug=%s tg_id=%s status=%s",
+            artist_slug,
+            slug,
+            tg_id,
+            status,
+        )
+        updated = await upsert_smartlink_cache(tg_id, updated_payload)
         if updated:
             text = build_smartlink_view_text(updated)
             await callback.message.answer(
                 text + "\n\nВыбери, что обновить:",
                 reply_markup=smartlink_edit_menu_kb(
-                    smartlink_id,
+                    updated["id"],
                     page,
                     updated.get("branding_disabled"),
                     updated.get("branding_paid"),
@@ -3612,14 +3923,41 @@ async def smartlinks_branding_pay_cb(callback):
         await callback.answer("Брендинг уже отключён", show_alert=True)
         return
     if smartlink.get("branding_paid"):
-        await update_smartlink_data(smartlink_id, tg_id, {"branding_disabled": True})
-        updated = await get_smartlink_by_id(smartlink_id)
+        updated_payload = {**smartlink, "branding_disabled": True}
+        artist_slug, slug = get_smartlink_slugs(updated_payload)
+        updated_payload["artist_slug"] = artist_slug
+        updated_payload["slug"] = slug
+        index_ok, status, error = await update_smartlink_in_index(
+            artist_slug,
+            slug,
+            updated_payload,
+            owner=build_owner_payload(callback.from_user),
+        )
+        if not index_ok:
+            logger.warning(
+                "[smartlink-edit] index_put failed artist_slug=%s slug=%s tg_id=%s status=%s error=%s",
+                artist_slug,
+                slug,
+                tg_id,
+                status,
+                (error or "")[:300],
+            )
+            await callback.answer("Не получилось обновить. Попробуй позже.", show_alert=True)
+            return
+        logger.info(
+            "[smartlink-edit] index_put ok artist_slug=%s slug=%s tg_id=%s status=%s",
+            artist_slug,
+            slug,
+            tg_id,
+            status,
+        )
+        updated = await upsert_smartlink_cache(tg_id, updated_payload)
         if updated:
             text = build_smartlink_view_text(updated)
             await callback.message.answer(
                 text + "\n\nВыбери, что обновить:",
                 reply_markup=smartlink_edit_menu_kb(
-                    smartlink_id,
+                    updated["id"],
                     page,
                     updated.get("branding_disabled"),
                     updated.get("branding_paid"),
@@ -4949,37 +5287,55 @@ async def any_message_router(message: Message):
 
         cover_updated = bool({"cover_file_id", "cover_source", "cover_url"} & set(updates.keys()))
         if updates:
-            await update_smartlink_data(smartlink_id, tg_id, updates)
+            updated_payload = {**smartlink, **updates}
             if cover_updated:
-                with contextlib.suppress(Exception):
-                    await bump_smartlink_cover_version(smartlink_id, tg_id)
-        await form_clear(tg_id)
-        updated = await get_smartlink_by_id(smartlink_id)
-        if updated:
-            schedule_smartlink_update(message.bot, smartlink_id)
-            if cover_updated:
-                try:
-                    push_ok, push_status, push_error = await push_smartlink_to_index(
-                        updated, owner=build_owner_payload(message.from_user)
-                    )
-                except Exception:
-                    logger.exception(
-                        "[smartlink] indexing failed after cover update smartlink_id=%s",
-                        smartlink_id,
-                    )
-                else:
-                    if not push_ok:
-                        logger.warning(
-                            "[smartlink] indexing failed after cover update smartlink_id=%s status=%s error=%s",
-                            smartlink_id,
-                            push_status,
-                            push_error,
-                        )
-            await message.answer(
-                "Смартлинк обновлён.", reply_markup=smartlink_view_kb(updated, page)
+                updated_payload["cover_version"] = int(smartlink.get("cover_version") or 1) + 1
+            artist_slug, slug = get_smartlink_slugs(updated_payload)
+            updated_payload["artist_slug"] = artist_slug
+            updated_payload["slug"] = slug
+
+            index_ok, status, error = await update_smartlink_in_index(
+                artist_slug,
+                slug,
+                updated_payload,
+                owner=build_owner_payload(message.from_user),
             )
-        else:
-            await message.answer("Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
+            if index_ok:
+                logger.info(
+                    "[smartlink-edit] index_put ok artist_slug=%s slug=%s tg_id=%s status=%s",
+                    artist_slug,
+                    slug,
+                    tg_id,
+                    status,
+                )
+            else:
+                logger.warning(
+                    "[smartlink-edit] index_put failed artist_slug=%s slug=%s tg_id=%s status=%s error=%s",
+                    artist_slug,
+                    slug,
+                    tg_id,
+                    status,
+                    (error or "")[:300],
+                )
+                await form_clear(tg_id)
+                await message.answer(
+                    "Не удалось обновить смартлинк. Попробуй ещё раз позже.",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
+
+            updated = await upsert_smartlink_cache(tg_id, updated_payload)
+            await form_clear(tg_id)
+            if updated:
+                if updated.get("id"):
+                    schedule_smartlink_update(message.bot, updated["id"])
+                await message.answer(
+                    "Смартлинк обновлён.", reply_markup=smartlink_view_kb(updated, page)
+                )
+            else:
+                await message.answer(
+                    "Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id)
+                )
         return
 
     if not txt or txt.startswith("/"):

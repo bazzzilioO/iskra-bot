@@ -251,6 +251,14 @@ def build_smartlink_index_payload(
         "cover_version": cover_version,
     }
 
+    caption_text = (smartlink or {}).get("caption_text")
+    if caption_text is not None:
+        payload["caption_text"] = caption_text
+
+    for flag_name in ("branding_disabled", "branding_paid", "pre_save_enabled", "reminders_enabled"):
+        if flag_name in (smartlink or {}):
+            payload[flag_name] = bool((smartlink or {}).get(flag_name))
+
     if cover_source_payload:
         payload["cover_source"] = cover_source_payload
     if cover_url:

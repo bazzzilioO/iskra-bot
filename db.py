@@ -783,6 +783,28 @@ async def get_smartlink_by_slugs(artist_slug: str, slug: str) -> dict | None:
     return _smartlink_row_to_dict(row) if row else None
 
 
+async def get_smartlink_by_owner_slugs(
+    owner_tg_id: int, artist_slug: str, slug: str
+) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
+        cur = await db.execute(
+            f"""
+            SELECT id, owner_tg_id, artist, title, release_date, pre_save_enabled, reminders_enabled, project_id, cover_file_id,
+                   cover_source_json, links_json, caption_text, branding_disabled, created_at, branding_paid, cover_url, artist_slug, slug, cover_version
+            FROM smartlinks
+            WHERE {owner_clause}
+              AND lower(coalesce(artist_slug, '')) = lower(?)
+              AND lower(coalesce(slug, '')) = lower(?)
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (*owner_params, artist_slug, slug),
+        )
+        row = await cur.fetchone()
+    return _smartlink_row_to_dict(row) if row else None
+
+
 async def list_smartlinks(owner_tg_id: int, limit: int = 5, offset: int = 0) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         owner_clause, owner_params = await _smartlink_owner_filter(db, owner_tg_id)
