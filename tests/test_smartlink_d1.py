@@ -22,14 +22,15 @@ class SmartlinkD1Tests(unittest.IsolatedAsyncioTestCase):
                     slug TEXT,
                     title TEXT,
                     links_json TEXT,
-                    created_at TEXT
+                    created_at TEXT,
+                    updated_at TEXT
                 )
                 """
             )
             await db.execute(
                 """
-                INSERT INTO smartlinks (owner_tg_user_id, artist_slug, slug, title, links_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO smartlinks (owner_tg_user_id, artist_slug, slug, title, links_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     "123",
@@ -38,6 +39,7 @@ class SmartlinkD1Tests(unittest.IsolatedAsyncioTestCase):
                     "Test Song",
                     '{"spotify": "https://example.com"}',
                     "2024-01-01T00:00:00",
+                    "2024-01-02T00:00:00",
                 ),
             )
             await db.commit()
