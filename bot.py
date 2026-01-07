@@ -814,10 +814,14 @@ async def fetch_my_smartlinks_from_index(
     page: int,
     limit: int,
 ) -> tuple[bool, list[dict] | None, int | None, int | None]:
+    if not SMARTLINK_API_KEY:
+        logger.error(
+            "[smartlink-my] SMARTLINK_API_KEY missing; falling back to cache tg_id=%s",
+            tg_id,
+        )
+        return False, None, None, None
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks"
-    headers = {}
-    if SMARTLINK_API_KEY:
-        headers["X-API-Key"] = SMARTLINK_API_KEY
+    headers = {"Authorization": f"Bearer {SMARTLINK_API_KEY}"}
     params = {
         "owner_tg_user_id": str(tg_id),
         "page": page,
@@ -882,11 +886,16 @@ async def fetch_smartlink_from_index(
     slug = str(slug or "").strip()
     if not SMARTLINK_INDEX_BASE or not artist_slug or not slug:
         return False, None, None
+    if not SMARTLINK_API_KEY:
+        logger.error(
+            "[smartlink-fetch] SMARTLINK_API_KEY missing; skipping index fetch artist_slug=%s slug=%s",
+            artist_slug,
+            slug,
+        )
+        return False, None, None
 
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {}
-    if SMARTLINK_API_KEY:
-        headers["X-API-Key"] = SMARTLINK_API_KEY
+    headers = {"Authorization": f"Bearer {SMARTLINK_API_KEY}"}
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -1033,10 +1042,16 @@ async def update_smartlink_in_index(
 ) -> tuple[bool, int | None, str | None]:
     if not SMARTLINK_INDEX_BASE:
         return False, None, "config_missing"
+    if not SMARTLINK_API_KEY:
+        logger.error(
+            "[smartlink-index] SMARTLINK_API_KEY missing; skipping update artist_slug=%s slug=%s",
+            artist_slug,
+            slug,
+        )
+        return False, None, "missing_api_key"
     index_url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
     headers = {"Content-Type": "application/json"}
-    if SMARTLINK_API_KEY:
-        headers["X-API-Key"] = SMARTLINK_API_KEY
+    headers["Authorization"] = f"Bearer {SMARTLINK_API_KEY}"
     payload = build_smartlink_index_payload(smartlink, owner=owner)
     if not payload:
         return False, None, "payload_invalid"
@@ -1793,11 +1808,13 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
     if not isinstance(links, dict):
         logger.warning("[smartlink-index] invalid links payload type=%s", type(links))
         return False, None, "links_invalid"
+    if not SMARTLINK_API_KEY:
+        logger.error("[smartlink-index] SMARTLINK_API_KEY missing; skipping sync")
+        return False, None, "missing_api_key"
 
     url = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
     headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
-    if SMARTLINK_API_KEY:
-        headers["X-API-Key"] = SMARTLINK_API_KEY
+    headers["Authorization"] = f"Bearer {SMARTLINK_API_KEY}"
     timeout = aiohttp.ClientTimeout(total=15)
     logger.info("[smartlink-index] outgoing payload=%s", json.dumps(payload, ensure_ascii=False))
     try:
