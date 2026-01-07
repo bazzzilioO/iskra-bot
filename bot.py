@@ -803,25 +803,35 @@ def build_my_smartlinks_kb(
     items: list[dict], page: int, total_pages: int, start_index: int
 ) -> InlineKeyboardMarkup:
     inline: list[list[InlineKeyboardButton]] = []
+
     for idx, item in enumerate(items, start=start_index + 1):
         artist_slug = str(item.get("artist_slug") or "").strip()
         slug = str(item.get("slug") or "").strip()
         smartlink_id = item.get("id")
+
         if not artist_slug or not slug:
             artist_slug, slug = get_smartlink_slugs(item)
+
         if not smartlink_id and artist_slug and slug:
             smartlink_id = build_smartlink_id(artist_slug, slug)
-        canonical_url = build_smartlink_web_url(artist_slug, slug) if artist_slug and slug else None
+
+        canonical_url = (
+            build_smartlink_web_url(artist_slug, slug) if artist_slug and slug else None
+        )
+
         row: list[InlineKeyboardButton] = []
+
         if canonical_url:
             row.append(InlineKeyboardButton(text=f"{idx}. 🌐 Открыть", url=canonical_url))
-      if artist_slug and slug:
-    row.append(
-        InlineKeyboardButton(
-            text="✏️ Редактировать",
-            callback_data=f"smartlinks:edit_menu:{artist_slug}:{slug}:{page}",
-        )
-    )
+
+        if smartlink_id:
+            # ВАЖНО: под существующий хендлер @dp.callback_query(F.data.startswith("smartlinks:edit:"))
+            row.append(
+                InlineKeyboardButton(
+                    text="✏️ Редактировать",
+                    callback_data=f"smartlinks:edit:{smartlink_id}:p{page}",
+                )
+            )
 
         if row:
             inline.append(row)
@@ -1257,58 +1267,38 @@ async def confirm_smartlink_indexed(
 
 
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
-    ok, items = await fetch_my_smartlinks_from_index(tg_id)
-    if not ok or items is None:
+    # Лучшее решение: источник истины = D1, фильтр = owner_tg_user_id
+    total_count = await count_owned_smartlinks(tg_id)
+    if total_count is None:
         await message.answer(
             "❌ Не удалось получить список смартлинков из D1. Попробуй позже.",
             reply_markup=smartlinks_menu_kb(),
         )
         return
 
-    total = len(items)
-    if total == 0:
+    if total_count == 0:
         await message.answer(
             "У тебя пока нет смартлинков. Создай первый через «➕ Создать смарт-линк».",
             reply_markup=smartlinks_menu_kb(),
         )
         return
 
-    total_pages = max(1, (total + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
+    total_pages = max(1, (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
     page = max(0, min(page, total_pages - 1))
 
-    start = page * MY_SMARTLINKS_PAGE_SIZE
-    page_items = items[start : start + MY_SMARTLINKS_PAGE_SIZE]
-
-    text = build_my_smartlinks_text(page_items, page, total_pages, start)
-    kb = build_my_smartlinks_kb(page_items, page, total_pages, start)
-    await message.answer(text, reply_markup=kb)
-
-
-        logger.warning("[smartlinks-my] index_list failed tg_id=%s", tg_id)
-    else:
-        logger.error(
-            "[smartlinks-my] SMARTLINK_INDEX_BASE or SMARTLINK_API_KEY missing tg_id=%s",
-            tg_id,
+    offset = page * MY_SMARTLINKS_PAGE_SIZE
+    items = await list_owned_smartlinks(tg_id, MY_SMARTLINKS_PAGE_SIZE, offset)
+    if items is None:
+        await message.answer(
+            "❌ Не удалось получить список смартлинков из D1. Попробуй позже.",
+            reply_markup=smartlinks_menu_kb(),
         )
+        return
 
-    total_count = await count_owned_smartlinks(tg_id)
-    if total_count is not None:
-        total_pages = max(1, (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE)
-        page = max(0, min(page, total_pages - 1))
-        offset = page * MY_SMARTLINKS_PAGE_SIZE
-        items = [] if total_count == 0 else await list_owned_smartlinks(tg_id, MY_SMARTLINKS_PAGE_SIZE, offset)
-        if items is not None:
-            start = page * MY_SMARTLINKS_PAGE_SIZE
-            logger.info(
-                "[smartlinks-my] source=d1 count=%s tg_id=%s page=%s",
-                total_count,
-                tg_id,
-                page,
-            )
-            text = build_my_smartlinks_text(items, page, total_pages, start)
-            kb = build_my_smartlinks_kb(items, page, total_pages, start)
-            await message.answer(text, reply_markup=kb)
-            return
+    text = build_my_smartlinks_text(items, page, total_pages, offset)
+    kb = build_my_smartlinks_kb(items, page, total_pages, offset)
+    await message.answer(text, reply_markup=kb)
+    return
 
     logger.warning("[smartlinks-my] smartlink list unavailable tg_id=%s", tg_id)
     await message.answer(
