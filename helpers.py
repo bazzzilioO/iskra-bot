@@ -299,6 +299,11 @@ def build_smartlink_index_payload(
         "links": links,
         "cover_version": cover_version,
     }
+    owner_tg_user_id = (smartlink or {}).get("owner_tg_user_id")
+    if owner_tg_user_id is None and isinstance(owner, dict):
+        owner_tg_user_id = owner.get("tg_user_id") or owner.get("owner_tg_user_id")
+    if owner_tg_user_id is not None:
+        payload["owner_tg_user_id"] = str(owner_tg_user_id).strip()
 
     caption_text = (smartlink or {}).get("caption_text")
     if caption_text is not None:

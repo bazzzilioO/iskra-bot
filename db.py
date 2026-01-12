@@ -296,7 +296,7 @@ async def init_db():
         await db.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_tg_id INTEGER,
+            owner_tg_user_id TEXT,
             name TEXT NOT NULL,
             slug TEXT,
             created_at TEXT
