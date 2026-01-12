@@ -91,6 +91,7 @@ from db import (
     list_due_smartlink_publish_jobs,
     update_smartlink_publish_job,
     delete_smartlink_publish_job,
+    fetch_owned_smartlink_from_d1,
 )
 from helpers import (
     build_smartlink_id,
@@ -108,6 +109,7 @@ from helpers import (
     safe_edit_caption,
     smartlink_can_remind,
     smartlink_pre_save_active,
+    slugify,
 )
 from keyboards import (
     ACCOUNTS,
@@ -1888,12 +1890,46 @@ def log_smartlink_step(tg_id: int, step: int, field: str, skipped: bool):
     )
 
 
-def slugify(value: str) -> str:
-    value = value.lower()
-    value = re.sub(r"[ _]+", "-", value)
-    value = re.sub(r"[^a-z0-9-]", "", value)
-    value = re.sub(r"-{2,}", "-", value)
-    return value.strip("-")
+async def smartlink_slug_exists(
+    artist_slug: str,
+    slug: str,
+    *,
+    owner_tg_user_id: int | None = None,
+) -> bool:
+    artist_slug = (artist_slug or "").strip()
+    slug = (slug or "").strip()
+    if not artist_slug or not slug:
+        return False
+    if smartlink_index_ready():
+        ok, _item, status = await fetch_smartlink_from_index(artist_slug, slug)
+        if ok:
+            return True
+        if status is not None:
+            return status != 404
+    if owner_tg_user_id is None:
+        return False
+    smartlink = await fetch_owned_smartlink_from_d1(owner_tg_user_id, artist_slug, slug)
+    return bool(smartlink)
+
+
+async def build_unique_smartlink_slugs(
+    artist: str,
+    title: str,
+    *,
+    owner_tg_user_id: int | None = None,
+) -> tuple[str, str]:
+    artist_slug = slugify(artist) or "artist"
+    base_slug = slugify(title) or "untitled"
+    candidate = base_slug
+    suffix = 2
+    while await smartlink_slug_exists(
+        artist_slug,
+        candidate,
+        owner_tg_user_id=owner_tg_user_id,
+    ):
+        candidate = f"{base_slug}-{suffix}"
+        suffix += 1
+    return artist_slug, candidate
 
 
 def build_cover_proxy_url(artist_slug: str, slug: str) -> str:
@@ -2042,11 +2078,11 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         raw_cover_url = data.get("cover_url") if isinstance(data.get("cover_url"), str) else ""
         cover_url = raw_cover_url.strip() if raw_cover_url and _is_valid_url(raw_cover_url.strip()) else ""
         metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-        fallback_suffix = f"{tg_id}-{int(time.time())}"
-        artist_slug = slugify(artist) or f"artist-{fallback_suffix}"
-        slug = slugify(title) or f"release-{fallback_suffix}"
-        if not cover_url and artist_slug and slug:
-            cover_url = build_cover_proxy_url(artist_slug, slug)
+        artist_slug, slug = await build_unique_smartlink_slugs(
+            artist,
+            title,
+            owner_tg_user_id=tg_id,
+        )
         links_clean = {
             k: v
             for k, v in links.items()
@@ -2079,6 +2115,12 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             return
         else:
             cover_source = {}
+            cover_source_type = None
+
+        if cover_source_type == "telegram" or cover_file_id:
+            cover_url = build_cover_proxy_url(artist_slug, slug) if artist_slug and slug else ""
+        else:
+            cover_url = cover_url or ""
 
         missing_fields = [name for name, value in {"artist": artist, "title": title}.items() if not value]
         if missing_fields:
@@ -2413,10 +2455,19 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
     if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
         links = latest.get("links") or {}
         links["spotify"] = spotify_url
-        fallback_suffix = f"{tg_id}-{int(time.time())}"
-        artist_slug = slugify(latest.get("artist", "")) or f"artist-{fallback_suffix}"
-        slug = slugify(latest.get("title", "")) or f"release-{fallback_suffix}"
-        cover_url = build_cover_proxy_url(artist_slug, slug) if artist_slug and slug else (latest.get("cover_url") or "")
+        artist_slug = (latest.get("artist_slug") or "").strip()
+        slug = (latest.get("slug") or "").strip()
+        if not artist_slug or not slug:
+            artist_slug, slug = await build_unique_smartlink_slugs(
+                latest.get("artist", ""),
+                latest.get("title", ""),
+                owner_tg_user_id=tg_id,
+            )
+        cover_url = (latest.get("cover_url") or "").strip()
+        cover_source = latest.get("cover_source") if isinstance(latest.get("cover_source"), dict) else {}
+        cover_file_id = latest.get("cover_file_id") or cover_source.get("file_id") or ""
+        if cover_file_id and artist_slug and slug:
+            cover_url = build_cover_proxy_url(artist_slug, slug)
         smartlink = {
             **latest,
             "links": links,
@@ -4973,9 +5024,15 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
         "cover_source": {"type": "telegram", "file_id": file_id},
         "cover_updated_at": dt.datetime.utcnow().isoformat(),
     }
-    artist_slug = slugify(latest.get("artist", "")) or f"artist-{latest.get('id') or tg_id}"
-    slug = slugify(latest.get("title", "")) or f"release-{latest.get('id') or tg_id}"
-    cover_url = build_cover_proxy_url(artist_slug, slug)
+    artist_slug = (latest.get("artist_slug") or "").strip()
+    slug = (latest.get("slug") or "").strip()
+    if not artist_slug or not slug:
+        artist_slug, slug = await build_unique_smartlink_slugs(
+            latest.get("artist", ""),
+            latest.get("title", ""),
+            owner_tg_user_id=tg_id,
+        )
+    cover_url = build_cover_proxy_url(artist_slug, slug) if artist_slug and slug else ""
     if cover_url:
         updates.update({"cover_url": cover_url, "artist_slug": artist_slug, "slug": slug})
 
