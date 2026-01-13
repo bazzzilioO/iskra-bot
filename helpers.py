@@ -340,13 +340,22 @@ def build_smartlink_index_payload(
         "links": links,
         "cover_version": cover_version,
     }
-    owner_tg_user_id = None
+    owner_tg_user_id = (smartlink or {}).get("owner_tg_user_id")
+    owner_tg_username = (smartlink or {}).get("owner_tg_username")
+    owner_display_name = (smartlink or {}).get("owner_display_name")
     if isinstance(owner, dict):
-        owner_tg_user_id = owner.get("tg_user_id") or owner.get("owner_tg_user_id")
-    if owner_tg_user_id is None:
-        owner_tg_user_id = (smartlink or {}).get("owner_tg_user_id")
+        if owner_tg_user_id is None:
+            owner_tg_user_id = owner.get("tg_user_id") or owner.get("owner_tg_user_id")
+        if not owner_tg_username:
+            owner_tg_username = owner.get("username") or owner.get("owner_tg_username")
+        if not owner_display_name:
+            owner_display_name = owner.get("display_name") or owner.get("owner_display_name")
     if owner_tg_user_id is not None:
         payload["owner_tg_user_id"] = str(owner_tg_user_id).strip()
+    if owner_tg_username:
+        payload["owner_tg_username"] = owner_tg_username
+    if owner_display_name:
+        payload["owner_display_name"] = owner_display_name
 
     caption_text = (smartlink or {}).get("caption_text")
     if caption_text is not None:

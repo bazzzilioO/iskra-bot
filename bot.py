@@ -274,6 +274,21 @@ def build_owner_payload(user: User) -> dict[str, str | None]:
     }
 
 
+def build_owner_cover_updates(existing: dict, user: User, bot: Bot) -> dict[str, str]:
+    updates: dict[str, str] = {}
+    existing_owner_id = str(existing.get("owner_tg_user_id") or "").strip()
+    bot_id = str(bot.id)
+    if not existing_owner_id or existing_owner_id == bot_id:
+        updates["owner_tg_user_id"] = str(user.id)
+    existing_username = str(existing.get("owner_tg_username") or "").strip()
+    if (not existing_username or existing_owner_id == bot_id) and user.username:
+        updates["owner_tg_username"] = user.username
+    existing_display_name = str(existing.get("owner_display_name") or "").strip()
+    if (not existing_display_name or existing_owner_id == bot_id) and user.full_name:
+        updates["owner_display_name"] = user.full_name
+    return updates
+
+
 def build_smartlink_keyboard(
     smartlink: dict,
     subscribed: bool = False,
@@ -981,6 +996,28 @@ def extract_index_owner_tg_user_id(item: dict) -> str:
     return ""
 
 
+def extract_index_owner_fields(item: dict) -> tuple[str, str]:
+    username = ""
+    display_name = ""
+    raw_username = item.get("owner_tg_username")
+    raw_display = item.get("owner_display_name")
+    if isinstance(raw_username, str) and raw_username.strip():
+        username = raw_username.strip()
+    if isinstance(raw_display, str) and raw_display.strip():
+        display_name = raw_display.strip()
+    owner = item.get("owner")
+    if isinstance(owner, dict):
+        if not username:
+            owner_username = owner.get("username")
+            if isinstance(owner_username, str) and owner_username.strip():
+                username = owner_username.strip()
+        if not display_name:
+            owner_display = owner.get("display_name")
+            if isinstance(owner_display, str) and owner_display.strip():
+                display_name = owner_display.strip()
+    return username, display_name
+
+
 def normalize_index_smartlink(
     item: dict,
     owner_tg_user_id: int | str | None = None,
@@ -994,12 +1031,15 @@ def normalize_index_smartlink(
     owner_raw = str(owner_tg_user_id).strip() if owner_tg_user_id is not None else ""
     if not owner_raw:
         owner_raw = extract_index_owner_tg_user_id(item)
+    owner_tg_username, owner_display_name = extract_index_owner_fields(item)
     cover_source = item.get("cover_source") if isinstance(item.get("cover_source"), dict) else {}
     cover_file_id = item.get("cover_file_id") or cover_source.get("file_id") or ""
     links = item.get("links") if isinstance(item.get("links"), dict) else {}
     return {
         "id": build_smartlink_id(artist_slug, slug),
         "owner_tg_user_id": owner_raw,
+        "owner_tg_username": owner_tg_username,
+        "owner_display_name": owner_display_name,
         "artist": item.get("artist") or item.get("artist_name") or "",
         "title": item.get("title") or "",
         "release_date": item.get("release_date") or "",
@@ -2146,6 +2186,8 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         smartlink = {
             "id": smartlink_id,
             "owner_tg_user_id": str(tg_id),
+            "owner_tg_username": message.from_user.username or "",
+            "owner_display_name": message.from_user.full_name or "",
             "artist": artist,
             "title": title,
             "release_date": release_iso,
@@ -5024,6 +5066,7 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
         "cover_source": {"type": "telegram", "file_id": file_id},
         "cover_updated_at": dt.datetime.utcnow().isoformat(),
     }
+    updates.update(build_owner_cover_updates(latest, message.from_user, message.bot))
     artist_slug = (latest.get("artist_slug") or "").strip()
     slug = (latest.get("slug") or "").strip()
     if not artist_slug or not slug:
@@ -5550,6 +5593,7 @@ async def any_message_router(message: Message):
                 return
             updates["cover_file_id"] = message.photo[-1].file_id
             updates["cover_source"] = {"type": "telegram", "file_id": message.photo[-1].file_id}
+            updates.update(build_owner_cover_updates(smartlink, message.from_user, message.bot))
         elif field == "link":
             platform = info.get("platform")
             links = smartlink.get("links") or {}
