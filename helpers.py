@@ -130,20 +130,60 @@ async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMa
             return None
 
 
-def _slugify(value: str) -> str:
-    value = value.lower()
-    value = re.sub(r"[ _]+", "-", value)
-    value = re.sub(r"[^a-z0-9-]", "", value)
-    value = re.sub(r"-{2,}", "-", value)
-    return value.strip("-")
+_CYRILLIC_TRANSLIT_MAP = {
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ё": "e",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "y",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "h",
+    "ц": "ts",
+    "ч": "ch",
+    "ш": "sh",
+    "щ": "shch",
+    "ъ": "",
+    "ы": "y",
+    "ь": "",
+    "э": "e",
+    "ю": "yu",
+    "я": "ya",
+}
+
+
+def slugify(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    transliterated = "".join(_CYRILLIC_TRANSLIT_MAP.get(ch, ch) for ch in raw)
+    transliterated = re.sub(r"[^a-z0-9\s_-]", "", transliterated)
+    transliterated = re.sub(r"[\s_]+", "-", transliterated)
+    transliterated = re.sub(r"-{2,}", "-", transliterated)
+    return transliterated.strip("-")
 
 
 def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     artist_raw = (smartlink or {}).get("artist") or ""
-    artist_slug = (smartlink or {}).get("artist_slug") or _slugify(artist_raw)
+    artist_slug = (smartlink or {}).get("artist_slug") or slugify(artist_raw) or "artist"
 
     title_raw = (smartlink or {}).get("title") or ""
-    slug = (smartlink or {}).get("slug") or _slugify(title_raw)
+    slug = (smartlink or {}).get("slug") or slugify(title_raw) or "untitled"
 
     return artist_slug, slug
 
@@ -292,6 +332,7 @@ def build_smartlink_index_payload(
         "artist_slug": artist_slug,
         "slug": slug,
         "title": (smartlink or {}).get("title") or "",
+        "artist": (smartlink or {}).get("artist") or (smartlink or {}).get("artist_name") or "",
         "artist_name": (smartlink or {}).get("artist_name")
         or (smartlink or {}).get("artist")
         or "",
