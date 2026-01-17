@@ -1940,16 +1940,42 @@ async def smartlink_slug_exists(
     slug = (slug or "").strip()
     if not artist_slug or not slug:
         return False
+    # Сначала проверяем локальную D1 БД - быстрее и надежнее
+    if owner_tg_user_id is not None:
+        try:
+            smartlink = await asyncio.wait_for(
+                fetch_owned_smartlink_from_d1(owner_tg_user_id, artist_slug, slug),
+                timeout=2.0
+            )
+            if smartlink:
+                return True
+        except asyncio.TimeoutError:
+            logger.warning("[smartlink-slug] D1 check timeout artist_slug=%s slug=%s", artist_slug, slug)
+        except Exception:
+            logger.exception("[smartlink-slug] D1 check error artist_slug=%s slug=%s", artist_slug, slug)
+    # Затем проверяем индекс, но с коротким таймаутом
     if smartlink_index_ready():
-        ok, _item, status = await fetch_smartlink_from_index(artist_slug, slug)
-        if ok:
-            return True
-        if status is not None:
-            return status != 404
-    if owner_tg_user_id is None:
-        return False
-    smartlink = await fetch_owned_smartlink_from_d1(owner_tg_user_id, artist_slug, slug)
-    return bool(smartlink)
+        try:
+            ok, _item, status = await asyncio.wait_for(
+                fetch_smartlink_from_index(artist_slug, slug),
+                timeout=3.0
+            )
+            if ok:
+                return True
+            # 401 (unauthorized) означает проблему с аутентификацией, не то что slug занят
+            # Считаем slug свободным, чтобы не блокировать создание
+            if status == 401:
+                logger.debug("[smartlink-slug] index auth failed, treating as available artist_slug=%s slug=%s", artist_slug, slug)
+                return False
+            if status is not None:
+                return status != 404
+        except asyncio.TimeoutError:
+            logger.warning("[smartlink-slug] index check timeout artist_slug=%s slug=%s", artist_slug, slug)
+            # При таймауте считаем, что slug свободен, чтобы не блокировать создание
+            return False
+        except Exception:
+            logger.exception("[smartlink-slug] index check error artist_slug=%s slug=%s", artist_slug, slug)
+    return False
 
 
 async def build_unique_smartlink_slugs(
@@ -2106,6 +2132,13 @@ async def _update_prompt_message(
 async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     logger.info("[smartlink] finalize start tg_id=%s", tg_id)
     failure_reason: str | None = None
+    # Отправляем уведомление о начале обработки
+    processing_msg: Message | None = None
+    try:
+        processing_msg = await message.answer("⏳ Обрабатываю смартлинк...")
+    except Exception:
+        pass
+    
     try:
         
         artist = data.get("artist") or ""
@@ -2289,6 +2322,13 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             )
             if cover_url:
                 summary_lines.append(f"🖼️ Обложка: {cover_url}")
+        # Удаляем сообщение "Обрабатываю..."
+        if processing_msg:
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+        
         await _update_prompt_message(
             message,
             tg_id,
@@ -2306,10 +2346,20 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     except TelegramBadRequest:
         traceback.print_exc()
         logger.exception("[smartlink] finalize failed (bad request) tg_id=%s", tg_id)
+        if processing_msg:
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
         await message.answer("Не удалось отправить карточку. Попробуй изменить данные и повторить.")
     except Exception:
         traceback.print_exc()
         logger.exception("[smartlink] finalize failed tg_id=%s", tg_id)
+        if processing_msg:
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
         error_text = failure_reason or "Не удалось создать смартлинк. Проверь данные или попробуй ещё раз."
         await _update_prompt_message(message, tg_id, data, error_text, None, step=None)
         await message.answer(error_text)
