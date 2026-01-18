@@ -288,7 +288,6 @@ def _smartlink_sanity_check():
         logger.exception("[smartlink] sanity check failed")
 
 
-LABEL_EMAIL = "sreda.records@gmail.com"
 
 HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
 
@@ -319,30 +318,6 @@ def smartlink_step_prompt(step: int) -> str:
         return f"Шаг {step + 1}/{total}: ссылка на {label}? (можно «Пропустить»)."
     return ""
 
-BANDLINK_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-BANDLINK_REFRESH_PLATFORMS = {"spotify", "yandex", "apple", "vk", "zvuk", "youtube", "deezer", "youtubemusic"}
-
-SONGLINK_API_URL = "https://api.song.link/v1-alpha.1/links"
-SONGLINK_PLATFORM_ALIASES = {
-    "spotify": "spotify",
-    "applemusic": "apple",
-    "applemusicapp": "apple",
-    "apple": "apple",
-    "itunes": "itunes",
-    "youtubemusic": "youtubemusic",
-    "youtube": "youtube",
-    "deezer": "deezer",
-    "yandex": "yandex",
-    "yandexmusic": "yandex",
-    "vk": "vk",
-    "zvuk": "zvuk",
-    "kion": "kion",
-    "mts": "kion",
-}
 
 # -------------------- CONFIG --------------------
 
@@ -419,57 +394,39 @@ async def user_menu_keyboard(tg_id: int) -> ReplyKeyboardMarkup:
     updates_enabled = await get_updates_opt_in(tg_id)
     return menu_keyboard(updates_enabled)
 
-load_dotenv()
-logging.basicConfig(level=logging.INFO)
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_TG_ID = os.getenv("ADMIN_TG_ID")
-APP_VERSION = os.getenv("APP_VERSION", "dev")
-PORT = int(os.getenv("PORT", "8000"))
-POLLING_LOCK_FILE = os.getenv("POLLING_LOCK_FILE", "/tmp/iskra_bot_polling.lock")
-POLLING_TIMEOUT = int(os.getenv("POLLING_TIMEOUT", "60"))
-NETWORK_ERROR_LOG_THROTTLE = float(os.getenv("NETWORK_ERROR_LOG_THROTTLE", "30"))
-# Optional API key for smartlink read-only endpoint
-SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
-SMARTLINK_INDEX_BASE = normalize_base_url(
-    os.getenv("SMARTLINK_INDEX_BASE") or os.getenv("GO_INDEX_BASE"),
-    None,
+from config import (
+    ADMIN_TG_ID,
+    APP_VERSION,
+    BANDLINK_REFRESH_PLATFORMS,
+    BANDLINK_USER_AGENT,
+    COVER_PROXY_BASE,
+    HEALTH_STATE,
+    HTTP_TIMEOUT,
+    LABEL_EMAIL,
+    NETWORK_ERROR_LOG_THROTTLE,
+    POLLING_BACKOFF_CONFIG,
+    POLLING_LOCK_FILE,
+    POLLING_TIMEOUT,
+    PORT,
+    RATE_LIMIT_COOLDOWN_SECONDS,
+    SMARTLINK_API_KEY,
+    SMARTLINK_INDEX_BASE,
+    SMARTLINK_INDEX_URL,
+    SMARTLINK_PUBLISH_QUEUE_INTERVAL_SECONDS,
+    SMARTLINK_PUBLISH_RETRY_DELAYS,
+    SMARTLINK_UPDATE_DEBOUNCE_SECONDS,
+    SMARTLINK_WEB_BASE,
+    SMTP_APP_PASSWORD,
+    SMTP_TO,
+    SMTP_USER,
+    SONGLINK_API_URL,
+    SONGLINK_PLATFORM_ALIASES,
+    SPOTIFY_CLIENT_ID,
+    SPOTIFY_CLIENT_SECRET,
+    SPOTIFY_UPC_ENABLED,
+    TOKEN,
+    UPDATES_POST_URL,
 )
-SMARTLINK_INDEX_URL = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
-SMARTLINK_WEB_BASE = normalize_base_url(
-    os.getenv("SMARTLINK_WEB_BASE") or os.getenv("SMARTLINK_PUBLIC_BASE"),
-    "https://go.sreda.pw",
-)
-SMARTLINK_PUBLISH_RETRY_DELAYS = [60, 300, 900, 3600]
-COVER_PROXY_BASE = normalize_base_url(
-    os.getenv("COVER_PROXY_BASE")
-    or os.getenv("PUBLIC_BASE_URL")
-    or os.getenv("BOT_PUBLIC_BASE")
-    or os.getenv("RAILWAY_PUBLIC_DOMAIN"),
-    f"http://localhost:{PORT}",
-)
-# HTTP timeout must be numeric: aiogram adds it to polling_timeout internally.
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_TOTAL", "90"))
-POLLING_BACKOFF_CONFIG = BackoffConfig(
-    min_delay=float(os.getenv("BACKOFF_MIN_DELAY", "1")),
-    max_delay=float(os.getenv("BACKOFF_MAX_DELAY", "60")),
-    factor=float(os.getenv("BACKOFF_FACTOR", "2")),
-    jitter=float(os.getenv("BACKOFF_JITTER", "0.1")),
-)
-HEALTH_STATE: dict[str, str | int | None] = {
-    "status": "starting",
-    "mode": "polling",
-    "version": APP_VERSION,
-    "bot_id": None,
-    "username": None,
-    "pid": os.getpid(),
-}
-
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD")
-SMTP_TO = os.getenv("SMTP_TO") or LABEL_EMAIL
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
-SPOTIFY_UPC_ENABLED = bool(SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET)
 
 _SPOTIFY_ACCESS_TOKEN: str | None = None
 _SPOTIFY_TOKEN_EXPIRES_AT: dt.datetime | None = None
@@ -484,7 +441,7 @@ _http_session_lock = asyncio.Lock()
 # Rate limit cooldown механизм
 _rate_limit_cooldown_until: float | None = None
 _rate_limit_cooldown_lock = asyncio.Lock()
-RATE_LIMIT_COOLDOWN_SECONDS = 60  # Пауза после 429 ошибки
+# RATE_LIMIT_COOLDOWN_SECONDS импортируется из config
 
 
 async def get_http_session() -> aiohttp.ClientSession:
@@ -2810,8 +2767,7 @@ async def get_release_reminder_state(tg_id: int, smartlink_id: int | str, allow_
     return await is_smartlink_subscribed(smartlink_id, tg_id)
 
 
-SMARTLINK_UPDATE_DEBOUNCE_SECONDS = 1.5
-SMARTLINK_PUBLISH_QUEUE_INTERVAL_SECONDS = 60
+# Константы импортируются из config
 _smartlink_update_tasks: dict[int | str, asyncio.Task] = {}
 
 
