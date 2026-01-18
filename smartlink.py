@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import aiohttp
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, User, InputMediaPhoto
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message, User, InputMediaPhoto
 
 from config import (
     ADMIN_TG_ID,
@@ -1804,3 +1804,271 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         await message.answer(error_text)
     finally:
         await form_clear(tg_id)
+
+
+# ==================== Import & Prefill Helper Functions ====================
+
+def pick_selected_metadata(data: dict) -> dict:
+    """Pick selected metadata from data dict."""
+    metadata = data.get("metadata") or {}
+    sources = metadata.get("sources") or {}
+    preferred = data.get("preferred_source") or metadata.get("preferred_source") or metadata.get("source_platform")
+    if preferred and preferred in sources:
+        return sources.get(preferred) or {}
+    if sources:
+        first_key = next(iter(sources.keys()))
+        return sources.get(first_key) or {}
+    return metadata
+
+
+async def start_prefill_editor(message: Message, tg_id: int, data: dict):
+    """Start prefill editor - lazy import to avoid circular dependencies."""
+    selected_meta = pick_selected_metadata(data)
+    artist = data.get("artist") or selected_meta.get("artist") or ""
+    title = data.get("title") or selected_meta.get("title") or ""
+    cover_file_id = data.get("cover_file_id") or selected_meta.get("cover_file_id") or ""
+
+    display_lines = [
+        "Проверь данные перед сохранением:",
+        f"Артист: {artist or '—'}",
+        f"Релиз: {title or '—'}",
+        f"Площадки: {', '.join(sorted((data.get('links') or {}).keys())) or '—'}",
+        "",
+        "Можно поправить нужное поле и продолжить.",
+    ]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Изменить артиста", callback_data="smartlink:prefill_edit:artist")],
+            [InlineKeyboardButton(text="Изменить релиз", callback_data="smartlink:prefill_edit:title")],
+            [InlineKeyboardButton(text="Заменить обложку", callback_data="smartlink:prefill_edit:cover")],
+            [InlineKeyboardButton(text="Продолжить", callback_data="smartlink:prefill_continue")],
+            [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
+        ]
+    )
+
+    if cover_file_id:
+        try:
+            await message.answer_photo(photo=cover_file_id, caption="\n".join(display_lines), reply_markup=kb)
+        except Exception:
+            await message.answer("\n".join(display_lines), reply_markup=kb)
+    else:
+        await message.answer("\n".join(display_lines), reply_markup=kb)
+
+    data["artist"] = artist
+    data["title"] = title
+    data["cover_file_id"] = cover_file_id
+    data.pop("pending", None)
+    await form_start(tg_id, "smartlink_prefill_edit")
+    await form_set(tg_id, 0, data)
+
+
+async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: dict):
+    """Apply Spotify UPC selection - lazy import to avoid circular dependencies."""
+    from bot import user_menu_keyboard
+    
+    await form_clear(tg_id)
+
+    spotify_url = candidate.get("spotify_url")
+    if not spotify_url:
+        await message.answer("Не нашёл ссылку Spotify для этого UPC.", reply_markup=await user_menu_keyboard(tg_id))
+        return
+
+    latest = await fetch_latest_smartlink_from_index(tg_id)
+    if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
+        links = latest.get("links") or {}
+        links["spotify"] = spotify_url
+        artist_slug = (latest.get("artist_slug") or "").strip()
+        slug = (latest.get("slug") or "").strip()
+        if not artist_slug or not slug:
+            artist_slug, slug = await build_unique_smartlink_slugs(
+                latest.get("artist", ""),
+                latest.get("title", ""),
+                owner_tg_user_id=tg_id,
+            )
+        cover_url = (latest.get("cover_url") or "").strip()
+        cover_source = latest.get("cover_source") if isinstance(latest.get("cover_source"), dict) else {}
+        cover_file_id = latest.get("cover_file_id") or cover_source.get("file_id") or ""
+        if cover_file_id and artist_slug and slug:
+            cover_url = build_cover_proxy_url(artist_slug, slug)
+        smartlink = {
+            **latest,
+            "links": links,
+            "cover_url": cover_url,
+            "artist_slug": artist_slug,
+            "slug": slug,
+            "id": build_smartlink_id(artist_slug, slug),
+        }
+        index_ok, status, error = await update_smartlink_in_index(
+            artist_slug,
+            slug,
+            smartlink,
+            owner=build_owner_payload(message.from_user),
+        )
+        if not index_ok:
+            logger.warning(
+                "[smartlink] upc index update failed artist_slug=%s slug=%s status=%s error=%s",
+                artist_slug,
+                slug,
+                status,
+                error,
+            )
+        smartlink = await fetch_owned_smartlink_with_fallback(tg_id, artist_slug, slug) or smartlink
+        allow_remind = smartlink_can_remind(smartlink)
+        subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
+        await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
+        await message.answer("Добавил Spotify по UPC. Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
+        return
+
+    await message.answer(
+        "Нашёл Spotify. Давай заполним смартлинк: ссылка на Spotify уже подставлена.",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
+    await start_smartlink_form(message, tg_id, initial_links={"spotify": spotify_url})
+
+
+async def apply_caption_update(
+    message: Message,
+    tg_id: int,
+    artist_slug: str,
+    slug: str,
+    caption_text: str,
+):
+    """Apply caption update - lazy import to avoid circular dependencies."""
+    from bot import user_menu_keyboard
+    
+    smartlink = await fetch_owned_smartlink_with_fallback(tg_id, artist_slug, slug)
+    if not smartlink:
+        await message.answer("Смартлинк не найден.", reply_markup=await user_menu_keyboard(tg_id))
+        await form_clear(tg_id)
+        return
+    updated_payload = {**smartlink, "caption_text": caption_text}
+    index_ok, status, error = await update_smartlink_in_index(
+        artist_slug,
+        slug,
+        updated_payload,
+        owner=build_owner_payload(message.from_user),
+    )
+    if not index_ok:
+        logger.warning(
+            "[smartlink-caption] index update failed artist_slug=%s slug=%s status=%s error=%s",
+            artist_slug,
+            slug,
+            status,
+            error,
+        )
+    smartlink = await fetch_owned_smartlink_with_fallback(tg_id, artist_slug, slug) or updated_payload
+    smartlink_id = smartlink.get("id")
+    updated = await update_smartlink_message(message.bot, smartlink_id) if smartlink_id else False
+    if not updated:
+        allow_remind = smartlink_can_remind(smartlink)
+        subscribed = await get_release_reminder_state(tg_id, smartlink_id, allow_remind)
+        await send_smartlink_photo(
+            message.bot,
+            tg_id,
+            smartlink,
+            subscribed=subscribed,
+            allow_remind=allow_remind,
+            store_message=True,
+        )
+    await message.answer("Текст обновлён.", reply_markup=await user_menu_keyboard(tg_id))
+    await form_clear(tg_id)
+
+
+async def fetch_cover_file(cover_url: str) -> BufferedInputFile | None:
+    """Fetch cover file from URL."""
+    if not cover_url:
+        return None
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(cover_url) as resp:
+                if resp.status >= 400:
+                    logger.warning("[cover] failed to fetch %s: status %s", cover_url, resp.status)
+                    return None
+                data = await resp.read()
+                if not data:
+                    return None
+                filename = cover_url.split("/")[-1] or "cover.jpg"
+                return BufferedInputFile(data, filename=filename)
+    except Exception as e:
+        logger.warning("[cover] error fetching %s: %s", cover_url, e)
+        return None
+
+
+async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
+    """Handle lazy Telegram cover upgrade when a photo is sent outside forms.
+
+    Returns True if the photo was processed (including skipped with logging),
+    False if the message was not a photo and should be handled elsewhere.
+    """
+    if not message.photo:
+        return False
+
+    tg_id = message.from_user.id
+    latest = await fetch_latest_smartlink_from_index(tg_id)
+
+    if not latest:
+        logger.info("[cover-upgrade] skip: no smartlink context tg_id=%s", tg_id)
+        return True
+
+    cover_source = latest.get("cover_source") if isinstance(latest.get("cover_source"), dict) else {}
+    cover_file_id = (latest.get("cover_file_id") or "").strip()
+    if (cover_source.get("type") or cover_file_id):
+        logger.info(
+            "[cover-upgrade] skip: cover already exists smartlink_id=%s", latest.get("id")
+        )
+        return True
+
+    file_id = message.photo[-1].file_id if message.photo else ""
+    if not file_id or file_id.isdigit():
+        logger.info(
+            "[cover-upgrade] skip: invalid file_id smartlink_id=%s file_id=%s",
+            latest.get("id"),
+            file_id,
+        )
+        return True
+
+    updates = {
+        "cover_file_id": file_id,
+        "cover_source": {"type": "telegram", "file_id": file_id},
+        "cover_updated_at": dt.datetime.utcnow().isoformat(),
+    }
+    updates.update(build_owner_cover_updates(latest, message.from_user, message.bot))
+    artist_slug = (latest.get("artist_slug") or "").strip()
+    slug = (latest.get("slug") or "").strip()
+    if not artist_slug or not slug:
+        artist_slug, slug = await build_unique_smartlink_slugs(
+            latest.get("artist", ""),
+            latest.get("title", ""),
+            owner_tg_user_id=tg_id,
+        )
+    cover_url = build_cover_proxy_url(artist_slug, slug) if artist_slug and slug else ""
+    if cover_url:
+        updates.update({"cover_url": cover_url, "artist_slug": artist_slug, "slug": slug})
+
+    updated_payload = {**latest, **updates}
+    updated_payload["cover_version"] = int(latest.get("cover_version") or 1) + 1
+    index_ok, status, error = await update_smartlink_in_index(
+        artist_slug,
+        slug,
+        updated_payload,
+        owner=build_owner_payload(message.from_user),
+    )
+    if not index_ok:
+        logger.warning(
+            "[cover-upgrade] index update failed artist_slug=%s slug=%s status=%s error=%s",
+            artist_slug,
+            slug,
+            status,
+            error,
+        )
+        return True
+    latest = await fetch_owned_smartlink_with_fallback(tg_id, artist_slug, slug) or updated_payload
+    logger.info(
+        "[cover-upgrade] success smartlink_id=%s file_id=%s", latest.get("id"), file_id
+    )
+
+    if latest.get("id"):
+        schedule_smartlink_update(message.bot, latest.get("id"))
+
+    return True
