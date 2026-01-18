@@ -927,19 +927,31 @@ async def fetch_smartlink_from_index(
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=headers) as resp:
                 body = await resp.text()
+                from helpers import _sanitize_body_for_logging, _is_html_response
+                sanitized_body = _sanitize_body_for_logging(body)
+                
+                # Обработка Rate Limit
+                if resp.status == 429 or (body and _is_html_response(body) and ("rate limited" in body.lower() or "error 1027" in body.lower())):
+                    logger.warning(
+                        "[smartlink-fetch] rate limited artist_slug=%s slug=%s",
+                        artist_slug,
+                        slug,
+                    )
+                    return False, None, 429
+                
                 if not (200 <= resp.status < 300):
                     log_missing_index_token(resp.status, body, "fetch_smartlink_from_index")
                     logger.warning(
-                        "[smartlink-fetch] response status=%s body=%s", resp.status, body
+                        "[smartlink-fetch] response status=%s body=%s", resp.status, sanitized_body
                     )
                     return False, None, resp.status
                 try:
                     payload = await resp.json()
                 except Exception:
-                    logger.exception(
+                    logger.warning(
                         "[smartlink-fetch] failed to parse json status=%s body=%s",
                         resp.status,
-                        body,
+                        sanitized_body,
                     )
                     return False, None, resp.status
 
@@ -1967,6 +1979,7 @@ async def smartlink_slug_exists(
     slug: str,
     *,
     owner_tg_user_id: int | None = None,
+    skip_api_check: bool = False,
 ) -> bool:
     artist_slug = (artist_slug or "").strip()
     slug = (slug or "").strip()
@@ -1985,6 +1998,11 @@ async def smartlink_slug_exists(
             logger.warning("[smartlink-slug] D1 check timeout artist_slug=%s slug=%s", artist_slug, slug)
         except Exception:
             logger.exception("[smartlink-slug] D1 check error artist_slug=%s slug=%s", artist_slug, slug)
+    
+    # Пропускаем проверку через API если skip_api_check=True (например, при rate limit)
+    if skip_api_check:
+        return False
+    
     # Затем проверяем индекс, но с коротким таймаутом
     if smartlink_index_ready():
         try:
@@ -1995,9 +2013,9 @@ async def smartlink_slug_exists(
             if ok:
                 return True
             # 401 (unauthorized) означает проблему с аутентификацией, не то что slug занят
-            # Считаем slug свободным, чтобы не блокировать создание
-            if status == 401:
-                logger.debug("[smartlink-slug] index auth failed, treating as available artist_slug=%s slug=%s", artist_slug, slug)
+            # 429 (rate limit) - считаем slug свободным, чтобы не блокировать создание
+            if status == 401 or status == 429:
+                logger.debug("[smartlink-slug] index auth/rate_limit failed, treating as available artist_slug=%s slug=%s status=%s", artist_slug, slug, status)
                 return False
             if status is not None:
                 return status != 404
@@ -2015,18 +2033,29 @@ async def build_unique_smartlink_slugs(
     title: str,
     *,
     owner_tg_user_id: int | None = None,
+    skip_api_check: bool = False,
 ) -> tuple[str, str]:
     artist_slug = slugify(artist) or "artist"
     base_slug = slugify(title) or "untitled"
     candidate = base_slug
     suffix = 2
+    max_iterations = 10  # Защита от бесконечного цикла
+    iteration = 0
     while await smartlink_slug_exists(
         artist_slug,
         candidate,
         owner_tg_user_id=owner_tg_user_id,
-    ):
+        skip_api_check=skip_api_check,
+    ) and iteration < max_iterations:
         candidate = f"{base_slug}-{suffix}"
         suffix += 1
+        iteration += 1
+    # Если пропустили проверку API или достигли лимита - добавляем timestamp для уникальности
+    if skip_api_check or iteration >= max_iterations:
+        import hashlib
+        import time
+        hash_suffix = hashlib.md5(f"{candidate}-{time.time()}".encode()).hexdigest()[:8]
+        candidate = f"{base_slug}-{hash_suffix}"
     return artist_slug, candidate
 
 
@@ -2292,7 +2321,32 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         publish_ok = False
         publish_status: int | None = None
         publish_error: str | None = None
-        if sync_ok:
+        
+        # Если sync не удался из-за rate limit - добавляем в очередь для повтора
+        is_rate_limit = sync_status == 429 or sync_error == "rate_limit"
+        if not sync_ok and is_rate_limit:
+            logger.info(
+                "[smartlink] rate limited during create, enqueueing for retry smartlink_id=%s",
+                smartlink_id,
+            )
+            owner = build_owner_payload(message.from_user)
+            await enqueue_smartlink_publish_retry(
+                artist_slug,
+                slug,
+                smartlink,
+                owner,
+                delay_seconds=60,  # Первая попытка через 60 сек
+                last_error=f"rate_limit during sync: {sync_error}",
+            )
+            # Пробуем сразу publish даже при rate limit на sync
+            publish_ok, publish_status, publish_error = await update_smartlink_in_index(
+                artist_slug,
+                slug,
+                smartlink,
+                owner=owner,
+                reason="create",
+            )
+        elif sync_ok:
             publish_ok, publish_status, publish_error = await update_smartlink_in_index(
                 artist_slug,
                 slug,
