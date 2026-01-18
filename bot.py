@@ -13,6 +13,7 @@
 import asyncio
 import contextlib
 import fcntl
+import html
 import json
 import logging
 import os
@@ -164,51 +165,6 @@ from texts import (
 )
 from scheduler import build_deadlines, reminder_scheduler
 
-def build_focus_caption(
-    tasks_state: dict[int, int],
-    experience: str | None = None,
-    important: set[int] | None = None,
-    focus_task_id: int | None = None,
-    show_completed: bool = False,
-) -> str:
-    text, _ = build_focus(tasks_state, experience, important, focus_task_id, show_completed)
-    return text
-
-
-async def update_smartlink_via_worker(
-    *,
-    tg_user,
-    artist_slug: str,
-    slug: str,
-    patch: dict,
-) -> bool:
-    ok, current, _status = await fetch_smartlink_from_index(artist_slug, slug)
-    if not ok or not current:
-        return False
-
-    payload = {
-        "artist_slug": artist_slug,
-        "slug": slug,
-        "title": current.get("title") or "",  # upsert требует title
-        "artist_name": current.get("artist_name"),
-        "release_date": current.get("release_date"),
-        "links": current.get("links") or {},
-        "cover_source": current.get("cover_source"),
-        "cover_url": current.get("cover_url"),
-        "cover_version": current.get("cover_version", 0),
-        "owner_tg_user_id": str(tg_user.id),
-        "owner": {
-            "tg_user_id": str(tg_user.id),
-            "username": tg_user.username,
-            "display_name": (tg_user.full_name or "").strip() or None,
-        },
-    }
-
-    # применяем изменения
-    payload.update(patch)
-
-    success, _status, _error = await sync_smartlink_to_web(payload)
-    return bool(success)
 
 def build_smartlink_caption(
     smartlink: dict, release_today: bool = False, show_listen_label: bool | None = None
@@ -289,22 +245,6 @@ def build_owner_cover_updates(existing: dict, user: User, bot: Bot) -> dict[str,
     return updates
 
 
-def build_smartlink_keyboard(
-    smartlink: dict,
-    subscribed: bool = False,
-    can_remind: bool = False,
-    page: int | None = None,
-    web_url: str | None = None,
-    can_update_web: bool = False,
-) -> InlineKeyboardMarkup | None:
-    return build_smartlink_buttons(
-        smartlink,
-        subscribed=subscribed,
-        can_remind=can_remind,
-        page=page,
-        web_url=web_url,
-        can_update_web=can_update_web,
-    )
 
 
 def _build_smartlink_fallback_text(smartlink: dict) -> str:
@@ -448,16 +388,6 @@ async def maybe_send_qc_prompt(callback, tg_id: int, task_id: int):
     )
     await callback.message.answer(f"Мини-проверка: {qc['question']}", reply_markup=kb)
 
-def expectations_text() -> str:
-    return EXPECTATIONS_TEXT
-
-
-def lyrics_sync_text() -> str:
-    return LYRICS_SYNC_TEXT
-
-
-def ugc_tip_text() -> str:
-    return UGC_TIP_TEXT
 
 def experience_prompt() -> tuple[str, InlineKeyboardMarkup]:
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -726,7 +656,7 @@ async def start_health_server(bot: Bot | None = None) -> web.AppRunner:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    print(f"Health endpoint available on port {PORT} (GET /health)")
+    logger.info("Health endpoint available on port %s (GET /health)", PORT)
     return runner
 
 
@@ -779,18 +709,6 @@ def smartlinks_help_text() -> str:
     return SMARTLINKS_HELP_TEXT
 
 
-def build_smartlink_list_text(items: list[dict], page: int, total_pages: int) -> str:
-    if not items:
-        return "Пока нет смарт-линков. Нажми «➕ Создать смарт-линк»."
-
-    lines = [f"📂 Мои смарт-линки (страница {page + 1}/{total_pages})", ""]
-    for idx, item in enumerate(items, start=1):
-        artist = item.get("artist") or "Без артиста"
-        title = item.get("title") or "Без названия"
-        rd = parse_date(item.get("release_date") or "")
-        rd_text = f"📅 {format_date_ru(rd)}" if rd else ""
-        lines.append(f"{idx}. {artist} — {title} {rd_text}")
-    return "\n".join(lines)
 
 
 def build_smartlink_view_text(smartlink: dict) -> str:
@@ -1503,9 +1421,6 @@ def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str 
     return None
 
 
-def _normalize_music_url(url: str, platform_hint: str | None = None) -> str:
-    normalized, _ = normalize_music_url_with_platform(url, platform_hint)
-    return normalized
 
 
 def normalize_music_url_with_platform(url: str, platform_hint: str | None = None) -> tuple[str, str | None]:
@@ -1600,12 +1515,12 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
         try:
             next_data_raw = html.unescape(next_script.string)
             next_data = json.loads(next_data_raw)
-            print("[bandlink] __NEXT_DATA__ found")
+            logger.debug("[bandlink] __NEXT_DATA__ found")
         except Exception as e:
-            print(f"[bandlink] failed to parse __NEXT_DATA__: {e}")
+            logger.warning("[bandlink] failed to parse __NEXT_DATA__: %s", e)
             next_data = None
     else:
-        print("[bandlink] __NEXT_DATA__ not found")
+        logger.debug("[bandlink] __NEXT_DATA__ not found")
         next_data = None
 
     def add_link(url: str | None, platform_hint: str | None = None):
@@ -1672,7 +1587,7 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
     if not links:
         legacy_links = extract_links_from_bandlink(html_content, soup=soup)
         if legacy_links:
-            print(f"[bandlink] legacy href parser extracted {len(legacy_links)} platforms")
+            logger.debug("[bandlink] legacy href parser extracted %d platforms", len(legacy_links))
             links.update(legacy_links)
 
     og_title_match = re.search(r'<meta[^>]+property=\"og:title\"[^>]+content=\"([^\"]+)\"', html_content, re.IGNORECASE)
@@ -1704,19 +1619,19 @@ def parse_bandlink(html_content: str) -> tuple[dict[str, str], dict | None]:
             "conflict": False,
         }
 
-    print(f"[bandlink] extracted {len(links)} platforms; meta={'yes' if meta else 'no'}")
+    logger.debug("[bandlink] extracted %d platforms; meta=%s", len(links), "yes" if meta else "no")
     return links, meta
 
 
 async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     timeout = aiohttp.ClientTimeout(total=10)
-    normalized_input_url = _normalize_music_url(url)
+    normalized_input_url, _ = normalize_music_url_with_platform(url)
 
     async def resolve_via_songlink() -> tuple[dict[str, str], dict | None]:
         def collect(platforms: dict, acc: dict[str, str]):
             for platform_key, info in (platforms or {}).items():
                 normalized_platform = SONGLINK_PLATFORM_ALIASES.get(platform_key.lower())
-                normalized_url = _normalize_music_url((info or {}).get("url") or "")
+                normalized_url, _ = normalize_music_url_with_platform((info or {}).get("url") or "")
                 if normalized_platform and normalized_url and normalized_platform not in acc:
                     acc[normalized_platform] = normalized_url
 
@@ -1744,7 +1659,7 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
         links: dict[str, str] = {}
         entities = data.get("entitiesByUniqueId") or {}
         if not entities:
-            print("[songlink] empty entities from resolver")
+            logger.debug("[songlink] empty entities from resolver")
             return {}, {}
 
         collect(data.get("linksByPlatform") or {}, links)
@@ -1771,7 +1686,7 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
                 }
 
         if not meta_candidates:
-            print("[songlink] no metadata from entities")
+            logger.debug("[songlink] no metadata from entities")
             return links, None
 
         priority = ["apple", "itunes", "spotify", "yandex", "vk", "zvuk", "youtube", "deezer", "kion", "youtubemusic"]
@@ -1797,8 +1712,8 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
             "conflict": conflict,
         }
 
-        print(f"[songlink] meta source={preferred} conflict={conflict} candidates={list(meta_candidates.keys())}")
-        print(f"[songlink] extracted {len(links)} platforms")
+        logger.debug("[songlink] meta source=%s conflict=%s candidates=%s", preferred, conflict, list(meta_candidates.keys()))
+        logger.debug("[songlink] extracted %d platforms", len(links))
 
         return links, meta
 
@@ -2469,7 +2384,7 @@ async def fetch_cover_file(cover_url: str) -> BufferedInputFile | None:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(cover_url) as resp:
                 if resp.status >= 400:
-                    print(f"[cover] failed to fetch {cover_url}: status {resp.status}")
+                    logger.warning("[cover] failed to fetch %s: status %s", cover_url, resp.status)
                     return None
                 data = await resp.read()
                 if not data:
@@ -2477,7 +2392,7 @@ async def fetch_cover_file(cover_url: str) -> BufferedInputFile | None:
                 filename = cover_url.split("/")[-1] or "cover.jpg"
                 return BufferedInputFile(data, filename=filename)
     except Exception as e:
-        print(f"[cover] error fetching {cover_url}: {e}")
+        logger.warning("[cover] error fetching %s: %s", cover_url, e)
         return None
 
 
@@ -2548,9 +2463,9 @@ async def show_import_confirmation(
                 reply_markup=kb,
             )
             if input_file:
-                print(f"[cover] downloaded cover from {cover_source}")
+                logger.info("[cover] downloaded cover from %s", cover_source)
         except Exception as e:
-            print(f"[cover] failed to show preview: {e}")
+            logger.warning("[cover] failed to show preview: %s", e)
             preview_message = None
 
     if not preview_message:
@@ -3472,7 +3387,7 @@ async def rb_smartlinks(message: Message):
 
 @dp.message(F.text == "🧠 Ожидания")
 async def rb_expectations(message: Message):
-    await message.answer(expectations_text(), reply_markup=await user_menu_keyboard(message.from_user.id))
+    await message.answer(EXPECTATIONS_TEXT, reply_markup=await user_menu_keyboard(message.from_user.id))
 
 @dp.message(F.text == "📰 Что нового")
 async def rb_whats_new(message: Message):
@@ -5030,12 +4945,12 @@ async def smartlinks_export_cb(callback):
 
 @dp.callback_query(F.data == "links:lyrics")
 async def links_lyrics_cb(callback):
-    await safe_edit(callback.message, lyrics_sync_text(), build_links_kb())
+    await safe_edit(callback.message, LYRICS_SYNC_TEXT, build_links_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "links:ugc")
 async def links_ugc_cb(callback):
-    await safe_edit(callback.message, ugc_tip_text(), build_links_kb())
+    await safe_edit(callback.message, UGC_TIP_TEXT, build_links_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "texts:start")
@@ -5405,7 +5320,7 @@ async def any_message_router(message: Message):
                     cover_file_id = preview.photo[-1].file_id if preview.photo else ""
                     await preview.delete()
             except Exception as e:
-                print(f"[cover] failed to auto download: {e}")
+                logger.warning("[cover] failed to auto download: %s", e)
 
         ready_for_autofill = (
             not (merged_metadata or {}).get("conflict")
@@ -5965,11 +5880,11 @@ async def run_polling(bot: Bot):
         except TelegramNetworkError as exc:
             now = time.monotonic()
             if now - last_network_log_at >= NETWORK_ERROR_LOG_THROTTLE:
-                print(f"Network error during polling: {exc}. Retrying...")
+                logger.warning("Network error during polling: %s. Retrying...", exc)
                 last_network_log_at = now
 
             delay = next(backoff)
-            print(f"Retrying polling in {delay:.1f}s (attempt #{backoff.counter})")
+            logger.info("Retrying polling in %.1fs (attempt #%d)", delay, backoff.counter)
             await asyncio.sleep(delay)
 
 
@@ -5978,10 +5893,10 @@ async def main():
         raise RuntimeError("BOT_TOKEN не задан.")
     lock_file = acquire_single_instance_lock(POLLING_LOCK_FILE)
     if lock_file is None:
-        print(f"Another polling instance is already running (lock: {POLLING_LOCK_FILE}). Exiting.")
+        logger.warning("Another polling instance is already running (lock: %s). Exiting.", POLLING_LOCK_FILE)
         return
 
-    print(f"Single-instance lock acquired at {POLLING_LOCK_FILE} (pid={os.getpid()})")
+    logger.info("Single-instance lock acquired at %s (pid=%d)", POLLING_LOCK_FILE, os.getpid())
 
     # Ensure database schema is initialized before starting external services
     await init_db()
@@ -6000,21 +5915,23 @@ async def main():
         "bot_id": me.id,
         "username": me.username,
     })
-    print(
-        "Starting bot in POLLING mode, "
-        f"bot_id={me.id}, username=@{me.username}, pid={os.getpid()}"
+    logger.info(
+        "Starting bot in POLLING mode, bot_id=%d, username=@%s, pid=%d",
+        me.id,
+        me.username,
+        os.getpid(),
     )
     await start_health_server(bot)
-    print("Dropping webhook and pending updates before polling...")
+    logger.info("Dropping webhook and pending updates before polling...")
     await bot.delete_webhook(drop_pending_updates=True)
     try:
         asyncio.create_task(reminder_scheduler(bot, send_smartlink_photo))
     except Exception as err:
-        print(f"[main] reminder scheduler not started: {err}")
+        logger.error("[main] reminder scheduler not started: %s", err)
     try:
         asyncio.create_task(smartlink_publish_scheduler())
     except Exception as err:
-        print(f"[main] smartlink publish scheduler not started: {err}")
+        logger.error("[main] smartlink publish scheduler not started: %s", err)
     try:
         await run_polling(bot)
     finally:

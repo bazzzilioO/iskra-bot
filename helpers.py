@@ -95,7 +95,7 @@ async def safe_edit(target: Message, text: str, reply_markup: InlineKeyboardMark
         try:
             return await target.answer(text, reply_markup=reply_markup)
         except Exception as answer_err:
-            print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
+            logger.warning("[safe_edit] edit failed: %s; answer failed: %s", edit_err, answer_err)
             return None
 
 
@@ -150,7 +150,7 @@ async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMa
                 parse_mode="HTML",
             )
         except Exception as answer_err:
-            print(f"[safe_edit_caption] edit failed: {edit_err}; answer failed: {answer_err}")
+            logger.warning("[safe_edit_caption] edit failed: %s; answer failed: %s", edit_err, answer_err)
             return None
 
 
