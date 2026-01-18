@@ -2,6 +2,12 @@
 
 - Recommended Python version: **3.12**. Using Python 3.13 with aiogram may cause startup issues (e.g., timeout handling in polling) on Railway, so prefer 3.12 for stable deployments.
 
+## Owner display name
+
+- `owner_display_name` is captured on the first smartlink save and must be treated as immutable afterward.
+- Use `owner_display_name` (or display names like `artist`/`title`) for UI text; never use slug values for display.
+- Updates to smartlinks must preserve the originally saved `owner_display_name` even if the Telegram profile name changes.
+
 ## Smartlink cover rules
 
 - External covers: provide a public `cover_url` (must be `http/https`).

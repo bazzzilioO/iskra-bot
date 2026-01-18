@@ -48,6 +48,9 @@ def normalize_base_url(base: str | None, default: str | None = DEFAULT_SMARTLINK
 
 
 SMARTLINK_WEB_BASE = normalize_base_url(os.getenv("SMARTLINK_WEB_BASE"), DEFAULT_SMARTLINK_BASE)
+CANONICAL_SMARTLINK_BASE = normalize_base_url(
+    os.getenv("SMARTLINK_CANONICAL_BASE"), DEFAULT_SMARTLINK_BASE
+)
 
 
 def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
@@ -61,18 +64,51 @@ def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
     return ""
 
 
-async def safe_edit(target: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> Message | None:
+async def safe_edit_message(
+    target: Message,
+    *,
+    text: str | None = None,
+    caption: str | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    parse_mode: str | None = None,
+) -> Message | None:
+    if text is None and caption is None:
+        return None
     try:
-        await target.edit_text(text, reply_markup=reply_markup)
+        if caption is not None:
+            await target.edit_caption(caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
+        else:
+            await target.edit_text(text or "", reply_markup=reply_markup, parse_mode=parse_mode)
         return target
     except TelegramBadRequest:
         return target
     except Exception as edit_err:
         try:
-            return await target.answer(text, reply_markup=reply_markup)
+            if caption is not None:
+                if target.photo:
+                    return await target.answer_photo(
+                        photo=target.photo[-1].file_id,
+                        caption=caption,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode,
+                    )
+                return await target.answer(
+                    caption,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode,
+                )
+            return await target.answer(text or "", reply_markup=reply_markup, parse_mode=parse_mode)
         except Exception as answer_err:
             print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
             return None
+
+
+async def safe_edit(
+    target: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> Message | None:
+    return await safe_edit_message(target, text=text, reply_markup=reply_markup)
 
 
 def parse_date(date_str: str) -> dt.date | None:
@@ -113,21 +149,17 @@ def smartlink_can_remind(smartlink: dict) -> bool:
     return bool(rd and rd > dt.date.today() and smartlink.get("reminders_enabled", True))
 
 
-async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMarkup | None) -> Message | None:
-    try:
-        await message.edit_caption(caption=caption, reply_markup=kb, parse_mode="HTML")
-        return message
-    except Exception as edit_err:
-        try:
-            return await message.answer_photo(
-                photo=message.photo[-1].file_id if message.photo else None,
-                caption=caption,
-                reply_markup=kb,
-                parse_mode="HTML",
-            )
-        except Exception as answer_err:
-            print(f"[safe_edit_caption] edit failed: {edit_err}; answer failed: {answer_err}")
-            return None
+async def safe_edit_caption(
+    message: Message,
+    caption: str,
+    kb: InlineKeyboardMarkup | None,
+) -> Message | None:
+    return await safe_edit_message(
+        message,
+        caption=caption,
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
 
 
 _CYRILLIC_TRANSLIT_MAP = {
@@ -186,6 +218,20 @@ def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     slug = (smartlink or {}).get("slug") or slugify(title_raw) or "untitled"
 
     return artist_slug, slug
+
+
+def build_canonical_smartlink_url(artist_slug: str, slug: str) -> str:
+    if not artist_slug or not slug:
+        return ""
+    base = CANONICAL_SMARTLINK_BASE or DEFAULT_SMARTLINK_BASE
+    if not base:
+        return ""
+    return f"{base}/{artist_slug}/{slug}"
+
+
+def build_canonical_smartlink_url_from_smartlink(smartlink: dict) -> str:
+    artist_slug, slug = get_smartlink_slugs(smartlink)
+    return build_canonical_smartlink_url(artist_slug, slug)
 
 
 def build_smartlink_id(artist_slug: str, slug: str) -> str:
