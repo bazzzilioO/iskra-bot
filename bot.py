@@ -111,6 +111,8 @@ from helpers import (
     smartlink_can_remind,
     smartlink_pre_save_active,
     slugify,
+    _is_html_response,
+    _sanitize_body_for_logging,
 )
 from keyboards import (
     ACCOUNTS,
@@ -475,6 +477,67 @@ _SPOTIFY_TOKEN_EXPIRES_AT: dt.datetime | None = None
 dp = Dispatcher()
 logger = logging.getLogger(__name__)
 
+# Глобальная HTTP сессия для переиспользования
+_http_session: aiohttp.ClientSession | None = None
+_http_session_lock = asyncio.Lock()
+
+# Rate limit cooldown механизм
+_rate_limit_cooldown_until: float | None = None
+_rate_limit_cooldown_lock = asyncio.Lock()
+RATE_LIMIT_COOLDOWN_SECONDS = 60  # Пауза после 429 ошибки
+
+
+async def get_http_session() -> aiohttp.ClientSession:
+    """Получить или создать глобальную HTTP сессию."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        async with _http_session_lock:
+            # Двойная проверка после получения лока
+            if _http_session is None or _http_session.closed:
+                timeout = aiohttp.ClientTimeout(total=15)
+                _http_session = aiohttp.ClientSession(timeout=timeout)
+    return _http_session
+
+
+async def close_http_session():
+    """Закрыть глобальную HTTP сессию (для cleanup)."""
+    global _http_session
+    if _http_session and not _http_session.closed:
+        await _http_session.close()
+        _http_session = None
+
+
+async def check_rate_limit_cooldown() -> bool:
+    """Проверить, не в cooldown ли мы после rate limit. True если можно делать запросы."""
+    global _rate_limit_cooldown_until
+    if _rate_limit_cooldown_until is None:
+        return True
+    if time.monotonic() >= _rate_limit_cooldown_until:
+        async with _rate_limit_cooldown_lock:
+            # Двойная проверка после получения лока
+            if _rate_limit_cooldown_until is not None and time.monotonic() >= _rate_limit_cooldown_until:
+                _rate_limit_cooldown_until = None
+        return True
+    return False
+
+
+async def set_rate_limit_cooldown(seconds: int = RATE_LIMIT_COOLDOWN_SECONDS):
+    """Установить cooldown после rate limit ошибки."""
+    global _rate_limit_cooldown_until
+    async with _rate_limit_cooldown_lock:
+        _rate_limit_cooldown_until = time.monotonic() + seconds
+        logger.warning("[rate-limit] cooldown activated for %d seconds", seconds)
+
+
+def is_rate_limited_response(status: int, body: str | None) -> bool:
+    """Проверить, является ли ответ rate limit ошибкой."""
+    if status == 429:
+        return True
+    if body and _is_html_response(body):
+        body_lower = body.lower()
+        return "rate limited" in body_lower or "error 1027" in body_lower
+    return False
+
 async def maybe_send_update_notice(message: Message, tg_id: int):
     if not UPDATES_POST_URL:
         return
@@ -838,54 +901,58 @@ async def fetch_smartlink_from_index(
         )
         return False, None, None
 
+    # Проверяем rate limit cooldown перед запросом
+    if not await check_rate_limit_cooldown():
+        logger.debug("[smartlink-fetch] skipping request due to rate limit cooldown artist_slug=%s slug=%s", artist_slug, slug)
+        return False, None, 429
+    
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
     headers = {"X-API-Key": SMARTLINK_API_KEY}
-    timeout = aiohttp.ClientTimeout(total=15)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
-                body = await resp.text()
-                from helpers import _sanitize_body_for_logging, _is_html_response
-                sanitized_body = _sanitize_body_for_logging(body)
-                
-                # Обработка Rate Limit
-                if resp.status == 429 or (body and _is_html_response(body) and ("rate limited" in body.lower() or "error 1027" in body.lower())):
-                    logger.warning(
-                        "[smartlink-fetch] rate limited artist_slug=%s slug=%s",
-                        artist_slug,
-                        slug,
-                    )
-                    return False, None, 429
-                
-                if not (200 <= resp.status < 300):
-                    log_missing_index_token(resp.status, body, "fetch_smartlink_from_index")
-                    logger.warning(
-                        "[smartlink-fetch] response status=%s body=%s", resp.status, sanitized_body
-                    )
-                    return False, None, resp.status
-                try:
-                    payload = await resp.json()
-                except Exception:
-                    logger.warning(
-                        "[smartlink-fetch] failed to parse json status=%s body=%s",
-                        resp.status,
-                        sanitized_body,
-                    )
-                    return False, None, resp.status
+        session = await get_http_session()
+        async with session.get(url, headers=headers) as resp:
+            body = await resp.text()
+            sanitized_body = _sanitize_body_for_logging(body)
+            
+            # Обработка Rate Limit
+            if is_rate_limited_response(resp.status, body):
+                logger.warning(
+                    "[smartlink-fetch] rate limited artist_slug=%s slug=%s",
+                    artist_slug,
+                    slug,
+                )
+                await set_rate_limit_cooldown()
+                return False, None, 429
+            
+            if not (200 <= resp.status < 300):
+                log_missing_index_token(resp.status, body, "fetch_smartlink_from_index")
+                logger.warning(
+                    "[smartlink-fetch] response status=%s body=%s", resp.status, sanitized_body
+                )
+                return False, None, resp.status
+            try:
+                payload = await resp.json()
+            except Exception:
+                logger.warning(
+                    "[smartlink-fetch] failed to parse json status=%s body=%s",
+                    resp.status,
+                    sanitized_body,
+                )
+                return False, None, resp.status
 
-                item: dict | None = None
-                if isinstance(payload, dict):
-                    for key in ("smartlink", "item", "data", "result"):
-                        value = payload.get(key)
-                        if isinstance(value, dict):
-                            item = value
-                            break
-                    if item is None:
-                        item = payload
-                elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
-                    item = payload[0]
+            item: dict | None = None
+            if isinstance(payload, dict):
+                for key in ("smartlink", "item", "data", "result"):
+                    value = payload.get(key)
+                    if isinstance(value, dict):
+                        item = value
+                        break
+                if item is None:
+                    item = payload
+            elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                item = payload[0]
 
-                return True, item, resp.status
+            return True, item, resp.status
     except Exception as err:
         logger.warning("[smartlink-fetch] request error: %s", err)
         return False, None, None
@@ -1093,38 +1160,42 @@ async def update_smartlink_in_index(
             slug,
         )
         return False, None, "missing_api_key"
+    # Проверяем rate limit cooldown перед запросом
+    if not await check_rate_limit_cooldown():
+        logger.debug("[smartlink-publish] skipping request due to rate limit cooldown artist_slug=%s slug=%s", artist_slug, slug)
+        return False, 429, "rate_limit_cooldown"
+    
     index_url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
     headers = {"Content-Type": "application/json"}
     headers["X-API-Key"] = SMARTLINK_API_KEY
     payload = build_smartlink_index_payload(smartlink, owner=owner)
     if not payload:
         return False, None, "payload_invalid"
-    timeout = aiohttp.ClientTimeout(total=15)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.put(index_url, headers=headers, json=payload) as resp:
-                body = await resp.text()
-                from helpers import _sanitize_body_for_logging, _is_html_response
-                sanitized_body = _sanitize_body_for_logging(body)
-                
-                # Обработка Rate Limit
-                if resp.status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
-                    logger.warning(
-                        "[smartlink-publish] rate limited artist_slug=%s slug=%s reason=%s",
+        session = await get_http_session()
+        async with session.put(index_url, headers=headers, json=payload) as resp:
+            body = await resp.text()
+            sanitized_body = _sanitize_body_for_logging(body)
+            
+            # Обработка Rate Limit
+            if is_rate_limited_response(resp.status, body):
+                logger.warning(
+                    "[smartlink-publish] rate limited artist_slug=%s slug=%s reason=%s",
+                    artist_slug,
+                    slug,
+                    reason,
+                )
+                await set_rate_limit_cooldown()
+                if schedule_retry:
+                    await enqueue_smartlink_publish_retry(
                         artist_slug,
                         slug,
-                        reason,
+                        smartlink,
+                        owner,
+                        delay_seconds=min(SMARTLINK_PUBLISH_RETRY_DELAYS[-1], 300),  # До 5 минут для rate limit
+                        last_error=f"status={resp.status} error=rate_limit",
                     )
-                    if schedule_retry:
-                        await enqueue_smartlink_publish_retry(
-                            artist_slug,
-                            slug,
-                            smartlink,
-                            owner,
-                            delay_seconds=min(SMARTLINK_PUBLISH_RETRY_DELAYS[-1], 300),  # До 5 минут для rate limit
-                            last_error=f"status={resp.status} error=rate_limit",
-                        )
-                    return False, 429, "rate_limit"
+                return False, 429, "rate_limit"
                 
                 if 200 <= resp.status < 300:
                     logger.info(
@@ -1186,24 +1257,28 @@ async def confirm_smartlink_indexed(
             slug,
         )
         return False, None, "missing_api_key"
+    # Проверяем rate limit cooldown перед запросом
+    if not await check_rate_limit_cooldown():
+        logger.debug("[smartlink-index] skipping confirm request due to rate limit cooldown artist_slug=%s slug=%s", artist_slug, slug)
+        return False, 429, "rate_limit_cooldown"
+    
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
     headers = {"X-API-Key": SMARTLINK_API_KEY}
-    timeout = aiohttp.ClientTimeout(total=15)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers) as resp:
-                body = await resp.text()
-                from helpers import _sanitize_body_for_logging, _is_html_response
-                sanitized_body = _sanitize_body_for_logging(body)
-                
-                # Обработка Rate Limit
-                if resp.status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
-                    logger.warning(
-                        "[smartlink-index] rate limited during confirm artist_slug=%s slug=%s",
-                        artist_slug,
-                        slug,
-                    )
-                    return False, 429, "rate_limit"
+        session = await get_http_session()
+        async with session.get(url, headers=headers) as resp:
+            body = await resp.text()
+            sanitized_body = _sanitize_body_for_logging(body)
+            
+            # Обработка Rate Limit
+            if is_rate_limited_response(resp.status, body):
+                logger.warning(
+                    "[smartlink-index] rate limited during confirm artist_slug=%s slug=%s",
+                    artist_slug,
+                    slug,
+                )
+                await set_rate_limit_cooldown()
+                return False, 429, "rate_limit"
                 
                 if log_missing_index_token(resp.status, body, "confirm_smartlink_indexed"):
                     return False, resp.status, sanitized_body
@@ -2005,33 +2080,36 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
         logger.error("[smartlink-index] SMARTLINK_INDEX_BASE missing; skipping sync")
         return False, None, "config_missing"
 
+    # Проверяем rate limit cooldown перед запросом
+    if not await check_rate_limit_cooldown():
+        logger.debug("[smartlink-index] skipping request due to rate limit cooldown")
+        return False, 429, "rate_limit_cooldown"
+    
     url = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
     headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
     headers["X-API-Key"] = SMARTLINK_API_KEY
-    timeout = aiohttp.ClientTimeout(total=15)
     logger.info("[smartlink-index] outgoing payload=%s", json.dumps(payload, ensure_ascii=False))
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, json=payload) as resp:
-                status = resp.status
-                try:
-                    body = await resp.text()
-                except Exception:
-                    body = None
-                # Импортируем функцию для очистки HTML
-                from helpers import _sanitize_body_for_logging, _is_html_response
-                sanitized_body = _sanitize_body_for_logging(body)
-                logger.info("[smartlink-index] worker response status=%s body=%s", status, sanitized_body)
-                
-                # Обработка Rate Limit
-                if status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
-                    logger.warning("[smartlink-index] rate limited by Cloudflare during sync")
-                    return False, 429, "rate_limit"
-                
-                log_missing_index_token(status, body, "sync_smartlink_to_web")
-                if 200 <= status < 300:
-                    return True, status, None
-                return False, status, sanitized_body
+        session = await get_http_session()
+        async with session.post(url, headers=headers, json=payload) as resp:
+            status = resp.status
+            try:
+                body = await resp.text()
+            except Exception:
+                body = None
+            sanitized_body = _sanitize_body_for_logging(body)
+            logger.info("[smartlink-index] worker response status=%s body=%s", status, sanitized_body)
+            
+            # Обработка Rate Limit
+            if is_rate_limited_response(status, body):
+                logger.warning("[smartlink-index] rate limited by Cloudflare during sync")
+                await set_rate_limit_cooldown()
+                return False, 429, "rate_limit"
+            
+            log_missing_index_token(status, body, "sync_smartlink_to_web")
+            if 200 <= status < 300:
+                return True, status, None
+            return False, status, sanitized_body
     except Exception as e:
         return False, None, str(e)
 
@@ -5936,6 +6014,7 @@ async def main():
         await run_polling(bot)
     finally:
         release_single_instance_lock(lock_file)
+        await close_http_session()
         await bot.session.close()
 
 if __name__ == "__main__":
