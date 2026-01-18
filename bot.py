@@ -1189,7 +1189,28 @@ async def update_smartlink_in_index(
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.put(index_url, headers=headers, json=payload) as resp:
                 body = await resp.text()
-                truncated_body = body[:1000] if body else body
+                from helpers import _sanitize_body_for_logging, _is_html_response
+                sanitized_body = _sanitize_body_for_logging(body)
+                
+                # Обработка Rate Limit
+                if resp.status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
+                    logger.warning(
+                        "[smartlink-publish] rate limited artist_slug=%s slug=%s reason=%s",
+                        artist_slug,
+                        slug,
+                        reason,
+                    )
+                    if schedule_retry:
+                        await enqueue_smartlink_publish_retry(
+                            artist_slug,
+                            slug,
+                            smartlink,
+                            owner,
+                            delay_seconds=min(SMARTLINK_PUBLISH_RETRY_DELAYS[-1], 300),  # До 5 минут для rate limit
+                            last_error=f"status={resp.status} error=rate_limit",
+                        )
+                    return False, 429, "rate_limit"
+                
                 if 200 <= resp.status < 300:
                     logger.info(
                         "[smartlink-publish] ok artist_slug=%s slug=%s status=%s reason=%s",
@@ -1207,17 +1228,17 @@ async def update_smartlink_in_index(
                         smartlink,
                         owner,
                         delay_seconds=SMARTLINK_PUBLISH_RETRY_DELAYS[0],
-                        last_error=f"status={resp.status} error={truncated_body}",
+                        last_error=f"status={resp.status} error={sanitized_body}",
                     )
                 logger.warning(
                     "[smartlink-publish] fail artist_slug=%s slug=%s status=%s error=%s reason=%s",
                     artist_slug,
                     slug,
                     resp.status,
-                    truncated_body,
+                    sanitized_body,
                     reason,
                 )
-                return False, resp.status, truncated_body
+                return False, resp.status, sanitized_body
     except Exception as err:
         if schedule_retry:
             await enqueue_smartlink_publish_retry(
@@ -1257,9 +1278,20 @@ async def confirm_smartlink_indexed(
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get(url, headers=headers) as resp:
                 body = await resp.text()
-                truncated_body = body[:1000] if body else body
+                from helpers import _sanitize_body_for_logging, _is_html_response
+                sanitized_body = _sanitize_body_for_logging(body)
+                
+                # Обработка Rate Limit
+                if resp.status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
+                    logger.warning(
+                        "[smartlink-index] rate limited during confirm artist_slug=%s slug=%s",
+                        artist_slug,
+                        slug,
+                    )
+                    return False, 429, "rate_limit"
+                
                 if log_missing_index_token(resp.status, body, "confirm_smartlink_indexed"):
-                    return False, resp.status, truncated_body
+                    return False, resp.status, sanitized_body
                 if resp.status == 404:
                     logger.error(
                         "[smartlink-index] confirm not found artist_slug=%s slug=%s",
@@ -1274,9 +1306,9 @@ async def confirm_smartlink_indexed(
                     artist_slug,
                     slug,
                     resp.status,
-                    truncated_body,
+                    sanitized_body,
                 )
-                return False, resp.status, truncated_body
+                return False, resp.status, sanitized_body
     except Exception as err:
         logger.warning(
             "[smartlink-index] confirm error artist_slug=%s slug=%s error=%s",
@@ -1966,16 +1998,42 @@ async def smartlink_slug_exists(
     slug = (slug or "").strip()
     if not artist_slug or not slug:
         return False
+    # Сначала проверяем локальную D1 БД - быстрее и надежнее
+    if owner_tg_user_id is not None:
+        try:
+            smartlink = await asyncio.wait_for(
+                fetch_owned_smartlink_from_d1(owner_tg_user_id, artist_slug, slug),
+                timeout=2.0
+            )
+            if smartlink:
+                return True
+        except asyncio.TimeoutError:
+            logger.warning("[smartlink-slug] D1 check timeout artist_slug=%s slug=%s", artist_slug, slug)
+        except Exception:
+            logger.exception("[smartlink-slug] D1 check error artist_slug=%s slug=%s", artist_slug, slug)
+    # Затем проверяем индекс, но с коротким таймаутом
     if smartlink_index_ready():
-        ok, _item, status = await fetch_smartlink_from_index(artist_slug, slug)
-        if ok:
-            return True
-        if status is not None:
-            return status != 404
-    if owner_tg_user_id is None:
-        return False
-    smartlink = await fetch_owned_smartlink_from_d1(owner_tg_user_id, artist_slug, slug)
-    return bool(smartlink)
+        try:
+            ok, _item, status = await asyncio.wait_for(
+                fetch_smartlink_from_index(artist_slug, slug),
+                timeout=3.0
+            )
+            if ok:
+                return True
+            # 401 (unauthorized) означает проблему с аутентификацией, не то что slug занят
+            # Считаем slug свободным, чтобы не блокировать создание
+            if status == 401:
+                logger.debug("[smartlink-slug] index auth failed, treating as available artist_slug=%s slug=%s", artist_slug, slug)
+                return False
+            if status is not None:
+                return status != 404
+        except asyncio.TimeoutError:
+            logger.warning("[smartlink-slug] index check timeout artist_slug=%s slug=%s", artist_slug, slug)
+            # При таймауте считаем, что slug свободен, чтобы не блокировать создание
+            return False
+        except Exception:
+            logger.exception("[smartlink-slug] index check error artist_slug=%s slug=%s", artist_slug, slug)
+    return False
 
 
 async def build_unique_smartlink_slugs(
@@ -2056,12 +2114,20 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
                     body = await resp.text()
                 except Exception:
                     body = None
-                truncated_body = body[:1000] if body else body
-                logger.info("[smartlink-index] worker response status=%s body=%s", status, truncated_body)
+                # Импортируем функцию для очистки HTML
+                from helpers import _sanitize_body_for_logging, _is_html_response
+                sanitized_body = _sanitize_body_for_logging(body)
+                logger.info("[smartlink-index] worker response status=%s body=%s", status, sanitized_body)
+                
+                # Обработка Rate Limit
+                if status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
+                    logger.warning("[smartlink-index] rate limited by Cloudflare during sync")
+                    return False, 429, "rate_limit"
+                
                 log_missing_index_token(status, body, "sync_smartlink_to_web")
                 if 200 <= status < 300:
                     return True, status, None
-                return False, status, body
+                return False, status, sanitized_body
     except Exception as e:
         return False, None, str(e)
 
@@ -2146,6 +2212,13 @@ async def _update_prompt_message(
 async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     logger.info("[smartlink] finalize start tg_id=%s", tg_id)
     failure_reason: str | None = None
+    # Отправляем уведомление о начале обработки
+    processing_msg: Message | None = None
+    try:
+        processing_msg = await message.answer("⏳ Обрабатываю смартлинк...")
+    except Exception:
+        pass
+    
     try:
         
         artist = data.get("artist") or ""
@@ -2334,6 +2407,13 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             )
             if cover_url:
                 summary_lines.append(f"🖼️ Обложка: {cover_url}")
+        # Удаляем сообщение "Обрабатываю..."
+        if processing_msg:
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+        
         await _update_prompt_message(
             message,
             tg_id,
@@ -2351,10 +2431,20 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
     except TelegramBadRequest:
         traceback.print_exc()
         logger.exception("[smartlink] finalize failed (bad request) tg_id=%s", tg_id)
+        if processing_msg:
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
         await message.answer("Не удалось отправить карточку. Попробуй изменить данные и повторить.")
     except Exception:
         traceback.print_exc()
         logger.exception("[smartlink] finalize failed tg_id=%s", tg_id)
+        if processing_msg:
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
         error_text = failure_reason or "Не удалось создать смартлинк. Проверь данные или попробуй ещё раз."
         await _update_prompt_message(message, tg_id, data, error_text, None, step=None)
         await message.answer(error_text)

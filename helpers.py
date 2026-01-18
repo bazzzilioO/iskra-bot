@@ -23,6 +23,30 @@ DEFAULT_SMARTLINK_BASE = "https://go.sreda.pw"
 SMARTLINK_WEB_BASE = None
 
 
+def _is_html_response(body: str | None) -> bool:
+    """Проверяет, является ли ответ HTML страницей (например, от Cloudflare Rate Limit)."""
+    if not body:
+        return False
+    body_lower = body.strip().lower()
+    return body_lower.startswith("<!doctype") or body_lower.startswith("<html") or "<title>" in body_lower[:500]
+
+
+def _sanitize_body_for_logging(body: str | None, max_length: int = 200) -> str:
+    """Очищает тело ответа для логирования - убирает HTML и обрезает длинные строки."""
+    if not body:
+        return ""
+    if _is_html_response(body):
+        # Для HTML ищем название ошибки
+        if "rate limited" in body.lower():
+            return "<HTML: Cloudflare Rate Limit>"
+        if "error" in body.lower():
+            return "<HTML: Error page>"
+        return "<HTML response>"
+    if len(body) > max_length:
+        return body[:max_length] + "..."
+    return body
+
+
 def log_missing_index_token(status: int | None, body: str | None, context: str) -> bool:
     normalized_body = (body or "").lower()
     if status == 500 or "missing_index_token" in normalized_body:
@@ -30,7 +54,7 @@ def log_missing_index_token(status: int | None, body: str | None, context: str) 
             "[smartlink-index] missing index token context=%s status=%s body=%s",
             context,
             status,
-            body,
+            _sanitize_body_for_logging(body),
         )
         return True
     return False
@@ -458,15 +482,34 @@ async def push_smartlink_to_index(
                         body = await resp.text()
                     except Exception:
                         body = None
-                    truncated_body = (body[:1000] if body else body)
+                    sanitized_body = _sanitize_body_for_logging(body)
                     logger.info(
                         "[smartlink-index] worker response status=%s body=%s",
                         resp.status,
-                        truncated_body,
+                        sanitized_body,
                     )
                     last_status = resp.status
+                    
+                    # Обработка Rate Limit (429) от Cloudflare
+                    if resp.status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
+                        last_error = "rate_limit"
+                        logger.warning(
+                            "[smartlink-index] rate limited by Cloudflare, will retry with longer delay"
+                        )
+                        if attempt < max_attempts:
+                            # Для rate limit используем более длинную задержку
+                            backoff_seconds = min(60 * attempt, 300)  # До 5 минут
+                            logger.info(
+                                "[smartlink-index] retrying after rate limit backoff=%ss attempt=%s",
+                                backoff_seconds,
+                                attempt + 1,
+                            )
+                            await asyncio.sleep(backoff_seconds)
+                            continue
+                        return False, 429, "rate_limit"
+                    
                     if log_missing_index_token(resp.status, body, "push_smartlink_to_index"):
-                        return False, resp.status, truncated_body
+                        return False, resp.status, sanitized_body
                     if 200 <= resp.status < 300:
                         verified, verify_status, verify_error = await _verify_index_entry(
                             session, base_url, payload["artist_slug"], payload["slug"], headers
@@ -474,9 +517,9 @@ async def push_smartlink_to_index(
                         if verified:
                             return True, resp.status, None
                         return False, verify_status, verify_error
-                    last_error = truncated_body
+                    last_error = sanitized_body
                     if resp.status < 500:
-                        return False, resp.status, truncated_body
+                        return False, resp.status, sanitized_body
         except Exception as err:
             last_status = None
             last_error = str(err)
@@ -510,9 +553,9 @@ async def _verify_index_entry(
                 body = await resp.text()
             except Exception:
                 body = None
-            truncated_body = body[:1000] if body else body
+            sanitized_body = _sanitize_body_for_logging(body)
             if log_missing_index_token(status, body, "verify_index_entry"):
-                return False, status, truncated_body
+                return False, status, sanitized_body
             if status == 404:
                 logger.error(
                     "[smartlink-index] verify failed: not found artist_slug=%s slug=%s",
@@ -527,9 +570,9 @@ async def _verify_index_entry(
                 artist_slug,
                 slug,
                 status,
-                truncated_body,
+                sanitized_body,
             )
-            return False, status, truncated_body
+            return False, status, sanitized_body
     except Exception as err:
         logger.warning(
             "[smartlink-index] verify error artist_slug=%s slug=%s error=%s",
