@@ -1,4 +1,4 @@
-# Table of contents
+﻿# Table of contents
 # CONFIG/ENV
 # CONSTANTS
 # DB
@@ -514,587 +514,47 @@ async def get_spotify_access_token() -> str | None:
 
 
 async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
-    items: list[dict], page: int, total_pages: int, start_index: int
-) -> InlineKeyboardMarkup:
-    inline: list[list[InlineKeyboardButton]] = []
+    token = await get_spotify_access_token()
+    if not token:
+        return []
 
-    for idx, item in enumerate(items, start=start_index + 1):
-        artist_slug = str(item.get("artist_slug") or "").strip()
-        slug = str(item.get("slug") or "").strip()
-        smartlink_id = item.get("id")
+    timeout = aiohttp.ClientTimeout(total=10)
+    headers = {"Authorization": f"Bearer {token}"}
+    params = {"q": f"upc:{upc}", "type": "album,track", "limit": 5}
+    candidates: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
 
-        if not artist_slug or not slug:
-            artist_slug, slug = get_smartlink_slugs(item)
-
-        if not smartlink_id and artist_slug and slug:
-            smartlink_id = build_smartlink_id(artist_slug, slug)
-
-        canonical_url = (
-            build_smartlink_web_url(artist_slug, slug) if artist_slug and slug else None
-        )
-
-        row: list[InlineKeyboardButton] = []
-
-        if canonical_url:
-            row.append(InlineKeyboardButton(text=f"{idx}. 🌐 Открыть", url=canonical_url))
-
-        if smartlink_id:
-            # ВАЖНО: под существующий хендлер @dp.callback_query(F.data.startswith("smartlinks:edit:"))
-            row.append(
-                InlineKeyboardButton(
-                    text="✏️ Редактировать",
-                    callback_data=f"smartlinks:edit:{smartlink_id}:p{page}",
-                )
-            )
-
-        if row:
-            inline.append(row)
-
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"smartlinks:my:{page - 1}"))
-    if page < total_pages - 1:
-        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"smartlinks:my:{page + 1}"))
-    if nav_row:
-        inline.append(nav_row)
-
-    inline.append([InlineKeyboardButton(text="◀️ Назад", callback_data="smartlinks:menu")])
-
-    return InlineKeyboardMarkup(inline_keyboard=inline)
-
-
-async def fetch_my_smartlinks_from_index(
-    tg_id: int,
-    page: int = 0,
-    limit: int = 10,
-) -> tuple[bool, list[dict] | None, int, int]:
-    if not SMARTLINK_INDEX_BASE:
-        logger.error("[smartlink-my] SMARTLINK_INDEX_BASE missing; skipping fetch")
-        return False, None, 0, 1
-    url = f"{SMARTLINK_INDEX_BASE}/api/my"
-    headers = {}
-    if SMARTLINK_API_KEY:
-        headers["X-API-Key"] = SMARTLINK_API_KEY
-
-    params = {
-        "owner_tg_user_id": str(tg_id),
-        "page": str(max(0, page)),
-        "limit": str(limit),
-    }
-
-    timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, params=params) as resp:
-                body = await resp.text()
-                if not (200 <= resp.status < 300):
-                    logger.warning("[smartlink-my] status=%s body=%s", resp.status, body)
-                    return False, None, 0, 1
+            async with session.get(
+                "https://api.spotify.com/v1/search", headers=headers, params=params
+            ) as resp:
+                if resp.status >= 400:
+                    return []
                 data = await resp.json()
-                items = data.get("items") or []
-                total_pages = int(data.get("total_pages") or 1)
-                total_count = int(data.get("total_count") or len(items))
-                return True, items, total_count, max(1, total_pages)
-    except Exception as e:
-        logger.exception("[smartlink-my] error: %s", e)
-        return False, None, 0, 1
+                for item_type in ("albums", "tracks"):
+                    items = data.get(item_type, {}).get("items", [])
+                    for item in items:
+                        url = item.get("external_urls", {}).get("spotify", "")
+                        if url and url not in seen_urls:
+                            seen_urls.add(url)
+                            candidates.append(
+                                {
+                                    "artist": ", ".join(
+                                        a.get("name", "") for a in item.get("artists", [])
+                                    ),
+                                    "title": item.get("name", ""),
+                                    "url": url,
+                                }
+                            )
+    except Exception:
+        pass
+
+    return candidates
 
 
+# All smartlink utility functions are imported from smartlink module
 
-async def fetch_smartlink_from_index(
-    artist_slug: str, slug: str
-) -> tuple[bool, dict | None, int | None]:
-    artist_slug = str(artist_slug or "").strip()
-    slug = str(slug or "").strip()
-    if not SMARTLINK_INDEX_BASE or not artist_slug or not slug:
-        return False, None, None
-    if not SMARTLINK_API_KEY:
-        logger.error(
-            "[smartlink-fetch] SMARTLINK_API_KEY missing; skipping index fetch artist_slug=%s slug=%s",
-            artist_slug,
-            slug,
-        )
-        return False, None, None
-
-    # Проверяем rate limit cooldown перед запросом
-    if not await check_rate_limit_cooldown():
-        logger.debug("[smartlink-fetch] skipping request due to rate limit cooldown artist_slug=%s slug=%s", artist_slug, slug)
-        return False, None, 429
-    
-    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {"X-API-Key": SMARTLINK_API_KEY}
-    try:
-        session = await get_http_session()
-        async with session.get(url, headers=headers) as resp:
-            body = await resp.text()
-            sanitized_body = _sanitize_body_for_logging(body)
-            
-            # Обработка Rate Limit
-            if is_rate_limited_response(resp.status, body):
-                logger.warning(
-                    "[smartlink-fetch] rate limited artist_slug=%s slug=%s",
-                    artist_slug,
-                    slug,
-                )
-                await set_rate_limit_cooldown()
-                return False, None, 429
-            
-            if not (200 <= resp.status < 300):
-                log_missing_index_token(resp.status, body, "fetch_smartlink_from_index")
-                logger.warning(
-                    "[smartlink-fetch] response status=%s body=%s", resp.status, sanitized_body
-                )
-                return False, None, resp.status
-            try:
-                payload = await resp.json()
-            except Exception:
-                logger.warning(
-                    "[smartlink-fetch] failed to parse json status=%s body=%s",
-                    resp.status,
-                    sanitized_body,
-                )
-                return False, None, resp.status
-
-            item: dict | None = None
-            if isinstance(payload, dict):
-                for key in ("smartlink", "item", "data", "result"):
-                    value = payload.get(key)
-                    if isinstance(value, dict):
-                        item = value
-                        break
-                if item is None:
-                    item = payload
-            elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
-                item = payload[0]
-
-            return True, item, resp.status
-    except Exception as err:
-        logger.warning("[smartlink-fetch] request error: %s", err)
-        return False, None, None
-
-
-def parse_page_marker(marker: str | None, default: int = 0) -> int:
-    if not marker:
-        return default
-    marker = marker.strip()
-    if marker.startswith("p") and marker[1:].lstrip("-").isdigit():
-        return int(marker[1:])
-    if marker.lstrip("-").isdigit():
-        return int(marker)
-    return default
-
-
-def parse_smartlink_callback_data(data: str, tail_size: int) -> tuple[str, list[str]]:
-    parts = (data or "").split(":")
-    if len(parts) < 3 + tail_size:
-        return "", []
-    tail = parts[-tail_size:] if tail_size else []
-    smartlink_parts = parts[2:-tail_size] if tail_size else parts[2:]
-    smartlink_id = ":".join(part for part in smartlink_parts if part)
-    return smartlink_id, tail
-
-
-def extract_index_owner_tg_user_id(item: dict) -> str:
-    value = item.get("owner_tg_user_id")
-    if value is not None:
-        raw = str(value).strip()
-        if raw:
-            return raw
-    owner = item.get("owner")
-    if isinstance(owner, dict):
-        raw = str(owner.get("tg_user_id") or "").strip()
-        if raw:
-            return raw
-    return ""
-
-
-def extract_index_owner_fields(item: dict) -> tuple[str, str]:
-    username = ""
-    display_name = ""
-    raw_username = item.get("owner_tg_username")
-    raw_display = item.get("owner_display_name")
-    if isinstance(raw_username, str) and raw_username.strip():
-        username = raw_username.strip()
-    if isinstance(raw_display, str) and raw_display.strip():
-        display_name = raw_display.strip()
-    owner = item.get("owner")
-    if isinstance(owner, dict):
-        if not username:
-            owner_username = owner.get("username")
-            if isinstance(owner_username, str) and owner_username.strip():
-                username = owner_username.strip()
-        if not display_name:
-            owner_display = owner.get("display_name")
-            if isinstance(owner_display, str) and owner_display.strip():
-                display_name = owner_display.strip()
-    return username, display_name
-
-
-def normalize_index_smartlink(
-    item: dict,
-    owner_tg_user_id: int | str | None = None,
-    artist_slug: str | None = None,
-    slug: str | None = None,
-) -> dict:
-    artist_slug = (artist_slug or item.get("artist_slug") or "").strip()
-    slug = (slug or item.get("slug") or "").strip()
-    if not artist_slug or not slug:
-        artist_slug, slug = get_smartlink_slugs(item)
-    owner_raw = str(owner_tg_user_id).strip() if owner_tg_user_id is not None else ""
-    if not owner_raw:
-        owner_raw = extract_index_owner_tg_user_id(item)
-    owner_tg_username, owner_display_name = extract_index_owner_fields(item)
-    cover_source = item.get("cover_source") if isinstance(item.get("cover_source"), dict) else {}
-    cover_file_id = item.get("cover_file_id") or cover_source.get("file_id") or ""
-    links = item.get("links") if isinstance(item.get("links"), dict) else {}
-    return {
-        "id": build_smartlink_id(artist_slug, slug),
-        "owner_tg_user_id": owner_raw,
-        "owner_tg_username": owner_tg_username,
-        "owner_display_name": owner_display_name,
-        "artist": item.get("artist") or item.get("artist_name") or "",
-        "title": item.get("title") or "",
-        "release_date": item.get("release_date") or "",
-        "cover_file_id": cover_file_id or "",
-        "cover_source": cover_source or {},
-        "links": links or {},
-        "caption_text": item.get("caption_text") or "",
-        "branding_disabled": bool(item.get("branding_disabled", False)),
-        "branding_paid": bool(item.get("branding_paid", False)),
-        "pre_save_enabled": bool(item.get("pre_save_enabled", True)),
-        "reminders_enabled": bool(item.get("reminders_enabled", True)),
-        "cover_url": item.get("cover_url"),
-        "artist_slug": artist_slug,
-        "slug": slug,
-        "cover_version": int(item.get("cover_version") or 1),
-    }
-
-
-def smartlink_index_ready() -> bool:
-    return bool(SMARTLINK_INDEX_BASE and SMARTLINK_API_KEY)
-
-
-async def fetch_owned_smartlink_with_fallback(
-    tg_id: int, artist_slug: str, slug: str
-) -> dict | None:
-    artist_slug = str(artist_slug or "").strip()
-    slug = str(slug or "").strip()
-    if not artist_slug or not slug:
-        return None
-
-    if smartlink_index_ready():
-        ok, item, status = await fetch_smartlink_from_index(artist_slug, slug)
-        if ok:
-            if isinstance(item, dict):
-                owner_id = extract_index_owner_tg_user_id(item)
-                if owner_id and owner_id != str(tg_id):
-                    return None
-                return normalize_index_smartlink(
-                    item,
-                    owner_tg_user_id=str(tg_id),
-                    artist_slug=artist_slug,
-                    slug=slug,
-                )
-            return None
-        logger.warning(
-            "[smartlink-fetch] index fetch failed artist_slug=%s slug=%s tg_id=%s status=%s",
-            artist_slug,
-            slug,
-            tg_id,
-            status,
-        )
-    else:
-        logger.error(
-            "[smartlink-index] SMARTLINK_INDEX_BASE or SMARTLINK_API_KEY missing; using D1 fallback tg_id=%s",
-            tg_id,
-        )
-
-    return await fetch_owned_smartlink_from_d1(tg_id, artist_slug, slug)
-
-
-async def fetch_owned_smartlink_by_smartlink_id(
-    tg_id: int, smartlink_id: int | str
-) -> dict | None:
-    artist_slug, slug = parse_smartlink_id(smartlink_id)
-    if artist_slug and slug:
-        return await fetch_owned_smartlink_with_fallback(tg_id, artist_slug, slug)
-    if smartlink_id:
-        return await fetch_owned_smartlink_by_id(tg_id, smartlink_id)
-    return None
-
-
-async def fetch_owned_smartlink_from_index(
-    tg_id: int, artist_slug: str, slug: str
-) -> dict | None:
-    ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
-    if not ok or not isinstance(item, dict):
-        return None
-    owner_id = extract_index_owner_tg_user_id(item)
-    if owner_id and owner_id != str(tg_id):
-        return None
-    return normalize_index_smartlink(item, owner_tg_user_id=str(tg_id), artist_slug=artist_slug, slug=slug)
-
-
-async def fetch_smartlink_by_id(smartlink_id: int | str) -> dict | None:
-    artist_slug, slug = parse_smartlink_id(smartlink_id)
-    if not artist_slug or not slug:
-        return None
-    ok, item, _status = await fetch_smartlink_from_index(artist_slug, slug)
-    if not ok or not isinstance(item, dict):
-        return None
-    return normalize_index_smartlink(item, artist_slug=artist_slug, slug=slug)
-
-
-async def fetch_latest_smartlink_from_index(tg_id: int) -> dict | None:
-    index_ok, items, _total_count, _total_pages = await fetch_my_smartlinks_from_index(
-        tg_id, page=0, limit=1
-    )
-    if not index_ok or not items:
-        return None
-    item = items[0] if isinstance(items[0], dict) else None
-    if not item:
-        return None
-    return normalize_index_smartlink(item, owner_tg_user_id=str(tg_id))
-
-
-async def update_smartlink_in_index(
-    artist_slug: str,
-    slug: str,
-    smartlink: dict,
-    owner: dict | None = None,
-    *,
-    schedule_retry: bool = True,
-    reason: str | None = None,
-) -> tuple[bool, int | None, str | None]:
-    if not SMARTLINK_INDEX_BASE:
-        return False, None, "config_missing"
-    if not SMARTLINK_API_KEY:
-        logger.error(
-            "[smartlink-index] SMARTLINK_API_KEY missing; skipping update artist_slug=%s slug=%s",
-            artist_slug,
-            slug,
-        )
-        return False, None, "missing_api_key"
-    # Проверяем rate limit cooldown перед запросом
-    if not await check_rate_limit_cooldown():
-        logger.debug("[smartlink-publish] skipping request due to rate limit cooldown artist_slug=%s slug=%s", artist_slug, slug)
-        return False, 429, "rate_limit_cooldown"
-    
-    index_url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {"Content-Type": "application/json"}
-    headers["X-API-Key"] = SMARTLINK_API_KEY
-    payload = build_smartlink_index_payload(smartlink, owner=owner)
-    if not payload:
-        return False, None, "payload_invalid"
-    try:
-        session = await get_http_session()
-        async with session.put(index_url, headers=headers, json=payload) as resp:
-            body = await resp.text()
-            sanitized_body = _sanitize_body_for_logging(body)
-            
-            # Обработка Rate Limit
-            if is_rate_limited_response(resp.status, body):
-                logger.warning(
-                    "[smartlink-publish] rate limited artist_slug=%s slug=%s reason=%s",
-                    artist_slug,
-                    slug,
-                    reason,
-                )
-                await set_rate_limit_cooldown()
-                if schedule_retry:
-                    await enqueue_smartlink_publish_retry(
-                        artist_slug,
-                        slug,
-                        smartlink,
-                        owner,
-                        delay_seconds=min(SMARTLINK_PUBLISH_RETRY_DELAYS[-1], 300),  # До 5 минут для rate limit
-                        last_error=f"status={resp.status} error=rate_limit",
-                    )
-                return False, 429, "rate_limit"
-                
-                if 200 <= resp.status < 300:
-                    logger.info(
-                        "[smartlink-publish] ok artist_slug=%s slug=%s status=%s reason=%s",
-                        artist_slug,
-                        slug,
-                        resp.status,
-                        reason,
-                    )
-                    return True, resp.status, None
-                log_missing_index_token(resp.status, body, "update_smartlink_in_index")
-                if schedule_retry:
-                    await enqueue_smartlink_publish_retry(
-                        artist_slug,
-                        slug,
-                        smartlink,
-                        owner,
-                        delay_seconds=SMARTLINK_PUBLISH_RETRY_DELAYS[0],
-                        last_error=f"status={resp.status} error={sanitized_body}",
-                    )
-                logger.warning(
-                    "[smartlink-publish] fail artist_slug=%s slug=%s status=%s error=%s reason=%s",
-                    artist_slug,
-                    slug,
-                    resp.status,
-                    sanitized_body,
-                    reason,
-                )
-                return False, resp.status, sanitized_body
-    except Exception as err:
-        if schedule_retry:
-            await enqueue_smartlink_publish_retry(
-                artist_slug,
-                slug,
-                smartlink,
-                owner,
-                delay_seconds=SMARTLINK_PUBLISH_RETRY_DELAYS[0],
-                last_error=str(err),
-            )
-        logger.warning(
-            "[smartlink-publish] fail artist_slug=%s slug=%s error=%s reason=%s",
-            artist_slug,
-            slug,
-            err,
-            reason,
-        )
-        return False, None, str(err)
-
-
-async def confirm_smartlink_indexed(
-    artist_slug: str, slug: str
-) -> tuple[bool, int | None, str | None]:
-    if not SMARTLINK_INDEX_BASE:
-        return False, None, "config_missing"
-    if not SMARTLINK_API_KEY:
-        logger.error(
-            "[smartlink-index] SMARTLINK_API_KEY missing; skipping confirm artist_slug=%s slug=%s",
-            artist_slug,
-            slug,
-        )
-        return False, None, "missing_api_key"
-    # Проверяем rate limit cooldown перед запросом
-    if not await check_rate_limit_cooldown():
-        logger.debug("[smartlink-index] skipping confirm request due to rate limit cooldown artist_slug=%s slug=%s", artist_slug, slug)
-        return False, 429, "rate_limit_cooldown"
-    
-    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {"X-API-Key": SMARTLINK_API_KEY}
-    try:
-        session = await get_http_session()
-        async with session.get(url, headers=headers) as resp:
-            body = await resp.text()
-            sanitized_body = _sanitize_body_for_logging(body)
-            
-            # Обработка Rate Limit
-            if is_rate_limited_response(resp.status, body):
-                logger.warning(
-                    "[smartlink-index] rate limited during confirm artist_slug=%s slug=%s",
-                    artist_slug,
-                    slug,
-                )
-                await set_rate_limit_cooldown()
-                return False, 429, "rate_limit"
-                
-                if log_missing_index_token(resp.status, body, "confirm_smartlink_indexed"):
-                    return False, resp.status, sanitized_body
-                if resp.status == 404:
-                    logger.error(
-                        "[smartlink-index] confirm not found artist_slug=%s slug=%s",
-                        artist_slug,
-                        slug,
-                    )
-                    return False, resp.status, "not_found"
-                if 200 <= resp.status < 300:
-                    return True, resp.status, None
-                logger.warning(
-                    "[smartlink-index] confirm failed artist_slug=%s slug=%s status=%s body=%s",
-                    artist_slug,
-                    slug,
-                    resp.status,
-                    sanitized_body,
-                )
-                return False, resp.status, sanitized_body
-    except Exception as err:
-        logger.warning(
-            "[smartlink-index] confirm error artist_slug=%s slug=%s error=%s",
-            artist_slug,
-            slug,
-            err,
-        )
-        return False, None, str(err)
-
-
-async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
-    ok, items, total_count, total_pages = await fetch_my_smartlinks_from_index(
-        tg_id,
-        page=page,
-        limit=MY_SMARTLINKS_PAGE_SIZE,
-    )
-    if not ok or items is None:
-        fallback_count = await count_owned_smartlinks(tg_id)
-        fallback_items = await list_owned_smartlinks(
-            tg_id,
-            limit=MY_SMARTLINKS_PAGE_SIZE,
-            offset=max(0, page) * MY_SMARTLINKS_PAGE_SIZE,
-        )
-        if fallback_count is not None and fallback_items is not None:
-            total_count = fallback_count
-            items = fallback_items
-            total_pages = max(
-                1,
-                (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE,
-            )
-            await message.answer(
-                "⚠️ Не удалось получить список из индекса. Показываю данные из D1.",
-                reply_markup=smartlinks_menu_kb(),
-            )
-        else:
-            await message.answer(
-                "❌ Не удалось получить список смартлинков из D1. Попробуй позже.",
-                reply_markup=smartlinks_menu_kb(),
-            )
-            return
-
-    page = max(0, min(page, total_pages - 1))
-    start_index = page * MY_SMARTLINKS_PAGE_SIZE
-    text = build_my_smartlinks_text(items, page, total_pages, start_index)
-    kb = build_my_smartlinks_kb(items, page, total_pages, start_index)
-    await message.answer(text, reply_markup=kb)
-    return
-
-
-
-
-
-
-
-
-async def send_smartlink_list(message: Message, tg_id: int, page: int = 0):
-    await message.answer(
-        "Локальные черновики отключены. Список доступен в «📎 Мои смартлинки».",
-        reply_markup=smartlinks_menu_kb(),
-    )
-
-
-async def show_smartlink_view(
-    message: Message, tg_id: int, artist_slug: str, slug: str, page: int
-):
-    smartlink = await fetch_owned_smartlink_with_fallback(tg_id, artist_slug, slug)
-    if not smartlink:
-        await message.answer(
-            "Смартлинк не найден или временно недоступен.",
-            reply_markup=smartlinks_menu_kb(),
-        )
-        return
-    text = build_smartlink_view_text(smartlink)
-    await message.answer(text, reply_markup=smartlink_view_kb(smartlink, page))
-
-
-async def resend_smartlink_card(message: Message, tg_id: int, smartlink: dict, page: int):
-    allow_remind = smartlink_can_remind(smartlink)
-    subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
-    await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind, page=page)
-    await message.answer("Выбери действие:", reply_markup=smartlink_view_kb(smartlink, page))
 async def get_spotify_access_token() -> str | None:
     global _SPOTIFY_ACCESS_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
 
@@ -1179,6 +639,11 @@ def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str 
         return "spotify"
     if host == "music.apple.com":
         return "apple"
+
+
+# All smartlink utility functions are imported from smartlink module - duplicates removed
+
+def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str | None:
     if host == "itunes.apple.com":
         return "itunes"
     if host in {"music.vk.com", "music.vk.ru"}:
