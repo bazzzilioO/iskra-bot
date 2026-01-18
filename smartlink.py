@@ -26,6 +26,7 @@ from config import (
     SMARTLINK_PUBLISH_RETRY_DELAYS,
     SMARTLINK_UPDATE_DEBOUNCE_SECONDS,
     SMARTLINK_WEB_BASE,
+    SONGLINK_PLATFORM_ALIASES,
 )
 from db import (
     count_owned_smartlinks,
@@ -2072,3 +2073,113 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
         schedule_smartlink_update(message.bot, latest.get("id"))
 
     return True
+
+
+# ==================== Import Helper Functions ====================
+
+def filter_human_sources(sources: dict[str, dict]) -> dict[str, dict]:
+    """Filter sources to only include human metadata platforms."""
+    filtered: dict[str, dict] = {}
+    for key, meta in (sources or {}).items():
+        normalized_key = SONGLINK_PLATFORM_ALIASES.get(key, key)
+        if normalized_key not in HUMAN_METADATA_PLATFORMS:
+            continue
+        filtered.setdefault(normalized_key, meta or {})
+    return filtered
+
+
+async def show_import_confirmation(
+    message: Message,
+    tg_id: int,
+    links: dict[str, str],
+    metadata: dict | None,
+    latest: dict | None = None,
+):
+    """Show import confirmation - lazy import to avoid circular dependencies."""
+    sources = filter_human_sources((metadata or {}).get("sources") or {})
+    preferred_source = (metadata or {}).get("preferred_source") or (metadata or {}).get("source_platform")
+    if preferred_source:
+        preferred_source = SONGLINK_PLATFORM_ALIASES.get(preferred_source, preferred_source)
+    if preferred_source not in sources and sources:
+        preferred_source = next(iter(sources.keys()))
+    selected_meta = sources.get(preferred_source, metadata or {}) if metadata else {}
+
+    artist = selected_meta.get("artist") or (latest.get("artist") if latest else "")
+    title = selected_meta.get("title") or (latest.get("title") if latest else "")
+    release_date = (latest.get("release_date") or "") if latest else ""
+    caption_text = (latest.get("caption_text") or "") if latest else ""
+    cover_file_id = (latest.get("cover_file_id") or "") if latest else ""
+
+    platforms_text = ", ".join(sorted(links.keys())) if links else "—"
+    caption_lines = [
+        "Нашёл ссылки на релиз.",
+        f"{artist or 'Без артиста'} — {title or 'Без названия'}",
+        "",
+        f"Площадки: {platforms_text}",
+    ]
+    if metadata and sources and preferred_source:
+        label = platform_label(preferred_source)
+        caption_lines.append(f"Источник: {label}")
+    if metadata and metadata.get("conflict"):
+        caption_lines.append("⚠️ Название/артист отличаются на площадках. Выбери источник или подтверди по умолчанию.")
+    if len(links) < 2:
+        caption_lines.append("Можно прислать ссылку другой платформы, чтобы добавить остальные площадки.")
+    caption_lines.append("")
+    caption_lines.append("Подтверди данные или измени вручную.")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:import_confirm")],
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="smartlink:prefill_edit")],
+            [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
+        ]
+    )
+
+    if metadata and len(sources) > 1:
+        source_row = []
+        for platform_key in sorted(sources.keys()):
+            label = platform_label(platform_key)
+            mark = "✅ " if platform_key == preferred_source else ""
+            source_row.append(InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"smartlink:import_source:{platform_key}"))
+        kb.inline_keyboard.insert(0, source_row)
+
+    cover_source = selected_meta.get("cover_url") or cover_file_id
+    preview_message: Message | None = None
+    if cover_source:
+        try:
+            input_file = await fetch_cover_file(cover_source)
+        except Exception:
+            input_file = None
+        try:
+            preview_message = await message.answer_photo(
+                photo=input_file or cover_source,
+                caption="\n".join(caption_lines),
+                reply_markup=kb,
+            )
+            if input_file:
+                logger.info("[cover] downloaded cover from %s", cover_source)
+        except Exception as e:
+            logger.warning("[cover] failed to show preview: %s", e)
+            preview_message = None
+
+    if not preview_message:
+        preview_message = await message.answer("\n".join(caption_lines), reply_markup=kb)
+
+    if preview_message.photo:
+        cover_file_id = preview_message.photo[-1].file_id
+
+    await form_start(tg_id, "smartlink_import_review")
+    await form_set(
+        tg_id,
+        0,
+        {
+            "artist": artist,
+            "title": title,
+            "release_date": release_date,
+            "cover_file_id": cover_file_id,
+            "links": links,
+            "caption_text": caption_text,
+            "metadata": metadata or {},
+            "preferred_source": preferred_source,
+            "cover_url": selected_meta.get("cover_url") or "",
+        },
+    )
