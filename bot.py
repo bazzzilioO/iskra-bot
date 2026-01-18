@@ -166,130 +166,69 @@ from texts import (
     UGC_TIP_TEXT,
 )
 from scheduler import build_deadlines, reminder_scheduler
-
-
-def build_smartlink_caption(
-    smartlink: dict, release_today: bool = False, show_listen_label: bool | None = None
-) -> str:
-    artist = escape_html(smartlink.get("artist") or "")
-    title = escape_html(smartlink.get("title") or "")
-    caption_text = escape_html(smartlink.get("caption_text") or "")
-    release_date = parse_date(smartlink.get("release_date")) if smartlink.get("release_date") else None
-    show_branding = not smartlink.get("branding_disabled")
-    presave_active = smartlink_pre_save_active(smartlink)
-
-    links = smartlink.get("links") or {}
-    has_platforms = any(links.get(key) for key, _ in SMARTLINK_BUTTON_ORDER)
-    no_links_line = "Ссылки пока не найдены (попробуй обновить или добавь вручную)."
-
-    if release_today:
-        lines = [f"{artist} — {title}"]
-        lines.append("🎉 Сегодня релиз!")
-        if release_date:
-            lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
-        if caption_text:
-            lines.append(caption_text)
-        if show_branding:
-            lines.append("")
-            lines.append(ATTRIBUTION_HTML)
-        if not has_platforms:
-            if lines and lines[-1] != "":
-                lines.append("")
-            lines.append(no_links_line)
-        return "\n".join(lines)
-
-    lines = [f"{artist} — {title}"]
-    if release_date:
-        lines.append(f"📅 Релиз: {format_date_ru(release_date)}")
-    status_line: str | None = None
-    today = dt.date.today()
-    if presave_active and release_date and release_date > today:
-        status_line = "Релиз запланирован. Ссылки появятся ближе к дате или в день релиза."
-    if not has_platforms:
-        if release_date and release_date > today:
-            status_line = "Релиз запланирован. Ссылки появятся ближе к дате или в день релиза."
-        elif release_date and release_date <= today:
-            status_line = "Ссылки не найдены. Добавь вручную или обнови."
-    if status_line:
-        lines.append(status_line)
-    if caption_text:
-        lines.append(caption_text)
-    if show_branding:
-        lines.append("")
-        lines.append(ATTRIBUTION_HTML)
-    if not has_platforms:
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.append(no_links_line)
-    return "\n".join(lines)
-
-
-def build_owner_payload(user: User) -> dict[str, str | None]:
-    return {
-        "tg_user_id": str(user.id),
-        "username": user.username or None,
-        "display_name": user.full_name or None,
-    }
-
-
-def build_owner_cover_updates(existing: dict, user: User, bot: Bot) -> dict[str, str]:
-    updates: dict[str, str] = {}
-    existing_owner_id = str(existing.get("owner_tg_user_id") or "").strip()
-    bot_id = str(bot.id)
-    if not existing_owner_id or existing_owner_id == bot_id:
-        updates["owner_tg_user_id"] = str(user.id)
-    existing_username = str(existing.get("owner_tg_username") or "").strip()
-    if (not existing_username or existing_owner_id == bot_id) and user.username:
-        updates["owner_tg_username"] = user.username
-    existing_display_name = str(existing.get("owner_display_name") or "").strip()
-    if (not existing_display_name or existing_owner_id == bot_id) and user.full_name:
-        updates["owner_display_name"] = user.full_name
-    return updates
-
-
-
-
-def _build_smartlink_fallback_text(smartlink: dict) -> str:
-    artist = smartlink.get("artist") or "Без артиста"
-    title = smartlink.get("title") or "Без названия"
-    links = smartlink.get("links") or {}
-
-    lines = [f"{artist} — {title}"]
-
-    if links:
-        lines.append("Ссылки:")
-        added_keys: set[str] = set()
-        for key, label in SMARTLINK_BUTTON_ORDER:
-            url = links.get(key)
-            if url:
-                lines.append(f"- {label}: {url}")
-                added_keys.add(key)
-        for key, url in links.items():
-            if key in added_keys:
-                continue
-            label = platform_label(key)
-            lines.append(f"- {label}: {url}")
-    else:
-        lines.append("Ссылки: —")
-
-    return "\n".join(lines)
-
-
-async def _send_smartlink_fallback(bot: Bot, chat_id: int, smartlink: dict):
-    fallback_text = _build_smartlink_fallback_text(smartlink)
-    return await bot.send_message(chat_id, fallback_text)
-
-
-def _smartlink_sanity_check():
-    dummy = {"id": 0, "links": {}}
-    try:
-        build_smartlink_buttons(dummy, subscribed=False, can_remind=False)
-    except Exception:
-        logger.exception("[smartlink] sanity check failed")
-
-
-
-HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
+from smartlink import (
+    build_smartlink_caption,
+    build_owner_payload,
+    build_owner_cover_updates,
+    _build_smartlink_fallback_text,
+    _send_smartlink_fallback,
+    _smartlink_sanity_check,
+    smartlink_step_prompt,
+    smartlinks_help_text,
+    build_smartlink_view_text,
+    build_my_smartlinks_text,
+    build_my_smartlinks_kb,
+    start_smartlink_form,
+    start_smartlink_import,
+    skip_prefilled_smartlink_steps,
+    log_smartlink_step,
+    refresh_smartlink_links_from_bandlink,
+    _send_smartlink_prompt,
+    _update_smartlink_prompt,
+    _update_prompt_message,
+    finalize_smartlink_form,
+    send_my_smartlinks,
+    send_smartlink_list,
+    show_smartlink_view,
+    resend_smartlink_card,
+    get_release_reminder_state,
+    _store_smartlink_message,
+    update_smartlink_message,
+    schedule_smartlink_update,
+    smartlink_publish_scheduler,
+    send_smartlink_photo,
+    fetch_my_smartlinks_from_index,
+    fetch_smartlink_from_index,
+    parse_page_marker,
+    parse_smartlink_callback_data,
+    extract_index_owner_tg_user_id,
+    extract_index_owner_fields,
+    normalize_index_smartlink,
+    smartlink_index_ready,
+    fetch_owned_smartlink_with_fallback,
+    fetch_owned_smartlink_by_smartlink_id,
+    fetch_owned_smartlink_from_index,
+    fetch_smartlink_by_id,
+    fetch_latest_smartlink_from_index,
+    update_smartlink_in_index,
+    confirm_smartlink_indexed,
+    sync_smartlink_to_web,
+    smartlink_slug_exists,
+    build_unique_smartlink_slugs,
+    build_smartlink_web_url,
+    build_cover_proxy_url,
+    build_copy_links_text,
+    _iter_smartlink_links,
+    build_smartlink_export_text,
+    pick_selected_metadata,
+    start_prefill_editor,
+    apply_spotify_upc_selection,
+    apply_caption_update,
+    fetch_cover_file,
+    maybe_upgrade_smartlink_cover_from_photo,
+    filter_human_sources,
+    show_import_confirmation,
+)
 
 
 async def ensure_user(tg_id: int, username: str | None = None):
@@ -298,25 +237,6 @@ async def ensure_user(tg_id: int, username: str | None = None):
 
 async def cycle_account_status(tg_id: int, key: str):
     return await db_cycle_account_status(tg_id, key, next_acc_status)
-
-
-def smartlink_step_prompt(step: int) -> str:
-    total = 5 + len(SMARTLINK_PLATFORMS)
-    if step == 0:
-        return f"🔗 Смартлинк. Шаг 1/{total}: артист? (можно «Пропустить»)."
-    if step == 1:
-        return f"Шаг 2/{total}: название трека? (можно «Пропустить»)."
-    if step == 2:
-        return f"Шаг 3/{total}: дата релиза (ДД.ММ.ГГГГ)? (можно «Пропустить»)."
-    if step == 3:
-        return f"Шаг 4/{total}: пришли обложку (фото). Можно «Пропустить»."
-    if step == 4:
-        return "✍️ Добавь короткий текст (необязательно). Отправь сообщением или нажми «Пропустить»."
-    idx = step - 5
-    if 0 <= idx < len(SMARTLINK_PLATFORMS):
-        label = SMARTLINK_PLATFORMS[idx][1]
-        return f"Шаг {step + 1}/{total}: ссылка на {label}? (можно «Пропустить»)."
-    return ""
 
 
 # -------------------- CONFIG --------------------
@@ -507,42 +427,7 @@ async def maybe_send_update_notice(message: Message, tg_id: int):
     await set_last_update_notified(tg_id, UPDATES_POST_URL)
 
 
-async def start_smartlink_form(
-    message: Message,
-    tg_id: int,
-    initial_links: dict[str, str] | None = None,
-    prefill: dict | None = None,
-):
-    data = {"links": initial_links or {}, "caption_text": "", "branding_disabled": False}
-    if prefill:
-        data.update(prefill)
-    step = skip_prefilled_smartlink_steps(0, data)
-    await form_start(tg_id, "smartlink")
-    await form_set(tg_id, step, data)
-
-    logger.info(
-        "[smartlink] wizard started tg_id=%s initial_step=%s prefilled=%s", tg_id, step, bool(prefill)
-    )
-
-    total_steps = 5 + len(SMARTLINK_PLATFORMS)
-    if step >= total_steps:
-        await finalize_smartlink_form(message, tg_id, data)
-        return
-
-    await _send_smartlink_prompt(message, tg_id, step, data)
-
-
-async def start_smartlink_import(message: Message, tg_id: int):
-    await form_start(tg_id, "smartlink_import")
-    await form_set(
-        tg_id,
-        0,
-        {"links": {}, "metadata": {}, "bandlink_help_shown": False, "low_links_hint_shown": False},
-    )
-    await message.answer(
-        SMARTLINK_IMPORT_PROMPT,
-        reply_markup=await user_menu_keyboard(tg_id),
-    )
+# start_smartlink_form and start_smartlink_import are imported from smartlink
 
 
 # HTTP API handlers вынесены в api.py
@@ -592,39 +477,43 @@ SUPPORT_DONATE_PRICE = 50
 DONATE_MIN_STARS = 10
 DONATE_MAX_STARS = 5000
 
+# All smartlink utility functions are imported from smartlink module
+
+async def get_spotify_access_token() -> str | None:
+    global _SPOTIFY_ACCESS_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
+
+    if not SPOTIFY_UPC_ENABLED:
+        return None
+
+    now = dt.datetime.utcnow()
+    if _SPOTIFY_ACCESS_TOKEN and _SPOTIFY_TOKEN_EXPIRES_AT and _SPOTIFY_TOKEN_EXPIRES_AT > now:
+        return _SPOTIFY_ACCESS_TOKEN
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                "https://accounts.spotify.com/api/token",
+                data={"grant_type": "client_credentials"},
+                auth=aiohttp.BasicAuth(SPOTIFY_CLIENT_ID or "", SPOTIFY_CLIENT_SECRET or ""),
+            ) as resp:
+                if resp.status >= 400:
+                    return None
+                payload = await resp.json()
+                token = payload.get("access_token")
+                expires_in = int(payload.get("expires_in", 3600))
+                if not token:
+                    return None
+                _SPOTIFY_ACCESS_TOKEN = token
+                _SPOTIFY_TOKEN_EXPIRES_AT = now + dt.timedelta(seconds=max(expires_in - 30, 0))
+                return token
+    except Exception:
+        return None
+
+    return None
 
 
-def smartlinks_help_text() -> str:
-    return SMARTLINKS_HELP_TEXT
-
-
-
-
-def build_smartlink_view_text(smartlink: dict) -> str:
-    artist = smartlink.get("artist") or "Без артиста"
-    title = smartlink.get("title") or "Без названия"
-    rd = parse_date(smartlink.get("release_date") or "")
-    lines = [f"{artist} — {title}"]
-    if rd:
-        lines.append(f"📅 {format_date_ru(rd)}")
-    return "\n".join(lines)
-
-
-def build_my_smartlinks_text(
-    items: list[dict], page: int, total_pages: int, start_index: int
-) -> str:
-    if not items:
-        return "У тебя пока нет смартлинков. Создай первый через «➕ Создать смарт-линк»."
-
-    lines = [f"📎 Мои смартлинки (страница {page + 1}/{total_pages})", ""]
-    for idx, item in enumerate(items, start=start_index + 1):
-        artist = item.get("artist") or "Без артиста"
-        title = item.get("title") or "Без названия"
-        lines.append(f"{idx}. {artist} — {title}")
-    return "\n".join(lines)
-
-
-def build_my_smartlinks_kb(
+async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
     items: list[dict], page: int, total_pages: int, start_index: int
 ) -> InlineKeyboardMarkup:
     inline: list[list[InlineKeyboardButton]] = []
