@@ -10,7 +10,7 @@ from config import (
     SMARTLINK_API_KEY,
     TOKEN,
 )
-from helpers import normalize_index_smartlink
+from smartlink import normalize_index_smartlink
 
 logger = logging.getLogger(__name__)
 
