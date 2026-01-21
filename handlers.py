@@ -39,7 +39,6 @@ from db import (
     get_last_update_notified,
     get_release_date,
     get_reminders_enabled,
-    get_release_reminder_state,
     get_tasks_state,
     get_updates_opt_in,
     get_updates_opt_in_users,
@@ -164,6 +163,7 @@ from smartlink import (
     merge_metadata,
     smartlink_step_prompt,
     smartlinks_help_text,
+    get_release_reminder_state,
 )
 from config import (
     ADMIN_TG_ID,
