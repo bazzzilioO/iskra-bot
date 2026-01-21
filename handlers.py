@@ -75,7 +75,6 @@ from keyboards import (
     ACCOUNTS,
     BRANDING_DISABLE_PRICE,
     EXPORT_UNLOCK_PRICE,
-    HELP,
     KEY_PLATFORM_SET,
     QC_PROMPTS,
     SMARTLINK_BUTTON_ORDER,
@@ -105,7 +104,9 @@ from keyboards import (
 from texts import (
     EXPERIENCE_PROMPT_TEXT,
     EXPECTATIONS_TEXT,
+    HELP,
     LYRICS_SYNC_TEXT,
+    QC_PROMPTS,
     RESOLVER_FALLBACK_TEXT,
     SMARTLINKS_HELP_TEXT,
     UGC_TIP_TEXT,
