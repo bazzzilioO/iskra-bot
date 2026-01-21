@@ -499,82 +499,6 @@ async def get_spotify_access_token() -> str | None:
             ) as resp:
                 if resp.status >= 400:
                     return None
-                    payload = await resp.json()
-                token = payload.get("access_token")
-                expires_in = int(payload.get("expires_in", 3600))
-                if not token:
-                    return None
-                _SPOTIFY_ACCESS_TOKEN = token
-                _SPOTIFY_TOKEN_EXPIRES_AT = now + dt.timedelta(seconds=max(expires_in - 30, 0))
-                return token
-                except Exception:
-        return None
-
-                    return None
-
-
-async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
-    token = await get_spotify_access_token()
-    if not token:
-        return []
-
-    timeout = aiohttp.ClientTimeout(total=10)
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {"q": f"upc:{upc}", "type": "album,track", "limit": 5}
-    candidates: list[dict[str, str]] = []
-    seen_urls: set[str] = set()
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                "https://api.spotify.com/v1/search", headers=headers, params=params
-            ) as resp:
-                if resp.status >= 400:
-                    return []
-                data = await resp.json()
-                for item_type in ("albums", "tracks"):
-                    items = data.get(item_type, {}).get("items", [])
-                    for item in items:
-                        url = item.get("external_urls", {}).get("spotify", "")
-                        if url and url not in seen_urls:
-                            seen_urls.add(url)
-                            candidates.append(
-                                {
-                                    "artist": ", ".join(
-                                        a.get("name", "") for a in item.get("artists", [])
-                                    ),
-                                    "title": item.get("name", ""),
-                                    "url": url,
-                                }
-                            )
-    except Exception:
-        pass
-
-    return candidates
-
-
-# All smartlink utility functions are imported from smartlink module
-
-async def get_spotify_access_token() -> str | None:
-    global _SPOTIFY_ACCESS_TOKEN, _SPOTIFY_TOKEN_EXPIRES_AT
-
-    if not SPOTIFY_UPC_ENABLED:
-        return None
-
-    now = dt.datetime.utcnow()
-    if _SPOTIFY_ACCESS_TOKEN and _SPOTIFY_TOKEN_EXPIRES_AT and _SPOTIFY_TOKEN_EXPIRES_AT > now:
-        return _SPOTIFY_ACCESS_TOKEN
-
-    timeout = aiohttp.ClientTimeout(total=10)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                "https://accounts.spotify.com/api/token",
-                data={"grant_type": "client_credentials"},
-                auth=aiohttp.BasicAuth(SPOTIFY_CLIENT_ID or "", SPOTIFY_CLIENT_SECRET or ""),
-            ) as resp:
-                if resp.status >= 400:
-                    return None
                 payload = await resp.json()
                 token = payload.get("access_token")
                 expires_in = int(payload.get("expires_in", 3600))
@@ -585,8 +509,6 @@ async def get_spotify_access_token() -> str | None:
                 return token
     except Exception:
         return None
-
-    return None
 
 
 async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
@@ -612,6 +534,7 @@ async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
         candidates.append({"artist": artist_names, "title": title, "spotify_url": url})
         seen_urls.add(url)
 
+    data = {}
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.get("https://api.spotify.com/v1/search", headers=headers, params=params) as resp:
