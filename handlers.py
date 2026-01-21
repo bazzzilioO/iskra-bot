@@ -69,6 +69,7 @@ from helpers import (
     get_smartlink_slugs,
     build_smartlink_id,
     build_smartlink_key,
+    parse_smartlink_key,
 )
 from keyboards import (
     ACCOUNTS,
@@ -130,12 +131,8 @@ from smartlink import (
     fetch_my_smartlinks_from_index,
     normalize_index_smartlink,
     update_smartlink_in_index,
-    parse_smartlink_key,
     parse_smartlink_callback_data,
     parse_page_marker,
-    get_smartlink_slugs,
-    build_smartlink_id,
-    build_smartlink_key,
     smartlink_can_remind,
     schedule_smartlink_update,
     send_smartlink_photo,
