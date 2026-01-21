@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime as dt
+from datetime import timezone
 import logging
 import re
 import smtplib
@@ -2377,7 +2378,7 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
     updates = {
         "cover_file_id": file_id,
         "cover_source": {"type": "telegram", "file_id": file_id},
-        "cover_updated_at": dt.datetime.utcnow().isoformat(),
+        "cover_updated_at": dt.datetime.now(timezone.utc).isoformat(),
     }
     updates.update(build_owner_cover_updates(latest, message.from_user, message.bot))
     artist_slug = (latest.get("artist_slug") or "").strip()
