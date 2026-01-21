@@ -20,7 +20,7 @@ from aiogram.exceptions import TelegramForbiddenError
 
 # Import dp from bot.py - handlers need it for decorators
 # This will be imported after bot.py creates dp, avoiding circular import issues
-from bot import dp
+from bot import dp, DONATE_MAX_STARS, DONATE_MIN_STARS
 
 logger = logging.getLogger(__name__)
 
@@ -74,8 +74,6 @@ from helpers import (
 from keyboards import (
     ACCOUNTS,
     BRANDING_DISABLE_PRICE,
-    DONATE_MAX_STARS,
-    DONATE_MIN_STARS,
     EXPORT_UNLOCK_PRICE,
     HELP,
     KEY_PLATFORM_SET,
@@ -164,8 +162,6 @@ from smartlink import (
 )
 from config import (
     ADMIN_TG_ID,
-    DONATE_MAX_STARS,
-    DONATE_MIN_STARS,
     EXPORT_UNLOCK_PRICE,
     LABEL_EMAIL,
     SMTP_APP_PASSWORD,
