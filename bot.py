@@ -22,8 +22,16 @@ import datetime as dt
 from datetime import timezone
 import time
 import traceback
+import sys
 from typing import IO
 from urllib.parse import parse_qsl, urlparse, urlunparse, urlencode
+
+# When running this file as a script (`python bot.py`), its module name is `__main__`.
+# Our `handlers.py` imports `bot`, which would otherwise load a *second* copy of this
+# module (as `bot`) and create a different `dp`, causing "Update is not handled".
+# This alias ensures `import bot` returns the running `__main__` module.
+if __name__ == "__main__":
+    sys.modules.setdefault("bot", sys.modules[__name__])
 
 import aiohttp
 from bs4 import BeautifulSoup
