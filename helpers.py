@@ -72,9 +72,6 @@ def normalize_base_url(base: str | None, default: str | None = DEFAULT_SMARTLINK
 
 
 SMARTLINK_WEB_BASE = normalize_base_url(os.getenv("SMARTLINK_WEB_BASE"), DEFAULT_SMARTLINK_BASE)
-CANONICAL_SMARTLINK_BASE = normalize_base_url(
-    os.getenv("SMARTLINK_CANONICAL_BASE"), DEFAULT_SMARTLINK_BASE
-)
 
 
 def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
@@ -88,51 +85,18 @@ def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
     return ""
 
 
-async def safe_edit_message(
-    target: Message,
-    *,
-    text: str | None = None,
-    caption: str | None = None,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    parse_mode: str | None = None,
-) -> Message | None:
-    if text is None and caption is None:
-        return None
+async def safe_edit(target: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> Message | None:
     try:
-        if caption is not None:
-            await target.edit_caption(caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
-        else:
-            await target.edit_text(text or "", reply_markup=reply_markup, parse_mode=parse_mode)
+        await target.edit_text(text, reply_markup=reply_markup)
         return target
     except TelegramBadRequest:
         return target
     except Exception as edit_err:
         try:
-            if caption is not None:
-                if target.photo:
-                    return await target.answer_photo(
-                        photo=target.photo[-1].file_id,
-                        caption=caption,
-                        reply_markup=reply_markup,
-                        parse_mode=parse_mode,
-                    )
-                return await target.answer(
-                    caption,
-                    reply_markup=reply_markup,
-                    parse_mode=parse_mode,
-                )
-            return await target.answer(text or "", reply_markup=reply_markup, parse_mode=parse_mode)
+            return await target.answer(text, reply_markup=reply_markup)
         except Exception as answer_err:
             logger.warning("[safe_edit] edit failed: %s; answer failed: %s", edit_err, answer_err)
             return None
-
-
-async def safe_edit(
-    target: Message,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> Message | None:
-    return await safe_edit_message(target, text=text, reply_markup=reply_markup)
 
 
 def parse_date(date_str: str) -> dt.date | None:
@@ -246,20 +210,6 @@ def get_smartlink_slugs(smartlink: dict) -> tuple[str, str]:
     slug = (smartlink or {}).get("slug") or slugify(title_raw) or "untitled"
 
     return artist_slug, slug
-
-
-def build_canonical_smartlink_url(artist_slug: str, slug: str) -> str:
-    if not artist_slug or not slug:
-        return ""
-    base = CANONICAL_SMARTLINK_BASE or DEFAULT_SMARTLINK_BASE
-    if not base:
-        return ""
-    return f"{base}/{artist_slug}/{slug}"
-
-
-def build_canonical_smartlink_url_from_smartlink(smartlink: dict) -> str:
-    artist_slug, slug = get_smartlink_slugs(smartlink)
-    return build_canonical_smartlink_url(artist_slug, slug)
 
 
 def build_smartlink_id(artist_slug: str, slug: str) -> str:

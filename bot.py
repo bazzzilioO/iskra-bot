@@ -1,4 +1,4 @@
-﻿# Table of contents
+# Table of contents
 # CONFIG/ENV
 # CONSTANTS
 # DB
@@ -117,6 +117,7 @@ from helpers import (
 from keyboards import (
     ACCOUNTS,
     BRANDING_DISABLE_PRICE,
+    EXPORT_LABELS,
     EXPORT_UNLOCK_PRICE,
     EXTRA_SMARTLINK_PLATFORMS,
     KEY_PLATFORM_SET,
@@ -164,7 +165,6 @@ from texts import (
     SMARTLINK_IMPORT_PROMPT,
     UGC_TIP_TEXT,
 )
-from smartlink_ui import build_copy_links_text, build_smartlink_export_text
 from scheduler import build_deadlines, reminder_scheduler
 from smartlink import (
     build_smartlink_caption,
@@ -1316,7 +1316,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
         raw_cover_url = data.get("cover_url") if isinstance(data.get("cover_url"), str) else ""
         cover_url = raw_cover_url.strip() if raw_cover_url and _is_valid_url(raw_cover_url.strip()) else ""
         metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-        artist_slug, slug, slug_collision = await build_unique_smartlink_slugs(
+        artist_slug, slug = await build_unique_smartlink_slugs(
             artist,
             title,
             owner_tg_user_id=tg_id,
@@ -1506,11 +1506,6 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
                 else f"🔄 Sync: fail (status={sync_status}, error={sync_error})"
             ),
         ]
-        if slug_collision:
-            summary_lines.append(
-                "⚠️ Название уже используется. Добавил уникальный хэш в ссылку. "
-                "Если нужен другой URL — измени название релиза."
-            )
         if sync_ok and not publish_ok:
             summary_lines.append(
                 "⚠️ Сохранено, но публикация в web не удалась. Повторяем автоматически."
@@ -1745,7 +1740,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
         artist_slug = (latest.get("artist_slug") or "").strip()
         slug = (latest.get("slug") or "").strip()
         if not artist_slug or not slug:
-            artist_slug, slug, _slug_collision = await build_unique_smartlink_slugs(
+            artist_slug, slug = await build_unique_smartlink_slugs(
                 latest.get("artist", ""),
                 latest.get("title", ""),
                 owner_tg_user_id=tg_id,
@@ -1767,7 +1762,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             artist_slug,
             slug,
             smartlink,
-            owner=build_owner_payload(message.from_user, existing=latest),
+            owner=build_owner_payload(message.from_user),
         )
         if not index_ok:
             logger.warning(
@@ -1808,7 +1803,7 @@ async def apply_caption_update(
         artist_slug,
         slug,
         updated_payload,
-        owner=build_owner_payload(message.from_user, existing=smartlink),
+        owner=build_owner_payload(message.from_user),
     )
     if not index_ok:
         logger.warning(
@@ -1837,6 +1832,77 @@ async def apply_caption_update(
 
 
 ATTRIBUTION_HTML = 'Создано с помощью <a href="https://t.me/iskramusic_bot">ИСКРА</a>'
+
+
+def build_copy_links_text(smartlink: dict) -> str:
+    artist = smartlink.get("artist") or ""
+    title = smartlink.get("title") or ""
+    links = smartlink.get("links") or {}
+
+    lines = [f"{artist} — {title}"]
+
+    link_lines: list[str] = []
+    for key, label in SMARTLINK_BUTTON_ORDER:
+        url = links.get(key)
+        if url:
+            display_label = "YouTube" if key == "youtube" else label
+            link_lines.append(f"{display_label}: {url}")
+
+    if link_lines:
+        lines.append("")
+        lines.extend(link_lines)
+
+    return "\n".join(lines)
+
+
+def _iter_smartlink_links(smartlink: dict) -> list[tuple[str, str]]:
+    links = smartlink.get("links") or {}
+    items: list[tuple[str, str]] = []
+    for key, _ in SMARTLINK_BUTTON_ORDER:
+        url = links.get(key)
+        if url:
+            items.append((key, url))
+    return items
+
+
+def _export_label(platform: str, variant: str) -> str:
+    order = {"tg": 0, "vk": 1, "universal": 2, "links": 3}
+    labels = EXPORT_LABELS.get(platform)
+    if labels and variant in order:
+        return labels[order[variant]]
+    return platform_label(platform)
+
+
+def build_smartlink_export_text(smartlink: dict, variant: str) -> str:
+    artist = smartlink.get("artist") or "Без артиста"
+    title = smartlink.get("title") or "Без названия"
+    items = [(platform, url, _export_label(platform, variant)) for platform, url in _iter_smartlink_links(smartlink)]
+
+    if variant == "tg":
+        lines = [f"{artist} — {title}"]
+        if items:
+            lines.append("▶️ Слушать:")
+            for _platform, url, label in items:
+                lines.append(f"{label} — {url}")
+        return "\n".join(lines)
+
+    if variant == "vk":
+        lines = [f"{artist} — {title}", "Новый релиз уже доступен 👇"]
+        for _platform, url, label in items:
+            lines.append(f"{label}: {url}")
+        return "\n".join(lines)
+
+    if variant == "universal":
+        lines = [f"{artist} — {title}", "Release links:"]
+        for _platform, url, label in items:
+            lines.append(f"- {label}: {url}")
+        return "\n".join(lines)
+
+    if variant == "links":
+        lines = [f"{label}: {url}" for _platform, url, label in items]
+        return "\n".join(lines) if lines else "Ссылок пока нет"
+
+    return ""
 
 
 async def get_release_reminder_state(tg_id: int, smartlink_id: int | str, allow_remind: bool) -> bool:
@@ -2401,3 +2467,7 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# TODO (PR-2): вынести повторяющиеся функции для формирования клавиатур и текстов
+# - unify safe_edit_caption с safe_edit через общий обработчик
+# - собрать общую функцию для экспорта смартлинков (copy/export)
