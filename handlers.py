@@ -93,7 +93,6 @@ from keyboards import (
     build_timeline_kb,
     get_task_title,
     next_acc_status,
-    platform_label,
     smartlink_branding_confirm_kb,
     smartlink_edit_menu_kb,
     smartlink_export_kb,
@@ -110,7 +109,6 @@ from texts import (
     RESOLVER_FALLBACK_TEXT,
     SMARTLINKS_HELP_TEXT,
     UGC_TIP_TEXT,
-    UPDATES_CHANNEL_URL,
 )
 from scheduler import build_deadlines
 from smartlink import (
@@ -159,15 +157,16 @@ from smartlink import (
     smartlink_step_prompt,
     smartlinks_help_text,
     get_release_reminder_state,
+    platform_label,
 )
 from config import (
     ADMIN_TG_ID,
-    EXPORT_UNLOCK_PRICE,
     LABEL_EMAIL,
     SMTP_APP_PASSWORD,
     SMTP_TO,
     SMTP_USER,
     SPOTIFY_UPC_ENABLED,
+    UPDATES_CHANNEL_URL,
     UPDATES_POST_URL,
 )
 
