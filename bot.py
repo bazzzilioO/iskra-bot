@@ -1196,11 +1196,11 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
     try:
         session = await get_http_session()
         async with session.post(url, headers=headers, json=payload) as resp:
-                status = resp.status
-                try:
-                    body = await resp.text()
-                except Exception:
-                    body = None
+            status = resp.status
+            try:
+                body = await resp.text()
+            except Exception:
+                body = None
         sanitized_body = _sanitize_body_for_logging(body)
         logger.info("[smartlink-index] worker response status=%s body=%s", status, sanitized_body)
         
