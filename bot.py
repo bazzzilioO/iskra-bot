@@ -1196,11 +1196,11 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
     try:
         session = await get_http_session()
         async with session.post(url, headers=headers, json=payload) as resp:
-            status = resp.status
-            try:
-                body = await resp.text()
-            except Exception:
-                body = None
+                status = resp.status
+                try:
+                    body = await resp.text()
+                except Exception:
+                    body = None
         sanitized_body = _sanitize_body_for_logging(body)
         logger.info("[smartlink-index] worker response status=%s body=%s", status, sanitized_body)
         
@@ -1212,7 +1212,7 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
         
         log_missing_index_token(status, body, "sync_smartlink_to_web")
         if 200 <= status < 300:
-            return True, status, None
+                    return True, status, None
         return False, status, sanitized_body
     except Exception as e:
         return False, None, str(e)
@@ -2388,9 +2388,7 @@ def validate_label_input(key: str, raw: str) -> tuple[bool, str | None, str | No
 # Import handlers after all functions are defined to avoid import errors
 try:
     import handlers  # noqa: F401 - registers all handlers with dp
-    # Log handler registration status
-    handler_count = sum(len(handlers) for handlers in dp.subscribers.values())
-    logger.info("Handlers module imported successfully, registered %d handler groups", handler_count)
+    logger.info("Handlers module imported successfully")
 except Exception as e:
     logger.error("Failed to import handlers module: %s", e, exc_info=True)
     raise
