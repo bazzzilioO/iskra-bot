@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import datetime as dt
+from datetime import timezone
 import time
 import traceback
 from typing import IO
@@ -485,7 +486,7 @@ async def get_spotify_access_token() -> str | None:
     if not SPOTIFY_UPC_ENABLED:
         return None
 
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(timezone.utc)
     if _SPOTIFY_ACCESS_TOKEN and _SPOTIFY_TOKEN_EXPIRES_AT and _SPOTIFY_TOKEN_EXPIRES_AT > now:
         return _SPOTIFY_ACCESS_TOKEN
 
@@ -1396,7 +1397,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "branding_disabled": bool(data.get("branding_disabled")),
             "artist_slug": artist_slug,
             "slug": slug,
-            "created_at": dt.datetime.utcnow().isoformat(),
+            "created_at": dt.datetime.now(timezone.utc).isoformat(),
             "cover_url": cover_url,
             "metadata": metadata,
             "cover_version": 1,
@@ -2078,7 +2079,7 @@ def schedule_smartlink_update(
 
 async def smartlink_publish_scheduler():
     while True:
-        now = dt.datetime.utcnow()
+        now = dt.datetime.now(timezone.utc)
         jobs = await list_due_smartlink_publish_jobs(now)
         for job in jobs:
             artist_slug = job.get("artist_slug") or ""

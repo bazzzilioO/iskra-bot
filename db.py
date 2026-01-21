@@ -1,4 +1,5 @@
 import datetime as dt
+from datetime import timezone
 import json
 import logging
 import os
@@ -511,7 +512,7 @@ async def enqueue_smartlink_publish_retry(
     delay_seconds: int,
     last_error: str | None,
 ) -> None:
-    now = dt.datetime.utcnow()
+    now = dt.datetime.now(timezone.utc)
     next_attempt_at = (now + dt.timedelta(seconds=delay_seconds)).isoformat()
     created_at = now.isoformat()
     smartlink_json = _serialize_json(smartlink)
@@ -594,7 +595,7 @@ async def update_smartlink_publish_job(
             SET attempt=?, next_attempt_at=?, last_error=?, updated_at=?
             WHERE id=?
             """,
-            (attempt, next_attempt_at.isoformat(), last_error, dt.datetime.utcnow().isoformat(), job_id),
+            (attempt, next_attempt_at.isoformat(), last_error, dt.datetime.now(timezone.utc).isoformat(), job_id),
         )
         await db.commit()
 
@@ -1079,8 +1080,8 @@ async def save_smartlink_message_reference(
                 message_id,
                 smartlink_id,
                 chat_id,
-                dt.datetime.utcnow().isoformat(),
-                dt.datetime.utcnow().isoformat(),
+                dt.datetime.now(timezone.utc).isoformat(),
+                dt.datetime.now(timezone.utc).isoformat(),
             ),
         )
         await db.commit()
@@ -1108,7 +1109,7 @@ async def add_smartlink_reminder(tg_id: int, smartlink_id: int | str) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "INSERT OR IGNORE INTO smartlink_reminders (smartlink_id, tg_id, created_at) VALUES (?, ?, ?)",
-            (smartlink_id, tg_id, dt.datetime.utcnow().isoformat()),
+            (smartlink_id, tg_id, dt.datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -1144,7 +1145,7 @@ async def mark_smartlink_reminder_sent(tg_id: int, smartlink_id: int | str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO smartlink_reminder_sends (smartlink_id, tg_id, sent_at) VALUES (?, ?, ?)",
-            (smartlink_id, tg_id, dt.datetime.utcnow().isoformat()),
+            (smartlink_id, tg_id, dt.datetime.now(timezone.utc).isoformat()),
         )
         await db.commit()
 

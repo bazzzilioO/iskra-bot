@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import datetime as dt
+from datetime import timezone
 import json
 import logging
 import traceback
@@ -1228,7 +1229,7 @@ def schedule_smartlink_update(
 
 async def smartlink_publish_scheduler():
     while True:
-        now = dt.datetime.utcnow()
+        now = dt.datetime.now(timezone.utc)
         jobs = await list_due_smartlink_publish_jobs(now)
         for job in jobs:
             artist_slug = job.get("artist_slug") or ""
@@ -1645,7 +1646,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             "branding_disabled": bool(data.get("branding_disabled")),
             "artist_slug": artist_slug,
             "slug": slug,
-            "created_at": dt.datetime.utcnow().isoformat(),
+            "created_at": dt.datetime.now(timezone.utc).isoformat(),
             "cover_url": cover_url,
             "metadata": metadata,
             "cover_version": 1,
@@ -2031,7 +2032,7 @@ async def maybe_upgrade_smartlink_cover_from_photo(message: Message) -> bool:
     updates = {
         "cover_file_id": file_id,
         "cover_source": {"type": "telegram", "file_id": file_id},
-        "cover_updated_at": dt.datetime.utcnow().isoformat(),
+        "cover_updated_at": dt.datetime.now(timezone.utc).isoformat(),
     }
     updates.update(build_owner_cover_updates(latest, message.from_user, message.bot))
     artist_slug = (latest.get("artist_slug") or "").strip()
