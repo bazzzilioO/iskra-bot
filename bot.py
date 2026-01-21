@@ -508,8 +508,8 @@ async def get_spotify_access_token() -> str | None:
                 _SPOTIFY_ACCESS_TOKEN = token
                 _SPOTIFY_TOKEN_EXPIRES_AT = now + dt.timedelta(seconds=max(expires_in - 30, 0))
                 return token
-    except Exception:
-    return None
+        except Exception:
+            return None
 
 
 async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
