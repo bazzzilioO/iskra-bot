@@ -27,7 +27,6 @@ from config import (
     SMARTLINK_WEB_BASE,
     SONGLINK_PLATFORM_ALIASES,
 )
-from keyboards import KEY_PLATFORM_SET
 from db import (
     count_owned_smartlinks,
     enqueue_smartlink_publish_retry,
