@@ -20,7 +20,15 @@ from aiogram.exceptions import TelegramForbiddenError
 
 # Import dp from bot.py - handlers need it for decorators
 # This will be imported after bot.py creates dp, avoiding circular import issues
-from bot import dp, DONATE_MAX_STARS, DONATE_MIN_STARS, spotify_search_upc
+from bot import (
+    dp,
+    DONATE_MAX_STARS,
+    DONATE_MIN_STARS,
+    spotify_search_upc,
+    detect_platform,
+    resolve_links,
+    merge_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -150,9 +158,6 @@ from smartlink import (
     fetch_cover_file,
     show_import_confirmation,
     pick_selected_metadata,
-    detect_platform,
-    resolve_links,
-    merge_metadata,
     smartlink_step_prompt,
     smartlinks_help_text,
     get_release_reminder_state,
