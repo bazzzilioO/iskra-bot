@@ -123,7 +123,7 @@ async def safe_edit_message(
                 )
             return await target.answer(text or "", reply_markup=reply_markup, parse_mode=parse_mode)
         except Exception as answer_err:
-            print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
+            logger.warning("[safe_edit] edit failed: %s; answer failed: %s", edit_err, answer_err)
             return None
 
 
@@ -173,17 +173,21 @@ def smartlink_can_remind(smartlink: dict) -> bool:
     return bool(rd and rd > dt.date.today() and smartlink.get("reminders_enabled", True))
 
 
-async def safe_edit_caption(
-    message: Message,
-    caption: str,
-    kb: InlineKeyboardMarkup | None,
-) -> Message | None:
-    return await safe_edit_message(
-        message,
-        caption=caption,
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
+async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMarkup | None) -> Message | None:
+    try:
+        await message.edit_caption(caption=caption, reply_markup=kb, parse_mode="HTML")
+        return message
+    except Exception as edit_err:
+        try:
+            return await message.answer_photo(
+                photo=message.photo[-1].file_id if message.photo else None,
+                caption=caption,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        except Exception as answer_err:
+            logger.warning("[safe_edit_caption] edit failed: %s; answer failed: %s", edit_err, answer_err)
+            return None
 
 
 _CYRILLIC_TRANSLIT_MAP = {

@@ -52,11 +52,6 @@ def build_deadlines(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
     return sorted(items, key=lambda x: x[2])
 
 
-def build_deadline_messages(release_date: dt.date) -> list[tuple[str, str, dt.date]]:
-    messages: list[tuple[str, str, dt.date]] = []
-    for key, title, d in build_deadlines(release_date):
-        messages.append((key, title, d))
-    return messages
 
 
 def smartlink_reminder_text(offset: int, artist: str, title: str) -> str:
@@ -137,7 +132,7 @@ async def process_reminders(bot: Bot):
         rd = parse_date(rd_s)
         if not rd:
             continue
-        deadlines = build_deadline_messages(rd)
+        deadlines = build_deadlines(rd)
         for key, title, ddate in deadlines:
             for when_label, send_date, prefix in (
                 ("pre2", ddate - dt.timedelta(days=2), "⏳ Через 2 дня дедлайн: " + title),
