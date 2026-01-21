@@ -76,7 +76,6 @@ from keyboards import (
     BRANDING_DISABLE_PRICE,
     EXPORT_UNLOCK_PRICE,
     KEY_PLATFORM_SET,
-    QC_PROMPTS,
     SMARTLINK_BUTTON_ORDER,
     SMARTLINK_PLATFORMS,
     build_accounts_checklist,
