@@ -661,6 +661,222 @@ async def spotify_search_upc(upc: str) -> list[dict]:
     return result
 
 
+# -------------------- UPC fallback (no Spotify keys) --------------------
+
+_MUSICBRAINZ_BASE = "https://musicbrainz.org/ws/2"
+_MUSICBRAINZ_MIN_DELAY_SECONDS = 1.1  # MusicBrainz asks clients to rate limit (1 req/sec)
+_musicbrainz_last_request_at: float | None = None
+_musicbrainz_lock = asyncio.Lock()
+
+
+def _musicbrainz_user_agent() -> str:
+    # MusicBrainz requests a real User-Agent identifying the app.
+    return "iskra-bot/1.2 (https://t.me/iskramusic_bot)"
+
+
+async def _musicbrainz_get_json(url: str, *, params: dict[str, str] | None = None) -> dict | None:
+    global _musicbrainz_last_request_at
+    async with _musicbrainz_lock:
+        now = time.monotonic()
+        if _musicbrainz_last_request_at is not None:
+            elapsed = now - _musicbrainz_last_request_at
+            if elapsed < _MUSICBRAINZ_MIN_DELAY_SECONDS:
+                await asyncio.sleep(_MUSICBRAINZ_MIN_DELAY_SECONDS - elapsed)
+        _musicbrainz_last_request_at = time.monotonic()
+
+    timeout = aiohttp.ClientTimeout(total=10)
+    headers = {"User-Agent": _musicbrainz_user_agent(), "Accept": "application/json"}
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status >= 400:
+                    return None
+                return await resp.json()
+    except Exception:
+        return None
+
+
+def _mb_artist_title_from_release(release: dict) -> tuple[str, str]:
+    title = str(release.get("title") or "").strip()
+    artist_credit = release.get("artist-credit")
+    if isinstance(artist_credit, list):
+        names: list[str] = []
+        for part in artist_credit:
+            if isinstance(part, dict):
+                name = part.get("name") or (part.get("artist") or {}).get("name")
+                if name:
+                    names.append(str(name).strip())
+        artist = ", ".join([n for n in names if n])
+    else:
+        artist = ""
+    return artist, title
+
+
+def _mb_release_type(release: dict) -> str:
+    rg = release.get("release-group") if isinstance(release.get("release-group"), dict) else {}
+    primary = str(rg.get("primary-type") or "").strip()
+    # MusicBrainz sometimes includes "secondary-types": ["Compilation", ...]
+    secondary = rg.get("secondary-types") if isinstance(rg.get("secondary-types"), list) else []
+    secondary_lower = {str(s or "").lower() for s in secondary}
+    if "compilation" in secondary_lower:
+        return "compilation"
+    return primary.lower() if primary else ""
+
+
+def _mb_score_candidate(release: dict) -> int:
+    score = 0
+    mb_score = release.get("score")
+    if isinstance(mb_score, int):
+        score += min(max(mb_score, 0), 100)  # 0..100
+
+    kind = _mb_release_type(release)
+    if kind == "single":
+        score += 30
+    elif kind == "album":
+        score += 20
+    elif kind == "compilation":
+        score -= 200
+
+    artist, title = _mb_artist_title_from_release(release)
+    if artist.strip().lower() == "various artists":
+        score -= 200
+    title_l = title.lower()
+    if "karaoke" in title_l or "tribute" in title_l:
+        score -= 50
+    return score
+
+
+async def musicbrainz_search_upc(upc: str) -> list[dict]:
+    digits = re.sub(r"\D", "", upc or "")
+    if not re.fullmatch(r"\d{12,14}", digits):
+        return []
+
+    url = f"{_MUSICBRAINZ_BASE}/release/"
+    payload = await _musicbrainz_get_json(
+        url,
+        params={
+            "query": f"barcode:{digits}",
+            "fmt": "json",
+            "limit": "12",
+        },
+    )
+    releases = payload.get("releases") if isinstance(payload, dict) else None
+    if not isinstance(releases, list) or not releases:
+        return []
+
+    raw: list[dict] = []
+    for r in releases:
+        if not isinstance(r, dict):
+            continue
+        mbid = str(r.get("id") or "").strip()
+        if not mbid:
+            continue
+        artist, title = _mb_artist_title_from_release(r)
+        if not title:
+            continue
+        raw.append(
+            {
+                "source": "musicbrainz",
+                "mbid": mbid,
+                "artist": artist,
+                "title": title,
+                "kind": _mb_release_type(r),
+                "release_date": str(r.get("date") or "").strip(),
+                "score": _mb_score_candidate(r),
+            }
+        )
+
+    if not raw:
+        return []
+
+    # Filter compilations if we have other options
+    non_comp = [c for c in raw if (c.get("kind") or "") != "compilation" and (c.get("artist") or "").lower().strip() != "various artists"]
+    pool = non_comp if non_comp else raw
+
+    # Dedupe by artist+title
+    def _norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9а-яё]+", "", (s or "").lower())
+
+    best: dict[str, dict] = {}
+    for c in pool:
+        key = f"{_norm(c.get('artist') or '')}|{_norm(c.get('title') or '')}"
+        prev = best.get(key)
+        if not prev or int(c.get("score") or 0) > int(prev.get("score") or 0):
+            best[key] = c
+
+    ranked = sorted(best.values(), key=lambda x: int(x.get("score") or 0), reverse=True)
+    return ranked[:5]
+
+
+async def musicbrainz_release_hints(mbid: str) -> dict:
+    mbid = str(mbid or "").strip()
+    if not mbid:
+        return {}
+    url = f"{_MUSICBRAINZ_BASE}/release/{mbid}"
+    payload = await _musicbrainz_get_json(
+        url,
+        params={"fmt": "json", "inc": "url-rels+artists+release-groups"},
+    )
+    if not isinstance(payload, dict):
+        return {}
+
+    rels = payload.get("relations") if isinstance(payload.get("relations"), list) else []
+    urls: list[str] = []
+    for rel in rels:
+        if not isinstance(rel, dict):
+            continue
+        u = rel.get("url")
+        if isinstance(u, dict):
+            href = u.get("resource")
+            if isinstance(href, str) and href.startswith("http"):
+                urls.append(href)
+
+    def pick_url() -> str:
+        priority_hosts = [
+            "open.spotify.com",
+            "music.apple.com",
+            "itunes.apple.com",
+            "music.yandex.",
+            "music.vk.",
+            "vk.com",
+            "band.link",
+        ]
+        for host in priority_hosts:
+            for u in urls:
+                if host in u:
+                    return u
+        return urls[0] if urls else ""
+
+    artist, title = _mb_artist_title_from_release(payload)
+    kind = _mb_release_type(payload)
+    cover_url = f"https://coverartarchive.org/release/{mbid}/front"
+    return {
+        "url_hint": pick_url(),
+        "cover_url": cover_url,
+        "artist": artist,
+        "title": title,
+        "kind": kind,
+        "release_date": str(payload.get("date") or "").strip(),
+        "source": "musicbrainz",
+        "mbid": mbid,
+    }
+
+
+async def upc_search_candidates(upc: str) -> list[dict]:
+    """Unified UPC search: Spotify when enabled, otherwise MusicBrainz fallback."""
+    digits = re.sub(r"\D", "", upc or "")
+    if not re.fullmatch(r"\d{12,14}", digits):
+        return []
+    if SPOTIFY_UPC_ENABLED:
+        items = await spotify_search_upc(digits)
+        # tag source so downstream can branch if needed
+        for it in items:
+            if isinstance(it, dict):
+                it.setdefault("source", "spotify")
+        return items
+    return await musicbrainz_search_upc(digits)
+
+
 def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str | None:
     # Common platforms (keep this single function; avoid duplicate definitions).
     if "band.link" in host:

@@ -2027,13 +2027,45 @@ async def start_prefill_editor(message: Message, tg_id: int, data: dict):
 
 async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: dict):
     """Apply Spotify UPC selection - lazy import to avoid circular dependencies."""
-    from bot import user_menu_keyboard, resolve_links
+    from bot import user_menu_keyboard, resolve_links, musicbrainz_release_hints
     
     await form_clear(tg_id)
 
-    spotify_url = candidate.get("spotify_url")
-    if not spotify_url:
-        await message.answer("Не нашёл ссылку Spotify для этого UPC.", reply_markup=await user_menu_keyboard(tg_id))
+    url_hint = (candidate.get("spotify_url") or candidate.get("url_hint") or candidate.get("url") or "").strip()
+    mbid = str(candidate.get("mbid") or "").strip()
+    mb_meta: dict | None = None
+    if not url_hint and mbid:
+        mb_meta = await musicbrainz_release_hints(mbid)
+        url_hint = str(mb_meta.get("url_hint") or "").strip()
+
+    if not url_hint:
+        # We have an identified candidate but no streaming URL hint. Start import flow and ask for one link.
+        artist = str(candidate.get("artist") or (mb_meta or {}).get("artist") or "").strip()
+        title = str(candidate.get("title") or (mb_meta or {}).get("title") or "").strip()
+        cover_url = str((mb_meta or {}).get("cover_url") or "").strip()
+        metadata = {
+            "artist": artist,
+            "title": title,
+            "cover_url": cover_url,
+            "source_platform": "musicbrainz",
+            "preferred_source": "musicbrainz",
+            "sources": {"musicbrainz": {"artist": artist, "title": title, "cover_url": cover_url, "mbid": mbid}},
+            "conflict": False,
+        }
+        await form_start(
+            tg_id,
+            "smartlink_import",
+        )
+        await form_set(
+            tg_id,
+            0,
+            {"links": {}, "metadata": metadata, "bandlink_help_shown": False, "low_links_hint_shown": False},
+        )
+        await message.answer(
+            "Нашёл релиз по UPC (MusicBrainz), но не вижу ссылок на стриминги.\n"
+            "Пришли одну ссылку на релиз (Spotify/Apple/Яндекс/VK или BandLink) — я подтяну остальные.",
+            reply_markup=await user_menu_keyboard(tg_id),
+        )
         return
 
     await message.answer(
@@ -2041,13 +2073,27 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
         reply_markup=await user_menu_keyboard(tg_id),
     )
     try:
-        links, metadata = await resolve_links(spotify_url)
+        links, metadata = await resolve_links(url_hint)
     except Exception as e:
         logger.warning("[smartlink-upc] resolve_links failed: %s", e)
         links, metadata = {}, {}
 
     if links:
         # Reuse import confirmation UX so user can review/adjust metadata before saving.
+        # If we also have MusicBrainz metadata, merge it in (as an additional source).
+        if mb_meta and isinstance(metadata, dict):
+            sources = metadata.get("sources") if isinstance(metadata.get("sources"), dict) else {}
+            mb_sources = {"musicbrainz": {"artist": mb_meta.get("artist", ""), "title": mb_meta.get("title", ""), "cover_url": mb_meta.get("cover_url", ""), "mbid": mbid}}
+            sources = {**sources, **mb_sources}
+            metadata["sources"] = sources
+            metadata.setdefault("preferred_source", metadata.get("preferred_source") or "musicbrainz")
+            metadata.setdefault("source_platform", metadata.get("source_platform") or "musicbrainz")
+            if not metadata.get("artist") and mb_meta.get("artist"):
+                metadata["artist"] = mb_meta.get("artist")
+            if not metadata.get("title") and mb_meta.get("title"):
+                metadata["title"] = mb_meta.get("title")
+            if not metadata.get("cover_url") and mb_meta.get("cover_url"):
+                metadata["cover_url"] = mb_meta.get("cover_url")
         latest = await fetch_latest_smartlink_from_index(tg_id)
         await show_import_confirmation(message, tg_id, links, metadata or {}, latest=latest)
         return
@@ -2057,7 +2103,9 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
         "Давай заполним смартлинк: ссылка на Spotify уже подставлена.",
         reply_markup=await user_menu_keyboard(tg_id),
     )
-    await start_smartlink_form(message, tg_id, initial_links={"spotify": spotify_url})
+    # Fallback: still prefill with the found URL (if it's Spotify) so user can continue manually.
+    initial_links = {"spotify": url_hint} if "open.spotify.com" in url_hint else {}
+    await start_smartlink_form(message, tg_id, initial_links=initial_links)
 
 
 async def apply_caption_update(

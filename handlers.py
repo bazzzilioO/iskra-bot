@@ -25,7 +25,7 @@ from bot import (
     dp,
     DONATE_MAX_STARS,
     DONATE_MIN_STARS,
-    spotify_search_upc,
+    upc_search_candidates,
     detect_platform,
     resolve_links,
     merge_metadata,
@@ -170,7 +170,6 @@ from config import (
     SMTP_APP_PASSWORD,
     SMTP_TO,
     SMTP_USER,
-    SPOTIFY_UPC_ENABLED,
     UPDATES_CHANNEL_URL,
     UPDATES_POST_URL,
 )
@@ -1625,8 +1624,7 @@ async def smartlink_open_cb(callback):
     existing = await fetch_latest_smartlink_from_index(tg_id)
     if not existing:
         inline_keyboard = []
-        if SPOTIFY_UPC_ENABLED:
-            inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
+        inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
         inline_keyboard.extend([
             [InlineKeyboardButton(text="⚡ Импорт по ссылке", callback_data="smartlink:import")],
             [InlineKeyboardButton(text="✏️ Создать вручную", callback_data="smartlink:new")],
@@ -1642,8 +1640,7 @@ async def smartlink_open_cb(callback):
     await send_smartlink_photo(callback.message.bot, tg_id, existing, subscribed=subscribed, allow_remind=allow_remind)
 
     inline_keyboard = []
-    if SPOTIFY_UPC_ENABLED:
-        inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
+    inline_keyboard.append([InlineKeyboardButton(text="⚡ Автозаполнение по UPC", callback_data="smartlink:upc")])
     inline_keyboard.extend([
         [InlineKeyboardButton(text="⚡ Импорт по ссылке", callback_data="smartlink:import")],
         [InlineKeyboardButton(text="✏️ Обновить", callback_data="smartlink:new")],
@@ -1668,13 +1665,10 @@ async def smartlink_upc_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
 
-    if not SPOTIFY_UPC_ENABLED:
-        await callback.answer("Не задан SPOTIFY_CLIENT_ID/SECRET", show_alert=True)
-        return
-
     await form_start(tg_id, "smartlink_upc")
     await callback.message.answer(
-        "⚡ Автозаполнение по UPC. Пришли UPC (12–14 цифр).\n\n(Отмена: /cancel)",
+        "⚡ Автозаполнение по UPC. Пришли UPC (12–14 цифр).\n"
+        "Если Spotify ключей нет — попробую через MusicBrainz.\n\n(Отмена: /cancel)",
         reply_markup=await user_menu_keyboard(tg_id),
     )
     await callback.answer()
@@ -2439,12 +2433,12 @@ async def any_message_router(message: Message):
         # Allow sending UPC directly without pressing the "Автозаполнение по UPC" button.
         # This is the most common flow when UPC comes from a distributor.
         digits = re.sub(r"\D", "", txt)
-        if SPOTIFY_UPC_ENABLED and re.fullmatch(r"\d{12,14}", digits):
+        if re.fullmatch(r"\d{12,14}", digits):
             await form_start(tg_id, "smartlink_upc")
-            results = await spotify_search_upc(digits)
+            results = await upc_search_candidates(digits)
             if not results:
                 await message.answer(
-                    "Не нашёл релиз по этому UPC в Spotify. "
+                    "Не нашёл релиз по этому UPC. "
                     "Попробуй BandLink или пришли ссылку на релиз (Spotify/Apple/Яндекс/VK).",
                     reply_markup=await user_menu_keyboard(tg_id),
                 )
@@ -2533,10 +2527,10 @@ async def any_message_router(message: Message):
             )
             return
 
-        results = await spotify_search_upc(digits)
+        results = await upc_search_candidates(digits)
         if not results:
             await message.answer(
-                "Не нашёл, попробуй BandLink или вставь ссылки вручную. Можешь прислать другой UPC.",
+                "Не нашёл релиз по UPC. Попробуй BandLink/ссылку на релиз или пришли другой UPC.",
                 reply_markup=await user_menu_keyboard(tg_id),
             )
             return
@@ -2579,15 +2573,15 @@ async def any_message_router(message: Message):
         # Allow UPC input during "import by link" flow.
         # Users often paste UPC from a distributor instead of a URL.
         digits = re.sub(r"\D", "", txt)
-        if SPOTIFY_UPC_ENABLED and re.fullmatch(r"\d{12,14}", digits):
+        if re.fullmatch(r"\d{12,14}", digits):
             # Switch to UPC flow (reuses existing callbacks and resolve pipeline)
             await form_clear(tg_id)
             await form_start(tg_id, "smartlink_upc")
 
-            results = await spotify_search_upc(digits)
+            results = await upc_search_candidates(digits)
             if not results:
                 await message.answer(
-                    "Не нашёл релиз по этому UPC в Spotify. "
+                    "Не нашёл релиз по этому UPC. "
                     "Можешь прислать ссылку на релиз (Spotify/Apple/Яндекс/VK) или BandLink.",
                     reply_markup=await user_menu_keyboard(tg_id),
                 )
