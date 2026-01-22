@@ -1999,7 +1999,8 @@ async def smartlink_skip_cb(callback):
             await _send_smartlink_prompt(callback.message, tg_id, next_step, data)
         else:
             await form_set(tg_id, next_step, data)
-            await finalize_smartlink_form(callback.message, tg_id, data)
+            # callback.message is a bot message (from_user == bot), so pass the real user explicitly
+            await finalize_smartlink_form(callback.message, tg_id, data, owner_user=callback.from_user)
         await callback.answer("Пропустил")
         return
 
@@ -2778,7 +2779,7 @@ async def any_message_router(message: Message):
             return
 
         await form_set(tg_id, step, data)
-        await finalize_smartlink_form(message, tg_id, data)
+        await finalize_smartlink_form(message, tg_id, data, owner_user=message.from_user)
         return
 
     if form_name == "smartlink_prefill_edit":
