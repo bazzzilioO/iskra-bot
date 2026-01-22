@@ -2520,9 +2520,34 @@ async def any_message_router(message: Message):
 
     if form_name == "smartlink_upc":
         digits = re.sub(r"\D", "", txt)
+        # UX: user may paste a streaming URL while being in UPC mode.
+        # Treat it as "import by link" instead of rejecting it.
+        if re.match(r"https?://", txt):
+            await form_clear(tg_id)
+            await message.answer(
+                "Ок, принял ссылку. Пытаюсь найти релиз по ней…\n\n(Отмена: /cancel)",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            try:
+                links, metadata = await resolve_links(txt)
+            except Exception as e:
+                logger.warning("[smartlink-import] resolve_links failed in upc flow: %s", e)
+                links, metadata = {}, {}
+
+            if not links:
+                await message.answer(
+                    "Не смог найти площадки по этой ссылке. Попробуй BandLink или пришли другую ссылку.",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
+
+            latest = await fetch_latest_smartlink_from_index(tg_id)
+            await show_import_confirmation(message, tg_id, links, metadata or {}, latest=latest)
+            return
+
         if not re.fullmatch(r"\d{12,14}", digits):
             await message.answer(
-                "Нужен UPC: 12–14 цифр. Пришли номер ещё раз.\n\n(Отмена: /cancel)",
+                "Нужен UPC: 12–14 цифр (или пришли ссылку на релиз).\n\n(Отмена: /cancel)",
                 reply_markup=await user_menu_keyboard(tg_id),
             )
             return
