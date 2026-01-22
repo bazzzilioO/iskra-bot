@@ -852,6 +852,7 @@ async def musicbrainz_release_hints(mbid: str) -> dict:
     cover_url = f"https://coverartarchive.org/release/{mbid}/front"
     return {
         "url_hint": pick_url(),
+        "urls": urls,
         "cover_url": cover_url,
         "artist": artist,
         "title": title,
@@ -860,6 +861,81 @@ async def musicbrainz_release_hints(mbid: str) -> dict:
         "source": "musicbrainz",
         "mbid": mbid,
     }
+
+
+async def musicbrainz_search_release(artist: str, title: str) -> list[dict]:
+    """Search MusicBrainz releases by artist+title (best-effort, rate-limited)."""
+    artist = str(artist or "").strip()
+    title = str(title or "").strip()
+    if not (artist or title):
+        return []
+
+    def _score(artist_a: str, title_a: str, artist_b: str, title_b: str, mb_score: int | None) -> int:
+        score = 0
+        if isinstance(mb_score, int):
+            score += min(max(mb_score, 0), 100)
+        a1 = normalize_meta_value(artist_a)
+        t1 = normalize_meta_value(title_a)
+        a2 = normalize_meta_value(artist_b)
+        t2 = normalize_meta_value(title_b)
+        if a1 and a2 and a1 == a2:
+            score += 80
+        elif a1 and a2 and (a1 in a2 or a2 in a1):
+            score += 40
+        if t1 and t2 and t1 == t2:
+            score += 90
+        elif t1 and t2 and (t1 in t2 or t2 in t1):
+            score += 50
+        return score
+
+    # Release search tends to work well for singles too; we keep it simple.
+    query_parts: list[str] = []
+    if artist:
+        query_parts.append(f'artist:"{artist}"')
+    if title:
+        # Use release title primarily; recordings can be found via release anyway in most cases.
+        query_parts.append(f'release:"{title}"')
+    query = " AND ".join(query_parts) if query_parts else title
+
+    payload = await _musicbrainz_get_json(
+        f"{_MUSICBRAINZ_BASE}/release/",
+        params={"query": query, "fmt": "json", "limit": "12"},
+    )
+    releases = payload.get("releases") if isinstance(payload, dict) else None
+    if not isinstance(releases, list) or not releases:
+        return []
+
+    raw: list[dict] = []
+    for r in releases:
+        if not isinstance(r, dict):
+            continue
+        mbid = str(r.get("id") or "").strip()
+        if not mbid:
+            continue
+        r_artist, r_title = _mb_artist_title_from_release(r)
+        if not r_title:
+            continue
+        raw.append(
+            {
+                "source": "musicbrainz",
+                "mbid": mbid,
+                "artist": r_artist,
+                "title": r_title,
+                "kind": _mb_release_type(r),
+                "release_date": str(r.get("date") or "").strip(),
+                "score": _score(artist, title, r_artist, r_title, r.get("score") if isinstance(r.get("score"), int) else None),
+            }
+        )
+
+    if not raw:
+        return []
+
+    # Prefer non-compilations
+    non_comp = [c for c in raw if (c.get("kind") or "") != "compilation" and (c.get("artist") or "").lower().strip() != "various artists"]
+    pool = non_comp if non_comp else raw
+
+    ranked = sorted(pool, key=lambda x: int(x.get("score") or 0), reverse=True)
+    return ranked[:3]
 
 
 async def upc_search_candidates(upc: str) -> list[dict]:
@@ -975,6 +1051,7 @@ HUMAN_METADATA_PLATFORMS = {
     "youtubemusic",
     "zvuk",
     "kion",
+    "musicbrainz",
 }
 
 
@@ -1717,6 +1794,21 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
             meta_title = str((metadata or {}).get("title") or "").strip()
         except Exception:
             meta_artist, meta_title = "", ""
+
+        # MusicBrainz enrichment: if we have artist/title but few platforms, fetch URL relations
+        # and feed them into the link set (these become additional seeds for cross-resolve).
+        if meta_artist and meta_title and len(links) < 6 and "musicbrainz" not in (metadata or {}).get("sources", {}):
+            mb_candidates = await musicbrainz_search_release(meta_artist, meta_title)
+            if mb_candidates:
+                mbid = str((mb_candidates[0] or {}).get("mbid") or "").strip()
+                if mbid:
+                    mb_meta = await musicbrainz_release_hints(mbid)
+                    # Add relation URLs as links where possible
+                    for u in (mb_meta.get("urls") if isinstance(mb_meta, dict) else []) or []:
+                        normalized_u, platform = normalize_music_url_with_platform(str(u), None)
+                        if platform and normalized_u and platform not in links:
+                            links[platform] = normalized_u
+                    metadata = merge_metadata(metadata, {"sources": {"musicbrainz": {"artist": mb_meta.get("artist", ""), "title": mb_meta.get("title", ""), "cover_url": mb_meta.get("cover_url", ""), "release_date": mb_meta.get("release_date", ""), "mbid": mbid}}, "artist": mb_meta.get("artist", ""), "title": mb_meta.get("title", ""), "cover_url": mb_meta.get("cover_url", ""), "release_date": mb_meta.get("release_date", ""), "preferred_source": (metadata or {}).get("preferred_source") or "musicbrainz", "source_platform": (metadata or {}).get("source_platform") or "musicbrainz"})
 
         if meta_artist and meta_title and len(links) < 6:
             before = len(links)
