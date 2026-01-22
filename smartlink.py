@@ -1398,6 +1398,7 @@ async def send_smartlink_photo(
             page=page,
             web_url=web_url,
             can_update_web=is_admin,
+            include_tech=False,
         )
     except Exception:
         logger.exception("[smartlink] render failed smartlink_id=%s", smartlink.get("id"))

@@ -399,9 +399,7 @@ def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
     smartlink_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug)
-    rows = [
-        [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_key}:{page}")],
-    ]
+    rows = [[InlineKeyboardButton(text="🔗 Открыть карточку", callback_data=f"smartlinks:open:{smartlink_key}:{page}")]]
     if smartlink_id:
         rows.append(
             [
@@ -411,6 +409,9 @@ def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
                 )
             ]
         )
+    # If BandLink is present, allow refreshing platforms from it.
+    if (smartlink.get("links") or {}).get("bandlink"):
+        rows.append([InlineKeyboardButton(text="🔄 Обновить ссылки (BandLink)", callback_data=f"smartlinks:refresh:{smartlink_key}:{page}")])
     rows.extend(
         [
             [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink_key}")],
@@ -562,6 +563,7 @@ def build_smartlink_buttons(
     page: int | None = None,
     web_url: str | None = None,
     can_update_web: bool = False,
+    include_tech: bool = True,
 ) -> InlineKeyboardMarkup | None:
     rows: list[list[InlineKeyboardButton]] = []
     links = smartlink.get("links") or {}
@@ -588,6 +590,11 @@ def build_smartlink_buttons(
 
     if web_url:
         rows.append([InlineKeyboardButton(text="🌐 Открыть web", url=web_url)])
+
+    # Keep the smartlink card clean for sharing: technical buttons can be accessed via the
+    # "📎 Мои смартлинки" menu (smartlink_view_kb) / edit menu.
+    if not include_tech:
+        return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
     if can_update_web:
         rows.append(
@@ -626,6 +633,7 @@ def build_smartlink_keyboard(
     page: int | None = None,
     web_url: str | None = None,
     can_update_web: bool = False,
+    include_tech: bool = True,
 ) -> InlineKeyboardMarkup | None:
     return build_smartlink_buttons(
         smartlink,
@@ -634,6 +642,7 @@ def build_smartlink_keyboard(
         page=page,
         web_url=web_url,
         can_update_web=can_update_web,
+        include_tech=include_tech,
     )
 
 
