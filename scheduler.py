@@ -26,7 +26,13 @@ from db import (
 )
 from helpers import normalize_base_url, parse_date, parse_smartlink_id, get_smartlink_slugs, build_smartlink_id
 
-SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
+SMARTLINK_API_KEY = (
+    os.getenv("SMARTLINK_API_KEY")
+    or os.getenv("GO_API_KEY")
+    or os.getenv("GO_API_TOKEN")
+    or os.getenv("SMARTLINK_INDEX_TOKEN")
+    or os.getenv("SMARTLINK_TOKEN")
+)
 SMARTLINK_INDEX_BASE = normalize_base_url(
     os.getenv("SMARTLINK_INDEX_BASE") or os.getenv("GO_INDEX_BASE"),
 )
