@@ -1213,12 +1213,91 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
 
         return {"og_title": og_title, "og_image": og_image}
 
+    def _yandex_cover_url(cover_uri: str) -> str:
+        cover_uri = (cover_uri or "").strip()
+        if not cover_uri:
+            return ""
+        # Yandex uses "%%" placeholder for size.
+        cover_uri = cover_uri.replace("%%", "600x600")
+        if cover_uri.startswith("http://") or cover_uri.startswith("https://"):
+            return cover_uri
+        return f"https://{cover_uri.lstrip('/')}"
+
+    def _extract_yandex_ids(target_url: str) -> tuple[str, str]:
+        """Return (album_id, track_id) if present in /album/{a}/track/{t}."""
+        try:
+            parsed = urlparse(target_url)
+            path = parsed.path or ""
+        except Exception:
+            return "", ""
+        m = re.search(r"/album/(\d+)/track/(\d+)", path)
+        if not m:
+            return "", ""
+        return m.group(1), m.group(2)
+
+    async def yandex_meta_from_handler(target_url: str) -> dict | None:
+        album_id, track_id = _extract_yandex_ids(target_url)
+        if not track_id:
+            return None
+        headers = {"User-Agent": BANDLINK_USER_AGENT, "Accept": "application/json"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get("https://music.yandex.ru/handlers/track.jsx", params={"track": track_id}) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+        except Exception:
+            return None
+
+        track = data.get("track") or {}
+        title = str(track.get("title") or "").strip()
+        artists = track.get("artists") or data.get("artists") or []
+        artist = ""
+        if isinstance(artists, list) and artists:
+            artist = str((artists[0] or {}).get("name") or "").strip()
+
+        cover_uri = str(track.get("coverUri") or "")
+        if not cover_uri:
+            albums = track.get("albums") or data.get("alsoInAlbums") or []
+            if isinstance(albums, list) and albums:
+                cover_uri = str((albums[0] or {}).get("coverUri") or "")
+        cover_url = _yandex_cover_url(cover_uri)
+
+        release_date_raw = ""
+        albums = track.get("albums") or data.get("alsoInAlbums") or []
+        if isinstance(albums, list) and albums:
+            release_date_raw = str((albums[0] or {}).get("releaseDate") or "")
+        release_date = release_date_raw.split("T", 1)[0].strip() if release_date_raw else ""
+
+        if not (artist or title or cover_url):
+            return None
+
+        meta_candidates = {
+            "artist": artist,
+            "title": title,
+            "cover_url": cover_url,
+            "release_date": release_date,
+            "yandex_track_id": str(track_id),
+            "yandex_album_id": str(album_id) if album_id else "",
+        }
+        return {
+            "artist": artist,
+            "title": title,
+            "cover_url": cover_url,
+            "release_date": release_date,
+            "source_platform": "yandex",
+            "preferred_source": "yandex",
+            "sources": {"yandex": meta_candidates},
+            "conflict": False,
+        }
+
     async def yandex_meta_from_url(target_url: str) -> dict | None:
         meta = await fetch_open_graph_meta(target_url)
         og_title = (meta.get("og_title") or "").strip()
         og_image = (meta.get("og_image") or "").strip()
         if not og_title and not og_image:
-            return None
+            # If HTML/OG is unavailable (often geo-blocked), try JSON handlers by ids from URL.
+            return await yandex_meta_from_handler(target_url)
 
         artist = ""
         title = ""
@@ -1245,12 +1324,13 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
             "cover_url": og_image,
         }
         if not any(meta_candidates.values()):
-            return None
+            return await yandex_meta_from_handler(target_url)
 
         return {
             "artist": artist,
             "title": title,
             "cover_url": og_image,
+            "release_date": "",
             "source_platform": "yandex",
             "preferred_source": "yandex",
             "sources": {"yandex": meta_candidates},
@@ -1604,6 +1684,7 @@ def merge_metadata(existing: dict | None, new: dict | None) -> dict:
     merged["artist"] = new.get("artist") or value_from_sources("artist")
     merged["title"] = new.get("title") or value_from_sources("title")
     merged["cover_url"] = new.get("cover_url") or value_from_sources("cover_url")
+    merged["release_date"] = new.get("release_date") or value_from_sources("release_date")
 
     return merged
 
