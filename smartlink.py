@@ -38,6 +38,7 @@ from db import (
     delete_smartlink_publish_job,
     fetch_owned_smartlink_by_id,
     fetch_owned_smartlink_from_d1,
+    upsert_owned_smartlink_to_d1,
     is_smartlink_reminder_set,
     is_smartlink_subscribed,
     save_smartlink_message_reference,
@@ -1746,6 +1747,14 @@ async def finalize_smartlink_form(
             "metadata": metadata,
             "cover_version": 1,
         }
+
+        local_saved = await upsert_owned_smartlink_to_d1(smartlink)
+        if not local_saved:
+            logger.warning(
+                "[smartlink] local save failed (D1) tg_id=%s smartlink_id=%s",
+                tg_id,
+                smartlink_id,
+            )
         sync_payload = build_smartlink_index_payload(smartlink)
         if sync_payload:
             sync_ok, sync_status, sync_error = await sync_smartlink_to_web(sync_payload)
@@ -1838,8 +1847,10 @@ async def finalize_smartlink_form(
             web_status = f"🌐 Web: {web_url}"
         elif sync_ok and publish_ok and not confirm_ok:
             web_status = "🌐 Web: опубликовано, индекс обновляется (до 30 сек)"
+
+        created_status = "Смартлинк создан ✅" if local_saved else "Смартлинк создан ⚠️ (не удалось сохранить локально)"
         summary_lines = [
-            "Смартлинк готов ✅" if sync_ok else "Смартлинк не сохранён ❌",
+            created_status,
             f"Артист: {artist or '—'}",
             f"Релиз: {title or '—'}",
             f"Дата: {rd_text if rd_text else '—'}",
@@ -1851,6 +1862,11 @@ async def finalize_smartlink_form(
                 else f"🔄 Sync: fail (status={sync_status}, error={sync_error})"
             ),
         ]
+        if (not sync_ok) and sync_error and "GO_INDEX_BASE" in str(sync_error):
+            summary_lines.append(
+                "⚠️ Web-публикация недоступна: на сервисе go не настроен GO_INDEX_BASE. "
+                "Карточка и ссылки в боте сохранены, но web-ссылка не появится, пока не настроите переменные."
+            )
         if sync_ok and not publish_ok:
             summary_lines.append(
                 "⚠️ Сохранено, но публикация в web не удалась. Повторяем автоматически."
@@ -1994,11 +2010,16 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             "slug": slug,
             "id": build_smartlink_id(artist_slug, slug),
         }
+        owner_payload = (
+            build_owner_payload(message.from_user)
+            if message.from_user
+            else {"tg_user_id": str(tg_id)}
+        )
         index_ok, status, error = await update_smartlink_in_index(
             artist_slug,
             slug,
             smartlink,
-                owner=build_owner_payload(resolved_owner_user) if resolved_owner_user else {"tg_user_id": str(tg_id)},
+            owner=owner_payload,
         )
         if not index_ok:
             logger.warning(

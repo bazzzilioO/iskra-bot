@@ -13,6 +13,8 @@ SMARTLINK_D1_PATH = (
     os.getenv("SMARTLINK_D1_PATH")
     or os.getenv("SMARTLINK_D1_DB")
     or os.getenv("SMARTLINK_DB_PATH")
+    # Fallback to main DB so smartlinks still persist even if a separate D1 path isn't configured.
+    or DB_PATH
 )
 DEFAULT_TIMEZONE = "Europe/Moscow"
 DEFAULT_REMINDER_OFFSETS = "-7,-1,0,7"
@@ -334,6 +336,37 @@ async def list_owned_smartlinks(
         if not db:
             return None
         try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smartlinks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_tg_user_id TEXT NOT NULL,
+                    owner_tg_username TEXT,
+                    owner_display_name TEXT,
+                    artist_slug TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    artist TEXT,
+                    artist_name TEXT,
+                    title TEXT,
+                    release_date TEXT,
+                    cover_file_id TEXT,
+                    cover_url TEXT,
+                    cover_version INTEGER,
+                    caption_text TEXT,
+                    branding_disabled INTEGER,
+                    branding_paid INTEGER,
+                    pre_save_enabled INTEGER,
+                    reminders_enabled INTEGER,
+                    links_json TEXT,
+                    cover_source_json TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    cover_updated_at TEXT,
+                    UNIQUE(owner_tg_user_id, artist_slug, slug)
+                )
+                """
+            )
             query = (
                 "SELECT * FROM smartlinks WHERE owner_tg_user_id=? "
                 "ORDER BY updated_at DESC LIMIT ? OFFSET ?"
@@ -364,6 +397,37 @@ async def count_owned_smartlinks(owner_tg_user_id: int | str) -> int | None:
         if not db:
             return None
         try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smartlinks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_tg_user_id TEXT NOT NULL,
+                    owner_tg_username TEXT,
+                    owner_display_name TEXT,
+                    artist_slug TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    artist TEXT,
+                    artist_name TEXT,
+                    title TEXT,
+                    release_date TEXT,
+                    cover_file_id TEXT,
+                    cover_url TEXT,
+                    cover_version INTEGER,
+                    caption_text TEXT,
+                    branding_disabled INTEGER,
+                    branding_paid INTEGER,
+                    pre_save_enabled INTEGER,
+                    reminders_enabled INTEGER,
+                    links_json TEXT,
+                    cover_source_json TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    cover_updated_at TEXT,
+                    UNIQUE(owner_tg_user_id, artist_slug, slug)
+                )
+                """
+            )
             query = "SELECT COUNT(1) FROM smartlinks WHERE owner_tg_user_id=?"
             logger.info(
                 "[smartlink-d1] count query=%s tg_id=%s",
@@ -400,6 +464,37 @@ async def fetch_owned_smartlink_from_d1(
         if not db:
             return None
         try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smartlinks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_tg_user_id TEXT NOT NULL,
+                    owner_tg_username TEXT,
+                    owner_display_name TEXT,
+                    artist_slug TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    artist TEXT,
+                    artist_name TEXT,
+                    title TEXT,
+                    release_date TEXT,
+                    cover_file_id TEXT,
+                    cover_url TEXT,
+                    cover_version INTEGER,
+                    caption_text TEXT,
+                    branding_disabled INTEGER,
+                    branding_paid INTEGER,
+                    pre_save_enabled INTEGER,
+                    reminders_enabled INTEGER,
+                    links_json TEXT,
+                    cover_source_json TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    cover_updated_at TEXT,
+                    UNIQUE(owner_tg_user_id, artist_slug, slug)
+                )
+                """
+            )
             query = """
                 SELECT * FROM smartlinks
                 WHERE owner_tg_user_id=? AND artist_slug=? AND slug=?
@@ -442,6 +537,37 @@ async def fetch_owned_smartlink_by_id(
         if not db:
             return None
         try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smartlinks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_tg_user_id TEXT NOT NULL,
+                    owner_tg_username TEXT,
+                    owner_display_name TEXT,
+                    artist_slug TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    artist TEXT,
+                    artist_name TEXT,
+                    title TEXT,
+                    release_date TEXT,
+                    cover_file_id TEXT,
+                    cover_url TEXT,
+                    cover_version INTEGER,
+                    caption_text TEXT,
+                    branding_disabled INTEGER,
+                    branding_paid INTEGER,
+                    pre_save_enabled INTEGER,
+                    reminders_enabled INTEGER,
+                    links_json TEXT,
+                    cover_source_json TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    cover_updated_at TEXT,
+                    UNIQUE(owner_tg_user_id, artist_slug, slug)
+                )
+                """
+            )
             query = """
                 SELECT * FROM smartlinks
                 WHERE id=? AND owner_tg_user_id=?
@@ -477,6 +603,38 @@ async def list_recent_smartlinks(limit: int) -> list[dict] | None:
         if not db:
             return None
         try:
+            # Ensure schema exists (for bot.db fallback and fresh deployments).
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smartlinks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_tg_user_id TEXT NOT NULL,
+                    owner_tg_username TEXT,
+                    owner_display_name TEXT,
+                    artist_slug TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    artist TEXT,
+                    artist_name TEXT,
+                    title TEXT,
+                    release_date TEXT,
+                    cover_file_id TEXT,
+                    cover_url TEXT,
+                    cover_version INTEGER,
+                    caption_text TEXT,
+                    branding_disabled INTEGER,
+                    branding_paid INTEGER,
+                    pre_save_enabled INTEGER,
+                    reminders_enabled INTEGER,
+                    links_json TEXT,
+                    cover_source_json TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    cover_updated_at TEXT,
+                    UNIQUE(owner_tg_user_id, artist_slug, slug)
+                )
+                """
+            )
             cur = await db.execute("PRAGMA table_info(smartlinks)")
             rows = await cur.fetchall()
             columns = {row[1] for row in rows}
@@ -501,6 +659,128 @@ def _serialize_json(payload: dict | None) -> str | None:
     if payload is None:
         return None
     return json.dumps(payload, ensure_ascii=False)
+
+
+async def upsert_owned_smartlink_to_d1(smartlink: dict) -> bool:
+    """Upsert a smartlink into local D1 (sqlite) store.
+
+    This is a resilience layer: even if the remote Index/Web publish fails,
+    the user should still be able to see and manage their smartlinks.
+    """
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return False
+
+        owner_tg_user_id = str(smartlink.get("owner_tg_user_id") or "").strip()
+        artist_slug = str(smartlink.get("artist_slug") or "").strip()
+        slug = str(smartlink.get("slug") or "").strip()
+        if not owner_tg_user_id or not artist_slug or not slug:
+            logger.warning(
+                "[smartlink-d1] upsert skipped (missing owner/slugs) owner=%s artist_slug=%s slug=%s",
+                owner_tg_user_id,
+                artist_slug,
+                slug,
+            )
+            return False
+
+        try:
+            cur = await db.execute("PRAGMA table_info(smartlinks)")
+            rows = await cur.fetchall()
+            columns = {row[1] for row in rows}
+
+            now_iso = dt.datetime.now(timezone.utc).isoformat()
+
+            links_json = _serialize_json(
+                smartlink.get("links") if isinstance(smartlink.get("links"), dict) else {}
+            )
+            cover_source_json = _serialize_json(
+                smartlink.get("cover_source")
+                if isinstance(smartlink.get("cover_source"), dict)
+                else {}
+            )
+            metadata_json = _serialize_json(
+                smartlink.get("metadata") if isinstance(smartlink.get("metadata"), dict) else {}
+            )
+
+            value_map: dict[str, object] = {
+                "owner_tg_user_id": owner_tg_user_id,
+                "owner_tg_username": smartlink.get("owner_tg_username") or None,
+                "owner_display_name": smartlink.get("owner_display_name") or None,
+                "artist_slug": artist_slug,
+                "slug": slug,
+                "artist": smartlink.get("artist") or None,
+                "artist_name": smartlink.get("artist_name") or None,
+                "title": smartlink.get("title") or None,
+                "release_date": smartlink.get("release_date") or None,
+                "cover_file_id": smartlink.get("cover_file_id") or None,
+                "cover_url": smartlink.get("cover_url") or None,
+                "cover_version": int(smartlink.get("cover_version") or 1),
+                "caption_text": smartlink.get("caption_text") or None,
+                "branding_disabled": 1 if smartlink.get("branding_disabled") else 0,
+                "branding_paid": 1 if smartlink.get("branding_paid") else 0,
+                "pre_save_enabled": 1 if smartlink.get("pre_save_enabled", True) else 0,
+                "reminders_enabled": 1 if smartlink.get("reminders_enabled", True) else 0,
+                "links_json": links_json,
+                "cover_source_json": cover_source_json,
+                "metadata_json": metadata_json,
+                "created_at": smartlink.get("created_at") or now_iso,
+                "updated_at": now_iso,
+                "cover_updated_at": smartlink.get("cover_updated_at") or None,
+            }
+
+            update_cols = [c for c in value_map.keys() if c in columns and c != "created_at"]
+            insert_cols = [c for c in value_map.keys() if c in columns]
+
+            if not insert_cols:
+                logger.warning(
+                    "[smartlink-d1] upsert skipped (unsupported schema) columns=%s",
+                    sorted(columns),
+                )
+                return False
+
+            if update_cols:
+                update_set = ", ".join(f"{c}=?" for c in update_cols)
+                update_values = [value_map[c] for c in update_cols]
+                update_query = (
+                    f"UPDATE smartlinks SET {update_set} "
+                    "WHERE owner_tg_user_id=? AND artist_slug=? AND slug=?"
+                )
+                cur = await db.execute(
+                    update_query,
+                    (*update_values, owner_tg_user_id, artist_slug, slug),
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    await db.commit()
+                    logger.info(
+                        "[smartlink-d1] upsert updated owner=%s artist_slug=%s slug=%s",
+                        owner_tg_user_id,
+                        artist_slug,
+                        slug,
+                    )
+                    return True
+
+            insert_cols_sql = ", ".join(insert_cols)
+            insert_placeholders = ", ".join("?" for _ in insert_cols)
+            insert_values = [value_map[c] for c in insert_cols]
+            insert_query = f"INSERT INTO smartlinks ({insert_cols_sql}) VALUES ({insert_placeholders})"
+            await db.execute(insert_query, insert_values)
+            await db.commit()
+            logger.info(
+                "[smartlink-d1] upsert inserted owner=%s artist_slug=%s slug=%s",
+                owner_tg_user_id,
+                artist_slug,
+                slug,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[smartlink-d1] upsert failed owner=%s artist_slug=%s slug=%s",
+                owner_tg_user_id,
+                artist_slug,
+                slug,
+            )
+            return False
+
 
 
 async def enqueue_smartlink_publish_retry(

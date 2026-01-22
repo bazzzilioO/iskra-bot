@@ -1205,24 +1205,25 @@ async def sync_smartlink_to_web(payload: dict) -> tuple[bool, int | None, str | 
     try:
         session = await get_http_session()
         async with session.post(url, headers=headers, json=payload) as resp:
-                status = resp.status
-                try:
-                    body = await resp.text()
-                except Exception:
-                    body = None
-        sanitized_body = _sanitize_body_for_logging(body)
-        logger.info("[smartlink-index] worker response status=%s body=%s", status, sanitized_body)
-        
-        # Обработка Rate Limit
-        if is_rate_limited_response(status, body):
-            logger.warning("[smartlink-index] rate limited by Cloudflare during sync")
-            await set_rate_limit_cooldown()
-            return False, 429, "rate_limit"
-        
-        log_missing_index_token(status, body, "sync_smartlink_to_web")
-        if 200 <= status < 300:
-                    return True, status, None
-        return False, status, sanitized_body
+            status = resp.status
+            try:
+                body = await resp.text()
+            except Exception:
+                body = None
+
+            sanitized_body = _sanitize_body_for_logging(body)
+            logger.info("[smartlink-index] worker response status=%s body=%s", status, sanitized_body)
+
+            # Обработка Rate Limit
+            if is_rate_limited_response(status, body):
+                logger.warning("[smartlink-index] rate limited by Cloudflare during sync")
+                await set_rate_limit_cooldown()
+                return False, 429, "rate_limit"
+
+            log_missing_index_token(status, body, "sync_smartlink_to_web")
+            if 200 <= status < 300:
+                return True, status, None
+            return False, status, sanitized_body
     except Exception as e:
         return False, None, str(e)
 
