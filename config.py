@@ -27,7 +27,14 @@ POLLING_BACKOFF_CONFIG = BackoffConfig(
 )
 
 # Smartlink
-SMARTLINK_API_KEY = os.getenv("SMARTLINK_API_KEY")
+SMARTLINK_API_KEY = (
+    os.getenv("SMARTLINK_API_KEY")
+    # Backward/alternate env var names (to avoid silent 401s when deploying)
+    or os.getenv("GO_API_KEY")
+    or os.getenv("GO_API_TOKEN")
+    or os.getenv("SMARTLINK_INDEX_TOKEN")
+    or os.getenv("SMARTLINK_TOKEN")
+)
 SMARTLINK_INDEX_BASE = normalize_base_url(
     os.getenv("SMARTLINK_INDEX_BASE") or os.getenv("GO_INDEX_BASE"),
     None,

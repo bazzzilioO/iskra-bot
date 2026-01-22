@@ -1328,6 +1328,15 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
         limit=MY_SMARTLINKS_PAGE_SIZE,
     )
     if not ok or items is None:
+        # Helpful diagnostics: in production D1 may be disabled and Index may require an API key
+        if not SMARTLINK_INDEX_BASE or not SMARTLINK_API_KEY:
+            await message.answer(
+                "⚠️ Смартлинки сейчас не настроены: нет доступа к индексу (SMARTLINK_INDEX_BASE/SMARTLINK_API_KEY) "
+                "и нет локальной D1 (SMARTLINK_D1_PATH). Если ты разворачиваешь бота на Railway — добавь эти переменные "
+                "в окружение и перезапусти сервис.",
+                reply_markup=smartlinks_menu_kb(),
+            )
+            # Continue to attempt D1 fallback below (may still work)
         fallback_count = await count_owned_smartlinks(tg_id)
         fallback_items = await list_owned_smartlinks(
             tg_id,

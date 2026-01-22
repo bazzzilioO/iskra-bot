@@ -404,7 +404,13 @@ async def push_smartlink_to_index(
 ) -> tuple[bool, int | None, str | None]:
     base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), None)
     index_url = f"{base_url}/api/index/upsert"
-    api_key = os.getenv("SMARTLINK_API_KEY")
+    api_key = (
+        os.getenv("SMARTLINK_API_KEY")
+        or os.getenv("GO_API_KEY")
+        or os.getenv("GO_API_TOKEN")
+        or os.getenv("SMARTLINK_INDEX_TOKEN")
+        or os.getenv("SMARTLINK_TOKEN")
+    )
     if not base_url:
         logger.info("[smartlink-index] index url is not configured, skipping")
         return False, None, "config_missing"
