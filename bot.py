@@ -563,19 +563,15 @@ async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
 
 
 def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str | None:
+    # Common platforms (keep this single function; avoid duplicate definitions).
     if "band.link" in host:
         return "bandlink"
-    if host.startswith("music.yandex.") and ("/track/" in path or "/album/" in path):
+    if host.startswith("music.yandex.") and ("/track/" in path or "/album/" in path or "/artist/" in path):
         return "yandex"
     if host == "open.spotify.com":
         return "spotify"
     if host == "music.apple.com":
         return "apple"
-
-
-# All smartlink utility functions are imported from smartlink module - duplicates removed
-
-def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str | None:
     if host == "itunes.apple.com":
         return "itunes"
     if host in {"music.vk.com", "music.vk.ru"}:
