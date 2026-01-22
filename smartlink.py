@@ -2299,7 +2299,7 @@ async def show_import_confirmation(
     # Never fall back to latest smartlink for artist/title: that can silently create a wrong release.
     artist = selected_meta.get("artist") or ""
     title = selected_meta.get("title") or ""
-    release_date = (latest.get("release_date") or "") if latest else ""
+    release_date = selected_meta.get("release_date") or ((latest.get("release_date") or "") if latest else "")
     caption_text = (latest.get("caption_text") or "") if latest else ""
     # Avoid reusing latest cover (it may belong to another release).
     cover_file_id = ""
