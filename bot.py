@@ -964,7 +964,18 @@ def normalize_meta_value(value: str | None) -> str:
 
 # Platforms where metadata is typically human-facing/usable for prefill (avoid noisy/low-signal sources).
 # Kept in sync with `smartlink.py`.
-HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
+HUMAN_METADATA_PLATFORMS = {
+    "apple",
+    "itunes",
+    "spotify",
+    "yandex",
+    "vk",
+    "deezer",
+    "youtube",
+    "youtubemusic",
+    "zvuk",
+    "kion",
+}
 
 
 def filter_human_sources(sources: dict[str, dict]) -> dict[str, dict]:
@@ -1130,6 +1141,39 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     timeout = aiohttp.ClientTimeout(total=10)
     normalized_input_url, _ = normalize_music_url_with_platform(url)
 
+    def _artwork_upscale(artwork_url: str) -> str:
+        if not artwork_url:
+            return ""
+        # iTunes artwork often ends with ".../100x100bb.jpg" or contains "100x100".
+        # Replace with a larger size.
+        return (
+            artwork_url.replace("100x100bb", "1000x1000bb")
+            .replace("100x100", "1000x1000")
+            .replace("200x200", "1000x1000")
+            .replace("600x600", "1000x1000")
+        )
+
+    def _score_candidate(artist_a: str, title_a: str, artist_b: str, title_b: str) -> int:
+        a1 = normalize_meta_value(artist_a)
+        t1 = normalize_meta_value(title_a)
+        a2 = normalize_meta_value(artist_b)
+        t2 = normalize_meta_value(title_b)
+        score = 0
+        if a1 and a2 and a1 == a2:
+            score += 60
+        elif a1 and a2 and (a1 in a2 or a2 in a1):
+            score += 35
+        if t1 and t2 and t1 == t2:
+            score += 70
+        elif t1 and t2 and (t1 in t2 or t2 in t1):
+            score += 45
+        if score == 0 and (artist_a or title_a) and (artist_b or title_b):
+            # weak fallback: partial substring on raw strings
+            raw = f"{artist_b} {title_b}".lower()
+            if artist_a.lower() in raw or title_a.lower() in raw:
+                score += 15
+        return score
+
     async def fetch_open_graph_meta(target_url: str) -> dict[str, str]:
         """Fetch and parse OpenGraph title/image from a page."""
         headers = {
@@ -1212,6 +1256,152 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
             "sources": {"yandex": meta_candidates},
             "conflict": False,
         }
+
+    async def itunes_search_track(artist: str, title: str) -> tuple[dict[str, str], dict | None]:
+        """Best-effort Apple/iTunes lookup without auth keys."""
+        term = " ".join([p for p in [artist.strip(), title.strip()] if p]).strip()
+        if not term:
+            return {}, None
+        params = {
+            "term": term,
+            "media": "music",
+            "entity": "song",
+            "limit": "10",
+        }
+        headers = {"User-Agent": BANDLINK_USER_AGENT}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get("https://itunes.apple.com/search", params=params) as resp:
+                    if resp.status != 200:
+                        return {}, None
+                    data = await resp.json()
+        except Exception:
+            return {}, None
+
+        results = data.get("results") or []
+        best = None
+        best_score = -1
+        for item in results:
+            item_artist = str(item.get("artistName") or "")
+            item_title = str(item.get("trackName") or item.get("collectionName") or "")
+            score = _score_candidate(artist, title, item_artist, item_title)
+            if score > best_score:
+                best_score = score
+                best = item
+
+        if not best or best_score < 45:
+            return {}, None
+
+        track_url = str(best.get("trackViewUrl") or "").strip()
+        cover_url = _artwork_upscale(str(best.get("artworkUrl100") or best.get("artworkUrl60") or ""))
+
+        links: dict[str, str] = {}
+        normalized_track, platform = normalize_music_url_with_platform(track_url)
+        if normalized_track and platform:
+            links[platform] = normalized_track
+            # If Apple Music URL is provided, it effectively covers "itunes" use-cases too.
+            if platform == "apple" and "itunes" not in links:
+                links["itunes"] = normalized_track
+            if platform == "itunes" and "apple" not in links:
+                links["apple"] = normalized_track
+
+        meta_platform = "apple" if "apple" in links else ("itunes" if "itunes" in links else "apple")
+        meta = {
+            "artist": str(best.get("artistName") or "").strip(),
+            "title": str(best.get("trackName") or best.get("collectionName") or "").strip(),
+            "cover_url": cover_url,
+            "source_platform": meta_platform,
+            "preferred_source": meta_platform,
+            "sources": {meta_platform: {"artist": str(best.get("artistName") or "").strip(), "title": str(best.get("trackName") or "").strip(), "cover_url": cover_url}},
+            "conflict": False,
+        }
+        return links, meta
+
+    async def deezer_search_track(artist: str, title: str) -> tuple[dict[str, str], dict | None]:
+        term = " ".join([p for p in [artist.strip(), title.strip()] if p]).strip()
+        if not term:
+            return {}, None
+        q = f'artist:"{artist.strip()}" track:"{title.strip()}"' if artist.strip() and title.strip() else term
+        headers = {"User-Agent": BANDLINK_USER_AGENT}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get("https://api.deezer.com/search", params={"q": q, "limit": "10"}) as resp:
+                    if resp.status != 200:
+                        return {}, None
+                    data = await resp.json()
+        except Exception:
+            return {}, None
+
+        items = data.get("data") or []
+        best = None
+        best_score = -1
+        for item in items:
+            item_artist = str((item.get("artist") or {}).get("name") or "")
+            item_title = str(item.get("title") or "")
+            score = _score_candidate(artist, title, item_artist, item_title)
+            if score > best_score:
+                best_score = score
+                best = item
+
+        if not best or best_score < 45:
+            return {}, None
+
+        link = str(best.get("link") or "").strip()
+        cover_url = str(((best.get("album") or {}).get("cover_xl") or (best.get("album") or {}).get("cover_big") or "")).strip()
+        normalized, platform = normalize_music_url_with_platform(link, "deezer")
+        links = {"deezer": normalized} if normalized else {}
+        meta = {
+            "artist": str(((best.get("artist") or {}).get("name") or "")).strip(),
+            "title": str(best.get("title") or "").strip(),
+            "cover_url": cover_url,
+            "source_platform": "deezer",
+            "preferred_source": "deezer",
+            "sources": {"deezer": {"artist": str(((best.get("artist") or {}).get("name") or "")).strip(), "title": str(best.get("title") or "").strip(), "cover_url": cover_url}},
+            "conflict": False,
+        }
+        return links, meta
+
+    async def youtube_search_track(artist: str, title: str) -> tuple[dict[str, str], dict | None]:
+        term = " ".join([p for p in [artist.strip(), title.strip()] if p]).strip()
+        if not term:
+            return {}, None
+        query = f"{term} audio"
+        headers = {"User-Agent": BANDLINK_USER_AGENT, "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"}
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get("https://www.youtube.com/results", params={"search_query": query}) as resp:
+                    if resp.status != 200:
+                        return {}, None
+                    text = await resp.text()
+        except Exception:
+            return {}, None
+
+        # Extract first videoId from HTML payload.
+        ids = re.findall(r"\"videoId\":\"([a-zA-Z0-9_-]{11})\"", text or "")
+        video_id = next((i for i in ids if i), "")
+        if not video_id:
+            return {}, None
+
+        yt_url = f"https://www.youtube.com/watch?v={video_id}"
+        ytm_url = f"https://music.youtube.com/watch?v={video_id}"
+        links = {}
+        normalized_yt, _ = normalize_music_url_with_platform(yt_url, "youtube")
+        normalized_ytm, _ = normalize_music_url_with_platform(ytm_url, "youtubemusic")
+        if normalized_yt:
+            links["youtube"] = normalized_yt
+        if normalized_ytm:
+            links["youtubemusic"] = normalized_ytm
+
+        meta = {
+            "artist": artist.strip(),
+            "title": title.strip(),
+            "cover_url": "",
+            "source_platform": "youtube",
+            "preferred_source": "youtube",
+            "sources": {"youtube": {"artist": artist.strip(), "title": title.strip(), "cover_url": ""}},
+            "conflict": False,
+        }
+        return links, meta
 
     async def resolve_via_songlink(target_url: str) -> tuple[dict[str, str], dict | None]:
         def collect(platforms: dict, acc: dict[str, str]):
@@ -1343,6 +1533,35 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
                         before,
                         after,
                     )
+
+        # If we still have too few platforms but have usable metadata, try public fallback searches.
+        try:
+            meta_artist = str((metadata or {}).get("artist") or "").strip()
+            meta_title = str((metadata or {}).get("title") or "").strip()
+        except Exception:
+            meta_artist, meta_title = "", ""
+
+        if meta_artist and meta_title and len(links) < 6:
+            before = len(links)
+
+            if "apple" not in links and "itunes" not in links:
+                a_links, a_meta = await itunes_search_track(meta_artist, meta_title)
+                links.update(a_links)
+                metadata = merge_metadata(metadata, a_meta)
+
+            if "deezer" not in links:
+                d_links, d_meta = await deezer_search_track(meta_artist, meta_title)
+                links.update(d_links)
+                metadata = merge_metadata(metadata, d_meta)
+
+            if "youtube" not in links and "youtubemusic" not in links:
+                y_links, y_meta = await youtube_search_track(meta_artist, meta_title)
+                links.update(y_links)
+                metadata = merge_metadata(metadata, y_meta)
+
+            after = len(links)
+            if after > before:
+                logger.info("[resolve] enriched platforms via public search before=%d after=%d", before, after)
 
     if detected and normalized_input_url:
         platform_key = SONGLINK_PLATFORM_ALIASES.get(detected, detected)
