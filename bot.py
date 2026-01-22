@@ -1130,6 +1130,89 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     timeout = aiohttp.ClientTimeout(total=10)
     normalized_input_url, _ = normalize_music_url_with_platform(url)
 
+    async def fetch_open_graph_meta(target_url: str) -> dict[str, str]:
+        """Fetch and parse OpenGraph title/image from a page."""
+        headers = {
+            "User-Agent": BANDLINK_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Cache-Control": "no-cache",
+        }
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(target_url, allow_redirects=True) as resp:
+                    if resp.status >= 400:
+                        return {}
+                    html_text = await resp.text()
+        except Exception:
+            return {}
+
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        og_title = ""
+        og_image = ""
+
+        tag = soup.find("meta", attrs={"property": "og:title"})
+        if tag and tag.get("content"):
+            og_title = str(tag.get("content") or "").strip()
+        if not og_title:
+            tag = soup.find("meta", attrs={"name": "twitter:title"})
+            if tag and tag.get("content"):
+                og_title = str(tag.get("content") or "").strip()
+
+        tag = soup.find("meta", attrs={"property": "og:image"})
+        if tag and tag.get("content"):
+            og_image = str(tag.get("content") or "").strip()
+        if not og_image:
+            tag = soup.find("meta", attrs={"name": "twitter:image"})
+            if tag and tag.get("content"):
+                og_image = str(tag.get("content") or "").strip()
+
+        return {"og_title": og_title, "og_image": og_image}
+
+    async def yandex_meta_from_url(target_url: str) -> dict | None:
+        meta = await fetch_open_graph_meta(target_url)
+        og_title = (meta.get("og_title") or "").strip()
+        og_image = (meta.get("og_image") or "").strip()
+        if not og_title and not og_image:
+            return None
+
+        artist = ""
+        title = ""
+        # Heuristic: many pages use "Track — Artist" or "Artist — Track"
+        if " — " in og_title:
+            a, b = [p.strip() for p in og_title.split(" — ", 1)]
+            # Prefer the shorter side as artist in most cases (artist names are often shorter than track titles)
+            if len(a) <= len(b):
+                artist, title = a, b
+            else:
+                title, artist = a, b
+        elif " - " in og_title:
+            a, b = [p.strip() for p in og_title.split(" - ", 1)]
+            if len(a) <= len(b):
+                artist, title = a, b
+            else:
+                title, artist = a, b
+        else:
+            title = og_title
+
+        meta_candidates = {
+            "artist": artist,
+            "title": title,
+            "cover_url": og_image,
+        }
+        if not any(meta_candidates.values()):
+            return None
+
+        return {
+            "artist": artist,
+            "title": title,
+            "cover_url": og_image,
+            "source_platform": "yandex",
+            "preferred_source": "yandex",
+            "sources": {"yandex": meta_candidates},
+            "conflict": False,
+        }
+
     async def resolve_via_songlink() -> tuple[dict[str, str], dict | None]:
         def collect(platforms: dict, acc: dict[str, str]):
             for platform_key, info in (platforms or {}).items():
@@ -1238,6 +1321,12 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
         song_links, song_meta = await resolve_via_songlink()
         links.update(song_links)
         metadata = merge_metadata(metadata, song_meta)
+
+        # song.link часто не умеет в Яндекс и возвращает только исходный URL без метаданных.
+        # Поэтому добираем артиста/название/обложку прямо со страницы.
+        if detected == "yandex":
+            y_meta = await yandex_meta_from_url(url)
+            metadata = merge_metadata(metadata, y_meta)
 
     if detected and normalized_input_url:
         platform_key = SONGLINK_PLATFORM_ALIASES.get(detected, detected)

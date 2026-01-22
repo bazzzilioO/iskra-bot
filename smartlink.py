@@ -2285,11 +2285,13 @@ async def show_import_confirmation(
         preferred_source = next(iter(sources.keys()))
     selected_meta = sources.get(preferred_source, metadata or {}) if metadata else {}
 
-    artist = selected_meta.get("artist") or (latest.get("artist") if latest else "")
-    title = selected_meta.get("title") or (latest.get("title") if latest else "")
+    # Never fall back to latest smartlink for artist/title: that can silently create a wrong release.
+    artist = selected_meta.get("artist") or ""
+    title = selected_meta.get("title") or ""
     release_date = (latest.get("release_date") or "") if latest else ""
     caption_text = (latest.get("caption_text") or "") if latest else ""
-    cover_file_id = (latest.get("cover_file_id") or "") if latest else ""
+    # Avoid reusing latest cover (it may belong to another release).
+    cover_file_id = ""
 
     platforms_text = ", ".join(sorted(links.keys())) if links else "—"
     caption_lines = [
@@ -2303,6 +2305,8 @@ async def show_import_confirmation(
         caption_lines.append(f"Источник: {label}")
     if metadata and metadata.get("conflict"):
         caption_lines.append("⚠️ Название/артист отличаются на площадках. Выбери источник или подтверди по умолчанию.")
+    if not artist or not title:
+        caption_lines.append("⚠️ Не удалось определить артиста/название автоматически — нажми «Изменить».")
     if len(links) < 2:
         caption_lines.append("Можно прислать ссылку другой платформы, чтобы добавить остальные площадки.")
     caption_lines.append("")
