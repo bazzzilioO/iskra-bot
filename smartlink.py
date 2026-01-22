@@ -94,6 +94,7 @@ HUMAN_METADATA_PLATFORMS = {
     "youtubemusic",
     "zvuk",
     "kion",
+    "musicbrainz",
 }
 
 # Global state
