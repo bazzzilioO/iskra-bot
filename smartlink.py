@@ -527,7 +527,8 @@ def normalize_index_smartlink(
 
 
 def smartlink_index_ready() -> bool:
-    return bool(SMARTLINK_INDEX_BASE and SMARTLINK_API_KEY)
+    # Index may be accessible with different env var names and/or public endpoints.
+    return bool(SMARTLINK_INDEX_BASE)
 
 
 def _index_api_key_candidates() -> list[str]:
@@ -617,13 +618,6 @@ async def fetch_smartlink_from_index(
     slug = str(slug or "").strip()
     if not SMARTLINK_INDEX_BASE or not artist_slug or not slug:
         return False, None, None
-    if not SMARTLINK_API_KEY:
-        logger.error(
-            "[smartlink-fetch] SMARTLINK_API_KEY missing; skipping index fetch artist_slug=%s slug=%s",
-            artist_slug,
-            slug,
-        )
-        return False, None, None
 
     # Проверяем rate limit cooldown перед запросом
     if not await check_rate_limit_cooldown():
@@ -635,52 +629,70 @@ async def fetch_smartlink_from_index(
         return False, None, 429
 
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {"X-API-Key": SMARTLINK_API_KEY}
     try:
         session = await get_http_session()
-        async with session.get(url, headers=headers) as resp:
-            body = await resp.text()
-            sanitized_body = _sanitize_body_for_logging(body)
+        api_keys = _index_api_key_candidates()
+        header_attempts: list[dict[str, str]] = [_build_index_auth_headers(k) for k in api_keys] or [{}]
+        last_status: int | None = None
+        last_body: str | None = None
 
-            # Обработка Rate Limit
-            if is_rate_limited_response(resp.status, body):
-                logger.warning(
-                    "[smartlink-fetch] rate limited artist_slug=%s slug=%s",
-                    artist_slug,
-                    slug,
-                )
-                await set_rate_limit_cooldown()
-                return False, None, 429
+        for headers in header_attempts:
+            async with session.get(url, headers=headers) as resp:
+                body = await resp.text()
+                last_status, last_body = resp.status, body
+                sanitized_body = _sanitize_body_for_logging(body)
 
-            if not (200 <= resp.status < 300):
-                log_missing_index_token(resp.status, body, "fetch_smartlink_from_index")
-                logger.warning(
-                    "[smartlink-fetch] response status=%s body=%s", resp.status, sanitized_body
-                )
-                return False, None, resp.status
-            try:
-                payload = await resp.json()
-            except Exception:
-                logger.warning(
-                    "[smartlink-fetch] failed to parse json status=%s body=%s",
-                    resp.status,
-                    sanitized_body,
-                )
-                return False, None, resp.status
+                # Обработка Rate Limit
+                if is_rate_limited_response(resp.status, body):
+                    logger.warning(
+                        "[smartlink-fetch] rate limited artist_slug=%s slug=%s",
+                        artist_slug,
+                        slug,
+                    )
+                    await set_rate_limit_cooldown()
+                    return False, None, 429
 
-            item: dict | None = None
-            if isinstance(payload, dict):
-                for key in ("smartlink", "item", "data", "result"):
-                    value = payload.get(key)
-                    if isinstance(value, dict):
-                        item = value
-                        break
-                if item is None:
-                    item = payload
-            elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
-                item = payload[0]
+                if not (200 <= resp.status < 300):
+                    # Try next key on auth failure
+                    if resp.status == 401 and len(header_attempts) > 1:
+                        continue
+                    log_missing_index_token(resp.status, body, "fetch_smartlink_from_index")
+                    logger.warning(
+                        "[smartlink-fetch] response status=%s body=%s", resp.status, sanitized_body
+                    )
+                    return False, None, resp.status
+                try:
+                    payload = await resp.json()
+                except Exception:
+                    logger.warning(
+                        "[smartlink-fetch] failed to parse json status=%s body=%s",
+                        resp.status,
+                        sanitized_body,
+                    )
+                    return False, None, resp.status
 
-            return True, item, resp.status
+                item: dict | None = None
+                if isinstance(payload, dict):
+                    for key in ("smartlink", "item", "data", "result"):
+                        value = payload.get(key)
+                        if isinstance(value, dict):
+                            item = value
+                            break
+                    if item is None:
+                        item = payload
+                elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
+                    item = payload[0]
+
+                return True, item, resp.status
+
+        # All attempts exhausted (typically 401 for all keys)
+        if last_status is not None:
+            logger.warning(
+                "[smartlink-fetch] response status=%s body=%s",
+                last_status,
+                _sanitize_body_for_logging(last_body),
+            )
+        return False, None, last_status
     except Exception as err:
         logger.warning("[smartlink-fetch] request error: %s", err)
         return False, None, None
@@ -780,13 +792,6 @@ async def update_smartlink_in_index(
 ) -> tuple[bool, int | None, str | None]:
     if not SMARTLINK_INDEX_BASE:
         return False, None, "config_missing"
-    if not SMARTLINK_API_KEY:
-        logger.error(
-            "[smartlink-index] SMARTLINK_API_KEY missing; skipping update artist_slug=%s slug=%s",
-            artist_slug,
-            slug,
-        )
-        return False, None, "missing_api_key"
     # Проверяем rate limit cooldown перед запросом
     if not await check_rate_limit_cooldown():
         logger.debug(
@@ -797,65 +802,80 @@ async def update_smartlink_in_index(
         return False, 429, "rate_limit_cooldown"
 
     index_url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {"Content-Type": "application/json"}
-    headers["X-API-Key"] = SMARTLINK_API_KEY
+    base_headers = {"Content-Type": "application/json"}
     payload = build_smartlink_index_payload(smartlink, owner=owner)
     if not payload:
         return False, None, "payload_invalid"
     try:
         session = await get_http_session()
-        async with session.put(index_url, headers=headers, json=payload) as resp:
-            body = await resp.text()
-            sanitized_body = _sanitize_body_for_logging(body)
+        api_keys = _index_api_key_candidates()
+        header_attempts: list[dict[str, str]] = [_build_index_auth_headers(k) for k in api_keys] or [{}]
+        last_status: int | None = None
+        last_sanitized: str | None = None
 
-            # Обработка Rate Limit
-            if is_rate_limited_response(resp.status, body):
-                logger.warning(
-                    "[smartlink-publish] rate limited artist_slug=%s slug=%s reason=%s",
-                    artist_slug,
-                    slug,
-                    reason,
-                )
-                await set_rate_limit_cooldown()
-                if schedule_retry:
+        for auth_headers in header_attempts:
+            headers = {**base_headers, **auth_headers}
+            async with session.put(index_url, headers=headers, json=payload) as resp:
+                body = await resp.text()
+                sanitized_body = _sanitize_body_for_logging(body)
+                last_status, last_sanitized = resp.status, sanitized_body
+
+                # Обработка Rate Limit
+                if is_rate_limited_response(resp.status, body):
+                    logger.warning(
+                        "[smartlink-publish] rate limited artist_slug=%s slug=%s reason=%s",
+                        artist_slug,
+                        slug,
+                        reason,
+                    )
+                    await set_rate_limit_cooldown()
+                    if schedule_retry:
+                        await enqueue_smartlink_publish_retry(
+                            artist_slug,
+                            slug,
+                            smartlink,
+                            owner,
+                            delay_seconds=min(SMARTLINK_PUBLISH_RETRY_DELAYS[-1], 300),  # До 5 минут для rate limit
+                            last_error=f"status={resp.status} error=rate_limit",
+                        )
+                    return False, 429, "rate_limit"
+
+                if 200 <= resp.status < 300:
+                    logger.info(
+                        "[smartlink-publish] ok artist_slug=%s slug=%s status=%s reason=%s",
+                        artist_slug,
+                        slug,
+                        resp.status,
+                        reason,
+                    )
+                    return True, resp.status, None
+
+                # Try next key on auth failure
+                if resp.status == 401 and len(header_attempts) > 1:
+                    continue
+
+                log_missing_index_token(resp.status, body, "update_smartlink_in_index")
+                if schedule_retry and resp.status != 401:
                     await enqueue_smartlink_publish_retry(
                         artist_slug,
                         slug,
                         smartlink,
                         owner,
-                        delay_seconds=min(SMARTLINK_PUBLISH_RETRY_DELAYS[-1], 300),  # До 5 минут для rate limit
-                        last_error=f"status={resp.status} error=rate_limit",
+                        delay_seconds=SMARTLINK_PUBLISH_RETRY_DELAYS[0],
+                        last_error=f"status={resp.status} error={sanitized_body}",
                     )
-                return False, 429, "rate_limit"
-
-            if 200 <= resp.status < 300:
-                logger.info(
-                    "[smartlink-publish] ok artist_slug=%s slug=%s status=%s reason=%s",
+                logger.warning(
+                    "[smartlink-publish] fail artist_slug=%s slug=%s status=%s error=%s reason=%s",
                     artist_slug,
                     slug,
                     resp.status,
+                    sanitized_body,
                     reason,
                 )
-                return True, resp.status, None
-            log_missing_index_token(resp.status, body, "update_smartlink_in_index")
-            if schedule_retry:
-                await enqueue_smartlink_publish_retry(
-                    artist_slug,
-                    slug,
-                    smartlink,
-                    owner,
-                    delay_seconds=SMARTLINK_PUBLISH_RETRY_DELAYS[0],
-                    last_error=f"status={resp.status} error={sanitized_body}",
-                )
-            logger.warning(
-                "[smartlink-publish] fail artist_slug=%s slug=%s status=%s error=%s reason=%s",
-                artist_slug,
-                slug,
-                resp.status,
-                sanitized_body,
-                reason,
-            )
-            return False, resp.status, sanitized_body
+                return False, resp.status, sanitized_body
+
+        # All attempts exhausted (typically 401)
+        return False, last_status, last_sanitized or "unauthorized"
     except Exception as err:
         if schedule_retry:
             await enqueue_smartlink_publish_retry(
@@ -881,13 +901,6 @@ async def confirm_smartlink_indexed(
 ) -> tuple[bool, int | None, str | None]:
     if not SMARTLINK_INDEX_BASE:
         return False, None, "config_missing"
-    if not SMARTLINK_API_KEY:
-        logger.error(
-            "[smartlink-index] SMARTLINK_API_KEY missing; skipping confirm artist_slug=%s slug=%s",
-            artist_slug,
-            slug,
-        )
-        return False, None, "missing_api_key"
     # Проверяем rate limit cooldown перед запросом
     if not await check_rate_limit_cooldown():
         logger.debug(
@@ -898,42 +911,54 @@ async def confirm_smartlink_indexed(
         return False, 429, "rate_limit_cooldown"
 
     url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    headers = {"X-API-Key": SMARTLINK_API_KEY}
     try:
         session = await get_http_session()
-        async with session.get(url, headers=headers) as resp:
-            body = await resp.text()
-            sanitized_body = _sanitize_body_for_logging(body)
+        api_keys = _index_api_key_candidates()
+        header_attempts: list[dict[str, str]] = [_build_index_auth_headers(k) for k in api_keys] or [{}]
+        last_status: int | None = None
+        last_sanitized: str | None = None
 
-            # Обработка Rate Limit
-            if is_rate_limited_response(resp.status, body):
+        for headers in header_attempts:
+            async with session.get(url, headers=headers) as resp:
+                body = await resp.text()
+                sanitized_body = _sanitize_body_for_logging(body)
+                last_status, last_sanitized = resp.status, sanitized_body
+
+                # Обработка Rate Limit
+                if is_rate_limited_response(resp.status, body):
+                    logger.warning(
+                        "[smartlink-index] rate limited during confirm artist_slug=%s slug=%s",
+                        artist_slug,
+                        slug,
+                    )
+                    await set_rate_limit_cooldown()
+                    return False, 429, "rate_limit"
+
+                # Try next key on auth failure
+                if resp.status == 401 and len(header_attempts) > 1:
+                    continue
+
+                if log_missing_index_token(resp.status, body, "confirm_smartlink_indexed"):
+                    return False, resp.status, sanitized_body
+                if resp.status == 404:
+                    logger.error(
+                        "[smartlink-index] confirm not found artist_slug=%s slug=%s",
+                        artist_slug,
+                        slug,
+                    )
+                    return False, resp.status, "not_found"
+                if 200 <= resp.status < 300:
+                    return True, resp.status, None
                 logger.warning(
-                    "[smartlink-index] rate limited during confirm artist_slug=%s slug=%s",
+                    "[smartlink-index] confirm failed artist_slug=%s slug=%s status=%s body=%s",
                     artist_slug,
                     slug,
+                    resp.status,
+                    sanitized_body,
                 )
-                await set_rate_limit_cooldown()
-                return False, 429, "rate_limit"
-
-            if log_missing_index_token(resp.status, body, "confirm_smartlink_indexed"):
                 return False, resp.status, sanitized_body
-            if resp.status == 404:
-                logger.error(
-                    "[smartlink-index] confirm not found artist_slug=%s slug=%s",
-                    artist_slug,
-                    slug,
-                )
-                return False, resp.status, "not_found"
-            if 200 <= resp.status < 300:
-                return True, resp.status, None
-            logger.warning(
-                "[smartlink-index] confirm failed artist_slug=%s slug=%s status=%s body=%s",
-                artist_slug,
-                slug,
-                resp.status,
-                sanitized_body,
-            )
-            return False, resp.status, sanitized_body
+
+        return False, last_status, last_sanitized or "unauthorized"
     except Exception as err:
         logger.warning(
             "[smartlink-index] confirm error artist_slug=%s slug=%s error=%s",
@@ -1596,7 +1621,13 @@ async def start_smartlink_import(message: Message, tg_id: int):
     )
 
 
-async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
+async def finalize_smartlink_form(
+    message: Message,
+    tg_id: int,
+    data: dict,
+    *,
+    owner_user: User | None = None,
+):
     """Finalize smartlink form - lazy import to avoid circular dependencies."""
     from bot import user_menu_keyboard
     
@@ -1685,11 +1716,21 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
             )
 
         smartlink_id = build_smartlink_id(artist_slug, slug)
+        # `message` can be a bot message (when triggered via callback_query),
+        # so prefer explicit `owner_user` and fall back to message.from_user only if it's not the bot.
+        resolved_owner_user: User | None = owner_user
+        if resolved_owner_user is None:
+            if message.from_user and (not getattr(message, "bot", None) or message.from_user.id != message.bot.id):
+                resolved_owner_user = message.from_user
+
+        owner_username = resolved_owner_user.username if resolved_owner_user else ""
+        owner_display_name = resolved_owner_user.full_name if resolved_owner_user else ""
+
         smartlink = {
             "id": smartlink_id,
             "owner_tg_user_id": str(tg_id),
-            "owner_tg_username": message.from_user.username or "",
-            "owner_display_name": message.from_user.full_name or "",
+            "owner_tg_username": owner_username or "",
+            "owner_display_name": owner_display_name or "",
             "artist": artist,
             "title": title,
             "release_date": release_iso,
@@ -1729,7 +1770,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
                 "[smartlink] rate limited during create, enqueueing for retry smartlink_id=%s",
                 smartlink_id,
             )
-            owner = build_owner_payload(message.from_user)
+            owner = build_owner_payload(resolved_owner_user) if resolved_owner_user else {"tg_user_id": str(tg_id)}
             await enqueue_smartlink_publish_retry(
                 artist_slug,
                 slug,
@@ -1751,7 +1792,7 @@ async def finalize_smartlink_form(message: Message, tg_id: int, data: dict):
                 artist_slug,
                 slug,
                 smartlink,
-                owner=build_owner_payload(message.from_user),
+                owner=build_owner_payload(resolved_owner_user) if resolved_owner_user else {"tg_user_id": str(tg_id)},
                 reason="create",
             )
         else:
@@ -1957,7 +1998,7 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
             artist_slug,
             slug,
             smartlink,
-            owner=build_owner_payload(message.from_user),
+                owner=build_owner_payload(resolved_owner_user) if resolved_owner_user else {"tg_user_id": str(tg_id)},
         )
         if not index_ok:
             logger.warning(
