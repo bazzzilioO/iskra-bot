@@ -1426,6 +1426,29 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
         page=page,
         limit=MY_SMARTLINKS_PAGE_SIZE,
     )
+
+    # Index may return a valid (200) response but still be "empty" if publishes are failing upstream
+    # (e.g. Cloudflare worker misconfiguration like missing GO_INDEX_BASE). In that case, prefer
+    # showing locally persisted smartlinks from D1/SQLite so users still see their created items.
+    if ok and items is not None and len(items) == 0:
+        fallback_count = await count_owned_smartlinks(tg_id)
+        if fallback_count and fallback_count > 0:
+            fallback_items = await list_owned_smartlinks(
+                tg_id,
+                limit=MY_SMARTLINKS_PAGE_SIZE,
+                offset=max(0, page) * MY_SMARTLINKS_PAGE_SIZE,
+            )
+            if fallback_items is not None:
+                total_count = fallback_count
+                items = fallback_items
+                total_pages = max(
+                    1,
+                    (total_count + MY_SMARTLINKS_PAGE_SIZE - 1) // MY_SMARTLINKS_PAGE_SIZE,
+                )
+                await message.answer(
+                    "⚠️ Веб‑индекс вернул пустой список. Показываю смартлинки из локальной D1.",
+                    reply_markup=smartlinks_menu_kb(),
+                )
     if not ok or items is None:
         # Helpful diagnostics: in production D1 may be disabled and Index may require an API key
         if not SMARTLINK_INDEX_BASE or not SMARTLINK_API_KEY:
