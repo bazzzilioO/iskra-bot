@@ -83,7 +83,18 @@ logger = logging.getLogger(__name__)
 ATTRIBUTION_HTML = 'Создано с помощью <a href="https://t.me/iskramusic_bot">ИСКРА</a>'
 SMARTLINKS_PAGE_SIZE = 5
 MY_SMARTLINKS_PAGE_SIZE = 10
-HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
+HUMAN_METADATA_PLATFORMS = {
+    "apple",
+    "itunes",
+    "spotify",
+    "yandex",
+    "vk",
+    "deezer",
+    "youtube",
+    "youtubemusic",
+    "zvuk",
+    "kion",
+}
 
 # Global state
 _smartlink_update_tasks: dict[int | str, asyncio.Task] = {}
