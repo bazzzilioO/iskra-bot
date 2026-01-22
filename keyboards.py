@@ -17,6 +17,7 @@ LINKS = {
     "kion_pitch": "https://music.mts.ru/pitch",  # КИОН (бывш. МТС Music)
     "zvuk_pitch": "https://help.zvuk.com/article/67859",
     "zvuk_studio": "https://studio.zvuk.com/",
+    "vk_studio": "https://studio.vk.com/",
     "vk_studio_info": "https://the-flow.ru/features/zachem-artistu-studiya-servis-vk-muzyki",
     "tiktok_for_artists": "https://artists.tiktok.com/",
 }
@@ -342,9 +343,26 @@ def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, Inlin
         v = accounts_state.get(key, 0)
         emoji = "▫️" if v == 0 else ("⏳" if v == 1 else "✅")
         text += f"{emoji} {name}\n"
-    inline = []
+
+    account_urls: dict[str, str] = {
+        "spotify": LINKS["spotify_for_artists"],
+        "yandex": LINKS["yandex_artists_hub"],
+        "vk": LINKS.get("vk_studio") or LINKS.get("vk_studio_info") or "",
+        "zvuk": LINKS["zvuk_studio"],
+        "tiktok": LINKS["tiktok_for_artists"],
+    }
+
+    inline: list[list[InlineKeyboardButton]] = []
     for key, name in ACCOUNTS:
-        inline.append([InlineKeyboardButton(text=f"{name}", callback_data=f"accounts:cycle:{key}")])
+        v = accounts_state.get(key, 0)
+        emoji = "▫️" if v == 0 else ("⏳" if v == 1 else "✅")
+        row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(text=f"{emoji} {name}", callback_data=f"accounts:cycle:{key}")
+        ]
+        url = account_urls.get(key) or ""
+        if url.startswith("http"):
+            row.append(InlineKeyboardButton(text="🔗 Открыть", url=url))
+        inline.append(row)
     inline.append([InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")])
     return text, InlineKeyboardMarkup(inline_keyboard=inline)
 
