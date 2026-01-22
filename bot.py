@@ -1213,7 +1213,7 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
             "conflict": False,
         }
 
-    async def resolve_via_songlink() -> tuple[dict[str, str], dict | None]:
+    async def resolve_via_songlink(target_url: str) -> tuple[dict[str, str], dict | None]:
         def collect(platforms: dict, acc: dict[str, str]):
             for platform_key, info in (platforms or {}).items():
                 normalized_platform = SONGLINK_PLATFORM_ALIASES.get(platform_key.lower())
@@ -1233,7 +1233,7 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
 
         try:
             async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": BANDLINK_USER_AGENT}) as session:
-                async with session.get(SONGLINK_API_URL, params={"url": url}) as resp:
+                async with session.get(SONGLINK_API_URL, params={"url": target_url}) as resp:
                     if resp.status != 200:
                         return {}, {}
                     data = await resp.json()
@@ -1314,11 +1314,11 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
         metadata = merge_metadata(metadata, band_meta)
 
         if len(links) < 2 or not ((metadata or {}).get("artist") and (metadata or {}).get("title")):
-            song_links, song_meta = await resolve_via_songlink()
+            song_links, song_meta = await resolve_via_songlink(url)
             links.update(song_links)
             metadata = merge_metadata(metadata, song_meta)
     else:
-        song_links, song_meta = await resolve_via_songlink()
+        song_links, song_meta = await resolve_via_songlink(url)
         links.update(song_links)
         metadata = merge_metadata(metadata, song_meta)
 
@@ -1327,6 +1327,22 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
         if detected == "yandex":
             y_meta = await yandex_meta_from_url(url)
             metadata = merge_metadata(metadata, y_meta)
+
+            # Второй проход: если song.link по Яндексу дал Spotify, пробуем резолвить уже по Spotify URL.
+            # На практике это часто увеличивает количество площадок (Apple/Deezer/YouTube и т.д.).
+            spotify_url = (links.get("spotify") or "").strip()
+            if spotify_url and spotify_url != url and len(links) < 4:
+                more_links, more_meta = await resolve_via_songlink(spotify_url)
+                before = len(links)
+                links.update(more_links)
+                metadata = merge_metadata(metadata, more_meta)
+                after = len(links)
+                if after > before:
+                    logger.info(
+                        "[resolve] song.link second pass improved platforms detected=yandex before=%d after=%d",
+                        before,
+                        after,
+                    )
 
     if detected and normalized_input_url:
         platform_key = SONGLINK_PLATFORM_ALIASES.get(detected, detected)
