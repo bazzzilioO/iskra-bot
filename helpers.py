@@ -336,7 +336,10 @@ def build_smartlink_index_payload(
     if telegram_file_id:
         cover_source_type = "telegram"
         cover_source_payload = {"type": "telegram", "file_id": telegram_file_id}
-        cover_url = f"{SMARTLINK_WEB_BASE}/api/cover/{artist_slug}/{slug}"
+        # Prefer an explicit cover_url already present in the smartlink payload (e.g. bot cover proxy).
+        # Fallback to SMARTLINK_WEB_BASE only if nothing was provided.
+        if not cover_url:
+            cover_url = f"{SMARTLINK_WEB_BASE}/api/cover/{artist_slug}/{slug}"
     elif cover_url:
         cover_source_type = "external"
     else:
