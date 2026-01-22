@@ -1416,37 +1416,71 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
 
     async def itunes_search_track(artist: str, title: str) -> tuple[dict[str, str], dict | None]:
         """Best-effort Apple/iTunes lookup without auth keys."""
-        term = " ".join([p for p in [artist.strip(), title.strip()] if p]).strip()
-        if not term:
-            return {}, None
-        params = {
-            "term": term,
-            "media": "music",
-            "entity": "song",
-            "limit": "10",
-        }
-        headers = {"User-Agent": BANDLINK_USER_AGENT}
-        try:
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get("https://itunes.apple.com/search", params=params) as resp:
-                    if resp.status != 200:
-                        return {}, None
-                    data = await resp.json()
-        except Exception:
+        artist_in = artist.strip()
+        title_in = title.strip()
+
+        def _clean_query(s: str) -> str:
+            # Remove repeated punctuation like "???" / "!!!" which often breaks matching.
+            s = re.sub(r"[?!…]+", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
+        title_clean = _clean_query(title_in)
+        artist_clean = _clean_query(artist_in)
+
+        query_terms = []
+        # Most specific first
+        if artist_clean and title_clean:
+            query_terms.append(f"{artist_clean} {title_clean}")
+        if title_clean:
+            query_terms.append(title_clean)
+        if artist_clean and title_in:
+            query_terms.append(f"{artist_clean} {title_in}")
+        if title_in:
+            query_terms.append(title_in)
+
+        query_terms = [t for i, t in enumerate(query_terms) if t and t not in query_terms[:i]]
+        if not query_terms:
             return {}, None
 
-        results = data.get("results") or []
+        headers = {"User-Agent": BANDLINK_USER_AGENT}
+
+        async def _fetch(term: str, country: str) -> list[dict]:
+            params = {
+                "term": term,
+                "media": "music",
+                "entity": "song",
+                "limit": "25",
+                "country": country,
+            }
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                    async with session.get("https://itunes.apple.com/search", params=params) as resp:
+                        if resp.status != 200:
+                            return []
+                        data = await resp.json()
+            except Exception:
+                return []
+            return data.get("results") or []
+
         best = None
         best_score = -1
-        for item in results:
-            item_artist = str(item.get("artistName") or "")
-            item_title = str(item.get("trackName") or item.get("collectionName") or "")
-            score = _score_candidate(artist, title, item_artist, item_title)
-            if score > best_score:
-                best_score = score
-                best = item
+        best_item_artist = ""
+        best_item_title = ""
+        # Try RU first (best for Russian catalog), then US as fallback.
+        for country in ("ru", "us"):
+            for term in query_terms[:3]:
+                for item in await _fetch(term, country):
+                    item_artist = str(item.get("artistName") or "")
+                    item_title = str(item.get("trackName") or item.get("collectionName") or "")
+                    score = _score_candidate(artist_in, title_in, item_artist, item_title)
+                    if score > best_score:
+                        best_score = score
+                        best = item
+                        best_item_artist = item_artist
+                        best_item_title = item_title
 
-        if not best or best_score < 45:
+        if not best or best_score < 40:
             return {}, None
 
         track_url = str(best.get("trackViewUrl") or "").strip()
@@ -1464,12 +1498,12 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
 
         meta_platform = "apple" if "apple" in links else ("itunes" if "itunes" in links else "apple")
         meta = {
-            "artist": str(best.get("artistName") or "").strip(),
-            "title": str(best.get("trackName") or best.get("collectionName") or "").strip(),
+            "artist": best_item_artist.strip(),
+            "title": best_item_title.strip(),
             "cover_url": cover_url,
             "source_platform": meta_platform,
             "preferred_source": meta_platform,
-            "sources": {meta_platform: {"artist": str(best.get("artistName") or "").strip(), "title": str(best.get("trackName") or "").strip(), "cover_url": cover_url}},
+            "sources": {meta_platform: {"artist": best_item_artist.strip(), "title": best_item_title.strip(), "cover_url": cover_url}},
             "conflict": False,
         }
         return links, meta
@@ -2882,6 +2916,7 @@ async def update_smartlink_message(bot: Bot, smartlink_id: int | str) -> bool:
             page=None,
             web_url=web_url,
             can_update_web=is_admin,
+            include_tech=False,
         )
         caption = build_smartlink_caption(smartlink)
         cover_file_id = smartlink.get("cover_file_id")
@@ -3057,6 +3092,7 @@ async def send_smartlink_photo(
             page=page,
             web_url=web_url,
             can_update_web=is_admin,
+            include_tech=False,
         )
     except Exception:
         logger.exception("[smartlink] render failed smartlink_id=%s", smartlink.get("id"))

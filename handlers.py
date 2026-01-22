@@ -1162,7 +1162,7 @@ async def smartlinks_refresh_cb(callback):
 
     allow_remind = smartlink_can_remind(smartlink)
     subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
-    kb = build_smartlink_keyboard(smartlink, subscribed=subscribed, can_remind=allow_remind, page=page)
+    kb = build_smartlink_keyboard(smartlink, subscribed=subscribed, can_remind=allow_remind, page=page, include_tech=False)
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     if smartlink.get("id"):
@@ -1897,7 +1897,7 @@ async def smartlink_toggle_cb(callback):
         await add_smartlink_reminder(tg_id, smartlink_id)
     await set_smartlink_subscription(smartlink_id, tg_id, not current)
     allow_remind = smartlink_can_remind(smartlink)
-    kb = build_smartlink_keyboard(smartlink, subscribed=not current, can_remind=allow_remind)
+    kb = build_smartlink_keyboard(smartlink, subscribed=not current, can_remind=allow_remind, include_tech=False)
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Напомню" if not current else "Напоминание выключено")
@@ -1936,7 +1936,7 @@ async def smartlink_release_reminder_cb(callback):
         await add_smartlink_reminder(tg_id, smartlink_id)
         await set_smartlink_subscription(smartlink_id, tg_id, True)
 
-    kb = build_smartlink_keyboard(smartlink, subscribed=not current, can_remind=allow_remind)
+    kb = build_smartlink_keyboard(smartlink, subscribed=not current, can_remind=allow_remind, include_tech=False)
     caption = build_smartlink_caption(smartlink)
     await safe_edit_caption(callback.message, caption, kb)
     await callback.answer("Напомню" if not current else "Напоминание выключено")
