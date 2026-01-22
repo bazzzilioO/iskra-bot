@@ -2436,6 +2436,54 @@ async def any_message_router(message: Message):
         if not txt or txt.startswith("/"):
             return
 
+        # Allow sending UPC directly without pressing the "Автозаполнение по UPC" button.
+        # This is the most common flow when UPC comes from a distributor.
+        digits = re.sub(r"\D", "", txt)
+        if SPOTIFY_UPC_ENABLED and re.fullmatch(r"\d{12,14}", digits):
+            await form_start(tg_id, "smartlink_upc")
+            results = await spotify_search_upc(digits)
+            if not results:
+                await message.answer(
+                    "Не нашёл релиз по этому UPC в Spotify. "
+                    "Попробуй BandLink или пришли ссылку на релиз (Spotify/Apple/Яндекс/VK).",
+                    reply_markup=await user_menu_keyboard(tg_id),
+                )
+                return
+
+            await form_set(tg_id, 1, {"upc": digits, "candidates": results})
+            if len(results) == 1:
+                candidate = results[0]
+                kind = (candidate.get("album_type") or candidate.get("kind") or "").strip()
+                kind_label = f" ({kind})" if kind else ""
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:upc_pick:0")],
+                        [InlineKeyboardButton(text="Отмена", callback_data="smartlink:upc_cancel")],
+                    ]
+                )
+                await message.answer(
+                    f"Нашёл по UPC: {candidate.get('artist') or 'Без артиста'} — {candidate.get('title') or ''}{kind_label}\n"
+                    f"{candidate.get('spotify_url', '')}\n\nПодтверждаешь?",
+                    reply_markup=kb,
+                )
+            else:
+                rows = []
+                for idx, candidate in enumerate(results):
+                    kind = (candidate.get("album_type") or candidate.get("kind") or "").strip()
+                    kind_suffix = f" ({kind})" if kind else ""
+                    label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}{kind_suffix}".strip(" —")
+                    if len(label) > 60:
+                        label = label[:57] + "…"
+                    if not label:
+                        label = f"Вариант {idx + 1}"
+                    rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlink:upc_pick:{idx}")])
+                rows.append([InlineKeyboardButton(text="Отмена", callback_data="smartlink:upc_cancel")])
+                await message.answer(
+                    "Выбери релиз по UPC:",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+                )
+            return
+
         exp = await get_experience(tg_id)
         if exp == "unknown":
             lower = txt.lower()
@@ -2496,6 +2544,8 @@ async def any_message_router(message: Message):
         await form_set(tg_id, 1, {"upc": digits, "candidates": results})
         if len(results) == 1:
             candidate = results[0]
+            kind = (candidate.get("album_type") or candidate.get("kind") or "").strip()
+            kind_label = f" ({kind})" if kind else ""
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:upc_pick:0")],
@@ -2503,14 +2553,16 @@ async def any_message_router(message: Message):
                 ]
             )
             await message.answer(
-                f"Нашёл: {candidate.get('artist') or 'Без артиста'} — {candidate.get('title') or ''}\n"
+                f"Нашёл: {candidate.get('artist') or 'Без артиста'} — {candidate.get('title') or ''}{kind_label}\n"
                 f"{candidate.get('spotify_url', '')}\n\nПодтверждаешь?",
                 reply_markup=kb,
             )
         else:
             rows = []
             for idx, candidate in enumerate(results):
-                label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}".strip(" —")
+                kind = (candidate.get("album_type") or candidate.get("kind") or "").strip()
+                kind_suffix = f" ({kind})" if kind else ""
+                label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}{kind_suffix}".strip(" —")
                 if len(label) > 60:
                     label = label[:57] + "…"
                 if not label:
