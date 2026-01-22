@@ -570,7 +570,8 @@ async def fetch_my_smartlinks_from_index(
     if not SMARTLINK_INDEX_BASE:
         logger.error("[smartlink-my] SMARTLINK_INDEX_BASE missing; skipping fetch")
         return False, None, 0, 1
-    url = f"{SMARTLINK_INDEX_BASE}/api/my"
+    # Cloudflare Worker (sreda-go) uses /api/index/my. Keep /api/my as fallback.
+    url = f"{SMARTLINK_INDEX_BASE}/api/index/my"
     params = {
         "owner_tg_user_id": str(tg_id),
         "page": str(max(0, page)),
@@ -595,8 +596,14 @@ async def fetch_my_smartlinks_from_index(
                         data = await resp.json()
                         items = data.get("items") or []
                         total_pages = int(data.get("total_pages") or 1)
-                        total_count = int(data.get("total_count") or len(items))
+                        # sreda-go returns `total`, older index returns `total_count`
+                        total_count = int(data.get("total_count") or data.get("total") or len(items))
                         return True, items, total_count, max(1, total_pages)
+
+                    # Backward compatibility: some deployments used /api/my
+                    if resp.status == 404 and url.endswith("/api/index/my"):
+                        url = f"{SMARTLINK_INDEX_BASE}/api/my"
+                        continue
 
                     # If auth failed and we have more keys to try, keep going.
                     if resp.status == 401 and len(header_attempts) > 1:
@@ -629,7 +636,9 @@ async def fetch_smartlink_from_index(
         )
         return False, None, 429
 
-    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
+    # Cloudflare Worker (sreda-go) provides JSON via /api/index/get.
+    # Keep /api/smartlinks/{artist}/{slug} as fallback for older index backends.
+    url = f"{SMARTLINK_INDEX_BASE}/api/index/get?artist_slug={artist_slug}&slug={slug}"
     try:
         session = await get_http_session()
         api_keys = _index_api_key_candidates()
@@ -654,6 +663,10 @@ async def fetch_smartlink_from_index(
                     return False, None, 429
 
                 if not (200 <= resp.status < 300):
+                    # Backward compatibility: try legacy path once when worker endpoint not found.
+                    if resp.status == 404 and "/api/index/get" in url:
+                        url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
+                        continue
                     # Try next key on auth failure
                     if resp.status == 401 and len(header_attempts) > 1:
                         continue
@@ -684,6 +697,19 @@ async def fetch_smartlink_from_index(
                 elif isinstance(payload, list) and payload and isinstance(payload[0], dict):
                     item = payload[0]
 
+                # sreda-go /api/index/get returns DB record with links_json/cover_source strings.
+                if isinstance(item, dict) and "links_json" in item and "links" not in item:
+                    try:
+                        raw = item.get("links_json")
+                        item["links"] = json.loads(raw) if isinstance(raw, str) and raw.strip() else {}
+                    except Exception:
+                        item["links"] = {}
+                if isinstance(item, dict) and "cover_source" in item and isinstance(item.get("cover_source"), str):
+                    try:
+                        raw = str(item.get("cover_source") or "").strip()
+                        item["cover_source"] = json.loads(raw) if raw and raw.startswith("{") else item.get("cover_source")
+                    except Exception:
+                        pass
                 return True, item, resp.status
 
         # All attempts exhausted (typically 401 for all keys)
@@ -802,8 +828,9 @@ async def update_smartlink_in_index(
         )
         return False, 429, "rate_limit_cooldown"
 
-    index_url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
-    base_headers = {"Content-Type": "application/json"}
+    # Primary: Cloudflare Worker (sreda-go) upsert endpoint.
+    index_url = f"{SMARTLINK_INDEX_BASE}/api/index/upsert"
+    base_headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
     payload = build_smartlink_index_payload(smartlink, owner=owner)
     if not payload:
         return False, None, "payload_invalid"
@@ -816,7 +843,7 @@ async def update_smartlink_in_index(
 
         for auth_headers in header_attempts:
             headers = {**base_headers, **auth_headers}
-            async with session.put(index_url, headers=headers, json=payload) as resp:
+            async with session.post(index_url, headers=headers, json=payload) as resp:
                 body = await resp.text()
                 sanitized_body = _sanitize_body_for_logging(body)
                 last_status, last_sanitized = resp.status, sanitized_body
@@ -911,7 +938,8 @@ async def confirm_smartlink_indexed(
         )
         return False, 429, "rate_limit_cooldown"
 
-    url = f"{SMARTLINK_INDEX_BASE}/api/smartlinks/{artist_slug}/{slug}"
+    # Cloudflare Worker (sreda-go): confirm via /api/index/get.
+    url = f"{SMARTLINK_INDEX_BASE}/api/index/get?artist_slug={artist_slug}&slug={slug}"
     try:
         session = await get_http_session()
         api_keys = _index_api_key_candidates()
