@@ -2027,7 +2027,7 @@ async def start_prefill_editor(message: Message, tg_id: int, data: dict):
 
 async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: dict):
     """Apply Spotify UPC selection - lazy import to avoid circular dependencies."""
-    from bot import user_menu_keyboard
+    from bot import user_menu_keyboard, resolve_links
     
     await form_clear(tg_id)
 
@@ -2036,59 +2036,25 @@ async def apply_spotify_upc_selection(message: Message, tg_id: int, candidate: d
         await message.answer("Не нашёл ссылку Spotify для этого UPC.", reply_markup=await user_menu_keyboard(tg_id))
         return
 
-    latest = await fetch_latest_smartlink_from_index(tg_id)
-    if latest and latest.get("artist") and latest.get("title") and latest.get("cover_file_id"):
-        links = latest.get("links") or {}
-        links["spotify"] = spotify_url
-        artist_slug = (latest.get("artist_slug") or "").strip()
-        slug = (latest.get("slug") or "").strip()
-        if not artist_slug or not slug:
-            artist_slug, slug = await build_unique_smartlink_slugs(
-                latest.get("artist", ""),
-                latest.get("title", ""),
-                owner_tg_user_id=tg_id,
-            )
-        cover_url = (latest.get("cover_url") or "").strip()
-        cover_source = latest.get("cover_source") if isinstance(latest.get("cover_source"), dict) else {}
-        cover_file_id = latest.get("cover_file_id") or cover_source.get("file_id") or ""
-        if cover_file_id and artist_slug and slug:
-            cover_url = build_cover_proxy_url(artist_slug, slug)
-        smartlink = {
-            **latest,
-            "links": links,
-            "cover_url": cover_url,
-            "artist_slug": artist_slug,
-            "slug": slug,
-            "id": build_smartlink_id(artist_slug, slug),
-        }
-        owner_payload = (
-            build_owner_payload(message.from_user)
-            if message.from_user
-            else {"tg_user_id": str(tg_id)}
-        )
-        index_ok, status, error = await update_smartlink_in_index(
-            artist_slug,
-            slug,
-            smartlink,
-            owner=owner_payload,
-        )
-        if not index_ok:
-            logger.warning(
-                "[smartlink] upc index update failed artist_slug=%s slug=%s status=%s error=%s",
-                artist_slug,
-                slug,
-                status,
-                error,
-            )
-        smartlink = await fetch_owned_smartlink_with_fallback(tg_id, artist_slug, slug) or smartlink
-        allow_remind = smartlink_can_remind(smartlink)
-        subscribed = await get_release_reminder_state(tg_id, smartlink.get("id"), allow_remind)
-        await send_smartlink_photo(message.bot, tg_id, smartlink, subscribed=subscribed, allow_remind=allow_remind)
-        await message.answer("Добавил Spotify по UPC. Смартлинк обновлён.", reply_markup=await user_menu_keyboard(tg_id))
+    await message.answer(
+        "⚡ Нашёл релиз по UPC. Ищу ссылки на остальные площадки…",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
+    try:
+        links, metadata = await resolve_links(spotify_url)
+    except Exception as e:
+        logger.warning("[smartlink-upc] resolve_links failed: %s", e)
+        links, metadata = {}, {}
+
+    if links:
+        # Reuse import confirmation UX so user can review/adjust metadata before saving.
+        latest = await fetch_latest_smartlink_from_index(tg_id)
+        await show_import_confirmation(message, tg_id, links, metadata or {}, latest=latest)
         return
 
     await message.answer(
-        "Нашёл Spotify. Давай заполним смартлинк: ссылка на Spotify уже подставлена.",
+        "Нашёл Spotify, но не смог подтянуть остальные площадки автоматически. "
+        "Давай заполним смартлинк: ссылка на Spotify уже подставлена.",
         reply_markup=await user_menu_keyboard(tg_id),
     )
     await start_smartlink_form(message, tg_id, initial_links={"spotify": spotify_url})

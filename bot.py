@@ -520,28 +520,92 @@ async def get_spotify_access_token() -> str | None:
         return None
 
 
-async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
+async def spotify_search_upc(upc: str) -> list[dict]:
     token = await get_spotify_access_token()
     if not token:
         return []
 
     timeout = aiohttp.ClientTimeout(total=10)
     headers = {"Authorization": f"Bearer {token}"}
-    params = {"q": f"upc:{upc}", "type": "album,track", "limit": 5}
-    candidates: list[dict[str, str]] = []
-    seen_urls: set[str] = set()
+    # Fetch a bit more than 5 to better handle compilations/duplicates.
+    params = {"q": f"upc:{upc}", "type": "album,track", "limit": 10}
 
-    def add_candidate(title: str, artists: list[dict] | list[str], url: str | None):
-        if not url or url in seen_urls:
-            return
-        artist_names_list: list[str] = []
-        for a in artists:
+    raw: list[dict] = []
+
+    def _norm(s: str) -> str:
+        # Simple normalization for dedupe across minor punctuation/case variants
+        return re.sub(r"[^a-z0-9а-яё]+", "", (s or "").lower())
+
+    def _coerce_artists(artists: list[dict] | list[str] | None) -> tuple[str, str]:
+        names: list[str] = []
+        for a in artists or []:
             name = a.get("name") if isinstance(a, dict) else str(a)
+            name = (name or "").strip()
             if name:
-                artist_names_list.append(name)
-        artist_names = ", ".join(artist_names_list)
-        candidates.append({"artist": artist_names, "title": title, "spotify_url": url})
-        seen_urls.add(url)
+                names.append(name)
+        joined = ", ".join(names)
+        primary = names[0] if names else ""
+        return joined, primary
+
+    def _score(kind: str, album_type: str, popularity: int | None, primary_artist: str, title: str) -> int:
+        score = 0
+        if kind == "album":
+            score += 100
+        else:
+            score += 60
+
+        at = (album_type or "").lower()
+        if at == "single":
+            score += 30
+        elif at == "album":
+            score += 20
+        elif at == "compilation":
+            score -= 200
+
+        if primary_artist.lower().strip() == "various artists":
+            score -= 200
+
+        # Penalize typical noisy titles in compilations/re-uploads
+        title_l = (title or "").lower()
+        if "karaoke" in title_l or "tribute" in title_l:
+            score -= 50
+
+        if isinstance(popularity, int):
+            score += min(max(popularity, 0), 100) // 5  # 0..20
+        return score
+
+    def add_candidate(kind: str, item: dict):
+        if not isinstance(item, dict):
+            return
+        url = ((item.get("external_urls") or {}) if isinstance(item.get("external_urls"), dict) else {}).get("spotify")
+        if not url:
+            return
+        title = (item.get("name") or "").strip()
+
+        if kind == "album":
+            artists = item.get("artists") if isinstance(item.get("artists"), list) else []
+            album_type = str(item.get("album_type") or "").strip()
+            release_date = str(item.get("release_date") or "").strip()
+            popularity = None
+        else:
+            artists = item.get("artists") if isinstance(item.get("artists"), list) else []
+            album = item.get("album") if isinstance(item.get("album"), dict) else {}
+            album_type = str(album.get("album_type") or "").strip()
+            release_date = str(album.get("release_date") or "").strip()
+            popularity = item.get("popularity") if isinstance(item.get("popularity"), int) else None
+
+        artist, primary_artist = _coerce_artists(artists)
+        entry = {
+            "artist": artist,
+            "title": title,
+            "spotify_url": url,
+            "kind": kind,
+            "album_type": album_type,
+            "release_date": release_date,
+            "score": _score(kind, album_type, popularity, primary_artist, title),
+            "_dedupe_key": f"{_norm(primary_artist)}|{_norm(title)}",
+        }
+        raw.append(entry)
 
     data = {}
     try:
@@ -554,12 +618,47 @@ async def spotify_search_upc(upc: str) -> list[dict[str, str]]:
         return []
 
     for item in data.get("albums", {}).get("items", []) or []:
-        add_candidate(item.get("name", ""), item.get("artists", []), (item.get("external_urls") or {}).get("spotify"))
+        add_candidate("album", item)
 
     for item in data.get("tracks", {}).get("items", []) or []:
-        add_candidate(item.get("name", ""), item.get("artists", []), (item.get("external_urls") or {}).get("spotify"))
+        add_candidate("track", item)
 
-    return candidates
+    if not raw:
+        return []
+
+    # Prefer non-compilations. If everything is compilation, keep them as a last resort.
+    non_comp = [
+        c
+        for c in raw
+        if str(c.get("album_type") or "").lower() != "compilation"
+        and (str((c.get("artist") or "")).lower().strip() != "various artists")
+    ]
+    pool = non_comp if non_comp else raw
+
+    # Dedupe by (primary_artist,title), keep the best scored option (typically album/single).
+    best_by_key: dict[str, dict] = {}
+    for c in pool:
+        key = str(c.get("_dedupe_key") or "") or str(c.get("spotify_url") or "")
+        prev = best_by_key.get(key)
+        if not prev or int(c.get("score") or 0) > int(prev.get("score") or 0):
+            best_by_key[key] = c
+
+    ranked = sorted(best_by_key.values(), key=lambda x: int(x.get("score") or 0), reverse=True)
+
+    # Strip internal fields and cap output
+    result: list[dict] = []
+    for c in ranked[:5]:
+        result.append(
+            {
+                "artist": c.get("artist") or "",
+                "title": c.get("title") or "",
+                "spotify_url": c.get("spotify_url") or "",
+                "kind": c.get("kind") or "",
+                "album_type": c.get("album_type") or "",
+                "release_date": c.get("release_date") or "",
+            }
+        )
+    return result
 
 
 def _allowed_music_platform(host: str, path: str, query: dict[str, str]) -> str | None:
