@@ -6,6 +6,7 @@ import datetime as dt
 from datetime import timezone
 import json
 import logging
+import os
 import traceback
 from urllib.parse import urlparse
 
@@ -528,6 +529,36 @@ def smartlink_index_ready() -> bool:
     return bool(SMARTLINK_INDEX_BASE and SMARTLINK_API_KEY)
 
 
+def _index_api_key_candidates() -> list[str]:
+    """Return a list of possible Index API keys (deployments may use different env var names)."""
+    candidates = [
+        SMARTLINK_API_KEY,
+        os.getenv("ISKRA_API_KEY"),
+        os.getenv("GO_API_KEY"),
+        os.getenv("GO_API_TOKEN"),
+        os.getenv("SMARTLINK_INDEX_TOKEN"),
+        os.getenv("SMARTLINK_TOKEN"),
+    ]
+    uniq: list[str] = []
+    for v in candidates:
+        if not v:
+            continue
+        s = str(v).strip()
+        if not s or s in uniq:
+            continue
+        uniq.append(s)
+    return uniq
+
+
+def _build_index_auth_headers(api_key: str) -> dict[str, str]:
+    """Build auth headers for Index API; different deployments may accept different schemes."""
+    key = str(api_key or "").strip()
+    if not key:
+        return {}
+    # Send both: many backends accept one of them and ignore the other.
+    return {"X-API-Key": key, "Authorization": f"Bearer {key}"}
+
+
 async def fetch_my_smartlinks_from_index(
     tg_id: int,
     page: int = 0,
@@ -537,29 +568,42 @@ async def fetch_my_smartlinks_from_index(
         logger.error("[smartlink-my] SMARTLINK_INDEX_BASE missing; skipping fetch")
         return False, None, 0, 1
     url = f"{SMARTLINK_INDEX_BASE}/api/my"
-    headers = {}
-    if SMARTLINK_API_KEY:
-        headers["X-API-Key"] = SMARTLINK_API_KEY
-
     params = {
         "owner_tg_user_id": str(tg_id),
         "page": str(max(0, page)),
         "limit": str(limit),
     }
 
+    api_keys = _index_api_key_candidates()
+    # If there is no key at all, still try once (some deployments allow public access).
+    header_attempts: list[dict[str, str]] = [_build_index_auth_headers(k) for k in api_keys] or [{}]
+
     timeout = aiohttp.ClientTimeout(total=15)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers=headers, params=params) as resp:
-                body = await resp.text()
-                if not (200 <= resp.status < 300):
+            last_status: int | None = None
+            last_body: str | None = None
+            for headers in header_attempts:
+                async with session.get(url, headers=headers, params=params) as resp:
+                    body = await resp.text()
+                    last_status, last_body = resp.status, body
+
+                    if 200 <= resp.status < 300:
+                        data = await resp.json()
+                        items = data.get("items") or []
+                        total_pages = int(data.get("total_pages") or 1)
+                        total_count = int(data.get("total_count") or len(items))
+                        return True, items, total_count, max(1, total_pages)
+
+                    # If auth failed and we have more keys to try, keep going.
+                    if resp.status == 401 and len(header_attempts) > 1:
+                        continue
+
                     logger.warning("[smartlink-my] status=%s body=%s", resp.status, body)
                     return False, None, 0, 1
-                data = await resp.json()
-                items = data.get("items") or []
-                total_pages = int(data.get("total_pages") or 1)
-                total_count = int(data.get("total_count") or len(items))
-                return True, items, total_count, max(1, total_pages)
+
+            logger.warning("[smartlink-my] status=%s body=%s", last_status, last_body)
+            return False, None, 0, 1
     except Exception as e:
         logger.exception("[smartlink-my] error: %s", e)
         return False, None, 0, 1
