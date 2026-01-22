@@ -1577,6 +1577,98 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
     links: dict[str, str] = {}
     metadata: dict | None = None
 
+    async def cross_resolve_links() -> None:
+        """Cross-resolve by feeding discovered platform URLs back into resolvers.
+
+        Strategy:
+        - Start from original URL and any discovered platform URLs (spotify/apple/deezer/etc).
+        - For each seed, try song.link; if seed is BandLink, also parse it directly.
+        - Stop when no new platforms appear or the call budget is exhausted.
+        """
+        nonlocal metadata
+
+        # Prioritize platforms that tend to expand coverage when used as seeds.
+        platform_priority = [
+            "bandlink",
+            "spotify",
+            "apple",
+            "itunes",
+            "deezer",
+            "yandex",
+            "vk",
+            "zvuk",
+            "kion",
+            "youtubemusic",
+            "youtube",
+        ]
+
+        def _seed_key(u: str) -> str:
+            normalized, _ = normalize_music_url_with_platform(u)
+            return normalized or u.strip()
+
+        queue: list[str] = []
+        seen: set[str] = set()
+
+        def enqueue(u: str | None):
+            if not u:
+                return
+            u = str(u).strip()
+            if not u:
+                return
+            k = _seed_key(u)
+            if not k or k in seen:
+                return
+            seen.add(k)
+            queue.append(u)
+
+        # Always start with the original URL.
+        enqueue(url)
+
+        # Add known platform URLs in priority order first.
+        for p in platform_priority:
+            if p in links:
+                enqueue(links.get(p))
+
+        # Then add everything else discovered so far.
+        for _, u in sorted((links or {}).items()):
+            enqueue(u)
+
+        max_calls = 8
+        calls = 0
+
+        while queue and calls < max_calls:
+            seed = queue.pop(0)
+            before_count = len(links)
+
+            seed_platform = detect_platform(seed) or ""
+            if seed_platform == "bandlink":
+                try:
+                    html_content = await fetch_bandlink_html(seed) or ""
+                    band_links, band_meta = parse_bandlink(html_content)
+                    if band_links:
+                        links.update(band_links)
+                    metadata = merge_metadata(metadata, band_meta)
+                except Exception as e:
+                    logger.debug("[resolve] bandlink parse failed seed=%s err=%s", seed, e)
+
+            # song.link pass for this seed
+            more_links, more_meta = await resolve_via_songlink(seed)
+            calls += 1
+            if more_links:
+                links.update(more_links)
+            metadata = merge_metadata(metadata, more_meta)
+
+            # Enqueue newly discovered platform URLs
+            for p in platform_priority:
+                if p in links:
+                    enqueue(links.get(p))
+            for _, u in (links or {}).items():
+                enqueue(u)
+
+            after_count = len(links)
+            if after_count > before_count:
+                logger.info("[resolve] cross-pass expanded platforms seed=%s before=%d after=%d", seed_platform or "?", before_count, after_count)
+
     if detected == "bandlink":
         html_content = await fetch_bandlink_html(url) or ""
         band_links, band_meta = parse_bandlink(html_content)
@@ -1613,6 +1705,11 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
                         before,
                         after,
                     )
+
+        # Cross-resolve by using discovered platform URLs as seeds (Spotify/Apple/Deezer/YouTube/BandLink/etc).
+        # This often increases coverage when one platform has better mappings in song.link than another.
+        if len(links) < 8:
+            await cross_resolve_links()
 
         # If we still have too few platforms but have usable metadata, try public fallback searches.
         try:
