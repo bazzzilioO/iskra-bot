@@ -268,8 +268,9 @@ def smartlinks_help_text() -> str:
 
 
 def build_smartlink_view_text(smartlink: dict) -> str:
-    artist = smartlink.get("artist") or "Без артиста"
-    title = smartlink.get("title") or "Без названия"
+    # Index/D1 payloads may use different field names
+    artist = smartlink.get("artist") or smartlink.get("artist_name") or "Без артиста"
+    title = smartlink.get("title") or smartlink.get("track_title") or "Без названия"
     rd = parse_date(smartlink.get("release_date") or "")
     lines = [f"{artist} — {title}"]
     if rd:
@@ -285,8 +286,8 @@ def build_my_smartlinks_text(
 
     lines = [f"📎 Мои смартлинки (страница {page + 1}/{total_pages})", ""]
     for idx, item in enumerate(items, start=start_index + 1):
-        artist = item.get("artist") or "Без артиста"
-        title = item.get("title") or "Без названия"
+        artist = item.get("artist") or item.get("artist_name") or "Без артиста"
+        title = item.get("title") or item.get("track_title") or "Без названия"
         lines.append(f"{idx}. {artist} — {title}")
     return "\n".join(lines)
 
