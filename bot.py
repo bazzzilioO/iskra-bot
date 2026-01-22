@@ -651,6 +651,11 @@ def normalize_meta_value(value: str | None) -> str:
     return cleaned
 
 
+# Platforms where metadata is typically human-facing/usable for prefill (avoid noisy/low-signal sources).
+# Kept in sync with `smartlink.py`.
+HUMAN_METADATA_PLATFORMS = {"apple", "spotify", "yandex", "vk"}
+
+
 def filter_human_sources(sources: dict[str, dict]) -> dict[str, dict]:
     filtered: dict[str, dict] = {}
     for key, meta in (sources or {}).items():
@@ -1626,7 +1631,8 @@ async def show_import_confirmation(
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Подтвердить", callback_data="smartlink:import_confirm")],
-            [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit:{row['id']}")],
+            # Continue smartlink wizard editing (the old code referenced an undefined `row`)
+            [InlineKeyboardButton(text="✏️ Изменить", callback_data="smartlink:import_edit")],
             [InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel")],
         ]
     )
