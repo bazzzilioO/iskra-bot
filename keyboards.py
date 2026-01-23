@@ -398,7 +398,8 @@ def smartlinks_menu_kb() -> InlineKeyboardMarkup:
 def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
-    smartlink_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug)
+    # Prefer short local numeric id to avoid Telegram callback_data limits.
+    smartlink_id = smartlink.get("d1_id") or smartlink.get("id") or build_smartlink_id(artist_slug, slug)
     rows = [[InlineKeyboardButton(text="🔗 Открыть карточку", callback_data=f"smartlinks:open:{smartlink_key}:{page}")]]
     if smartlink_id:
         rows.append(
@@ -577,7 +578,8 @@ def build_smartlink_buttons(
     presave_active = smartlink_pre_save_active(smartlink)
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
-    smartlink_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug)
+    # Prefer short local numeric id to avoid Telegram callback_data limits.
+    smartlink_id = smartlink.get("d1_id") or smartlink.get("id") or build_smartlink_id(artist_slug, slug)
 
     platform_rows: list[list[InlineKeyboardButton]] = []
 

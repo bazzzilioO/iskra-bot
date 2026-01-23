@@ -754,12 +754,20 @@ async def fetch_owned_smartlink_with_fallback(
                 owner_id = extract_index_owner_tg_user_id(item)
                 if owner_id and owner_id != str(tg_id):
                     return None
-                return normalize_index_smartlink(
+                normalized = normalize_index_smartlink(
                     item,
                     owner_tg_user_id=str(tg_id),
                     artist_slug=artist_slug,
                     slug=slug,
                 )
+                # Attach local D1 numeric id when available to keep callback_data short.
+                try:
+                    d1 = await fetch_owned_smartlink_from_d1(tg_id, artist_slug, slug)
+                except Exception:
+                    d1 = None
+                if isinstance(d1, dict) and d1.get("d1_id") is not None:
+                    normalized["d1_id"] = d1.get("d1_id")
+                return normalized
             return None
         logger.warning(
             "[smartlink-fetch] index fetch failed artist_slug=%s slug=%s tg_id=%s status=%s",
