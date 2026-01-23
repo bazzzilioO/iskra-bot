@@ -536,6 +536,108 @@ async def fetch_owned_smartlink_by_id(
     async with _smartlink_d1_connection() as db:
         if not db:
             return None
+
+
+async def delete_owned_smartlink_from_d1(
+    owner_tg_user_id: int | str,
+    artist_slug: str,
+    slug: str,
+) -> bool:
+    """Delete a locally persisted smartlink (D1/SQLite)."""
+    artist_slug = str(artist_slug or "").strip()
+    slug = str(slug or "").strip()
+    if not artist_slug or not slug:
+        return False
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return False
+        try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smartlinks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_tg_user_id TEXT NOT NULL,
+                    owner_tg_username TEXT,
+                    owner_display_name TEXT,
+                    artist_slug TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    artist TEXT,
+                    artist_name TEXT,
+                    title TEXT,
+                    release_date TEXT,
+                    cover_file_id TEXT,
+                    cover_url TEXT,
+                    cover_version INTEGER,
+                    caption_text TEXT,
+                    branding_disabled INTEGER,
+                    branding_paid INTEGER,
+                    pre_save_enabled INTEGER,
+                    reminders_enabled INTEGER,
+                    links_json TEXT,
+                    cover_source_json TEXT,
+                    metadata_json TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    cover_updated_at TEXT,
+                    UNIQUE(owner_tg_user_id, artist_slug, slug)
+                )
+                """
+            )
+            cur = await db.execute(
+                "DELETE FROM smartlinks WHERE owner_tg_user_id=? AND artist_slug=? AND slug=?",
+                (str(owner_tg_user_id), artist_slug, slug),
+            )
+            await db.commit()
+            return bool(cur.rowcount and cur.rowcount > 0)
+        except Exception:
+            logger.exception(
+                "[smartlink-d1] failed to delete smartlink owner=%s artist_slug=%s slug=%s",
+                owner_tg_user_id,
+                artist_slug,
+                slug,
+            )
+            return False
+
+
+async def delete_smartlink_state(smartlink_id: int | str) -> None:
+    """Delete auxiliary bot state for a smartlink (subscriptions/reminders/stored messages)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "DELETE FROM smartlink_subscriptions WHERE smartlink_id=?",
+                (smartlink_id,),
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "DELETE FROM smartlink_reminders WHERE smartlink_id=?",
+                (smartlink_id,),
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "DELETE FROM smartlink_reminder_sends WHERE smartlink_id=?",
+                (smartlink_id,),
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "DELETE FROM smartlink_reminder_log WHERE smartlink_id=?",
+                (smartlink_id,),
+            )
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "DELETE FROM smartlink_messages WHERE smartlink_id=?",
+                (smartlink_id,),
+            )
+        except Exception:
+            pass
+        await db.commit()
         try:
             await db.execute(
                 """
