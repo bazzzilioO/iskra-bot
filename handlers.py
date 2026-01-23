@@ -69,6 +69,8 @@ from db import (
     add_smartlink_reminder,
     remove_smartlink_reminder,
     list_recent_smartlinks,
+    delete_owned_smartlink_from_d1,
+    delete_smartlink_state,
 )
 from helpers import (
     format_date_ru,
@@ -136,6 +138,7 @@ from smartlink import (
     fetch_my_smartlinks_from_index,
     normalize_index_smartlink,
     update_smartlink_in_index,
+    delete_smartlink_in_index,
     parse_smartlink_callback_data,
     parse_page_marker,
     smartlink_can_remind,
@@ -1226,8 +1229,64 @@ async def smartlinks_delete_cb(callback):
         await callback.answer("Не понял", show_alert=True)
         return
     page = int(parts[3])
-    await callback.answer("Удаление доступно в веб-кабинете.", show_alert=True)
-    await send_my_smartlinks(callback.message, tg_id, page=page)
+    confirm_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=f"smartlinks:delete_apply:{build_smartlink_key(artist_slug, slug)}:{page}",
+                )
+            ],
+            [InlineKeyboardButton(text="◀️ Отмена", callback_data=f"smartlinks:view:{build_smartlink_key(artist_slug, slug)}:{page}")],
+        ]
+    )
+    await callback.message.answer("Точно удалить смартлинк?", reply_markup=confirm_kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:delete_apply:"))
+async def smartlinks_delete_apply_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    # smartlinks:delete_apply:{smartlink_key}:{page}
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    artist_slug, slug = parse_smartlink_key(parts[2])
+    if not artist_slug or not slug:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    page = int(parts[3])
+
+    smartlink_id = build_smartlink_id(artist_slug, slug)
+
+    # Attempt to delete from the web index (if supported).
+    index_ok, index_status, index_error = await delete_smartlink_in_index(
+        artist_slug,
+        slug,
+        owner=build_owner_payload(callback.from_user),
+    )
+
+    local_deleted = await delete_owned_smartlink_from_d1(tg_id, artist_slug, slug)
+    await delete_smartlink_state(smartlink_id)
+
+    if index_ok:
+        await callback.answer("🗑 Удалено", show_alert=True)
+    else:
+        # If worker doesn't support deletion, we still hide it from the bot via local delete.
+        if index_status == 404 and index_error == "not_supported":
+            await callback.message.answer(
+                "🗑 Удалил смартлинк в боте. В web может остаться (удаление пока не поддерживается на стороне go)."
+            )
+        elif index_status is not None or index_error:
+            await callback.message.answer(
+                f"🗑 Удалил смартлинк в боте. Web-удаление не удалось (status={index_status}, error={index_error})."
+            )
+
+    # Refresh list
+    await send_my_smartlinks(callback.message, tg_id, page=page if local_deleted else 0)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("smartlinks:edit_menu:"))

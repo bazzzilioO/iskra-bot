@@ -38,6 +38,8 @@ from db import (
     delete_smartlink_publish_job,
     fetch_owned_smartlink_by_id,
     fetch_owned_smartlink_from_d1,
+    delete_owned_smartlink_from_d1,
+    delete_smartlink_state,
     upsert_owned_smartlink_to_d1,
     is_smartlink_reminder_set,
     is_smartlink_subscribed,
@@ -932,6 +934,69 @@ async def update_smartlink_in_index(
             slug,
             err,
             reason,
+        )
+        return False, None, str(err)
+
+
+async def delete_smartlink_in_index(
+    artist_slug: str,
+    slug: str,
+    *,
+    owner: dict | None = None,
+) -> tuple[bool, int | None, str | None]:
+    """Best-effort delete from web index (sreda-go).
+
+    If the worker doesn't support deletion, it will typically return 404.
+    """
+    if not SMARTLINK_INDEX_BASE:
+        return False, None, "config_missing"
+
+    artist_slug = str(artist_slug or "").strip()
+    slug = str(slug or "").strip()
+    if not artist_slug or not slug:
+        return False, None, "invalid_slugs"
+
+    url = f"{SMARTLINK_INDEX_BASE}/api/index/delete"
+    payload: dict = {"artist_slug": artist_slug, "slug": slug}
+    if owner:
+        payload["owner"] = owner
+
+    base_headers = {"Content-Type": "application/json", "X-Skip-Sync": "1"}
+    try:
+        session = await get_http_session()
+        api_keys = _index_api_key_candidates()
+        header_attempts: list[dict[str, str]] = [_build_index_auth_headers(k) for k in api_keys] or [{}]
+        last_status: int | None = None
+        last_sanitized: str | None = None
+
+        for auth_headers in header_attempts:
+            headers = {**base_headers, **auth_headers}
+            async with session.post(url, headers=headers, json=payload) as resp:
+                body = await resp.text()
+                sanitized_body = _sanitize_body_for_logging(body)
+                last_status, last_sanitized = resp.status, sanitized_body
+
+                if 200 <= resp.status < 300:
+                    return True, resp.status, None
+
+                # Not supported in worker
+                if resp.status == 404:
+                    return False, resp.status, "not_supported"
+
+                # Try next key on auth failure
+                if resp.status == 401 and len(header_attempts) > 1:
+                    continue
+
+                log_missing_index_token(resp.status, body, "delete_smartlink_in_index")
+                return False, resp.status, sanitized_body
+
+        return False, last_status, last_sanitized or "unauthorized"
+    except Exception as err:
+        logger.warning(
+            "[smartlink-delete] fail artist_slug=%s slug=%s error=%s",
+            artist_slug,
+            slug,
+            err,
         )
         return False, None, str(err)
 
