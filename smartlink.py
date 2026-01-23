@@ -41,6 +41,8 @@ from db import (
     delete_owned_smartlink_from_d1,
     delete_smartlink_state,
     upsert_owned_smartlink_to_d1,
+    clear_deleted_smartlink,
+    list_deleted_smartlinks,
     is_smartlink_reminder_set,
     is_smartlink_subscribed,
     save_smartlink_message_reference,
@@ -1569,6 +1571,26 @@ async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
             )
             return
 
+    # Hide locally deleted smartlinks from the list even if web index can't delete yet.
+    try:
+        deleted = await list_deleted_smartlinks(tg_id)
+    except Exception:
+        deleted = set()
+    if deleted and items:
+        filtered: list[dict] = []
+        for it in items:
+            a = str(it.get("artist_slug") or "").strip()
+            s = str(it.get("slug") or "").strip()
+            if not a or not s:
+                a, s = get_smartlink_slugs(it)
+            if a and s and (a, s) in deleted:
+                continue
+            filtered.append(it)
+        # If this page became empty after filtering, step back one page.
+        if not filtered and page > 0:
+            return await send_my_smartlinks(message, tg_id, page=page - 1)
+        items = filtered
+
     page = max(0, min(page, total_pages - 1))
     start_index = page * MY_SMARTLINKS_PAGE_SIZE
     text = build_my_smartlinks_text(items, page, total_pages, start_index)
@@ -1884,6 +1906,9 @@ async def finalize_smartlink_form(
             "metadata": metadata,
             "cover_version": 1,
         }
+
+        # If the user previously deleted this smartlink, unhide it on recreate.
+        await clear_deleted_smartlink(tg_id, artist_slug, slug)
 
         local_saved = await upsert_owned_smartlink_to_d1(smartlink)
         if not local_saved:
