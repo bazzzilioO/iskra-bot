@@ -84,6 +84,7 @@ from helpers import (
     build_smartlink_id,
     build_smartlink_key,
     parse_smartlink_key,
+    is_allowed_platform_url,
 )
 from keyboards import (
     ACCOUNTS,
@@ -3123,6 +3124,12 @@ async def any_message_router(message: Message):
                 if not re.match(r"https?://", txt):
                     await message.answer(
                         "Нужна ссылка вида https://... или слово «удалить».\n\n(Отмена: /cancel)",
+                        reply_markup=await user_menu_keyboard(tg_id),
+                    )
+                    return
+                if not is_allowed_platform_url(str(platform or ""), txt):
+                    await message.answer(
+                        "⚠️ Ссылка отклонена (защита от фишинга): домен не похож на официальный для этой площадки.",
                         reply_markup=await user_menu_keyboard(tg_id),
                     )
                     return

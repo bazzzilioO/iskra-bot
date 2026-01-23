@@ -54,6 +54,7 @@ from db import (
 )
 from helpers import (
     build_smartlink_id,
+    filter_platform_links_by_allowlist,
     escape_html,
     format_date_ru,
     parse_date,
@@ -1816,11 +1817,13 @@ async def finalize_smartlink_form(
             title,
             owner_tg_user_id=tg_id,
         )
-        links_clean = {
-            k: v
-            for k, v in links.items()
-            if v and isinstance(v, str) and _is_valid_url(v.strip())
+        links_candidate = {
+            k.strip().lower(): v.strip()
+            for k, v in (links.items() if isinstance(links, dict) else [])
+            if isinstance(k, str) and isinstance(v, str) and v.strip() and _is_valid_url(v.strip())
         }
+        # Anti-phishing: keep only official domains per platform
+        links_clean, rejected_links = filter_platform_links_by_allowlist(links_candidate)
         has_anchor_link = any(links_clean.get(p) for p in KEY_PLATFORM_SET)
         if links_clean.get("bandlink"):
             has_anchor_link = True
@@ -1830,6 +1833,14 @@ async def finalize_smartlink_form(
             len(links),
             len(links_clean),
         )
+        if rejected_links:
+            try:
+                rejected_names = ", ".join(platform_label(k) for k in sorted(rejected_links.keys()))
+                await message.answer(
+                    f"⚠️ Убрал ссылки с неофициальных доменов (защита от фишинга): {rejected_names}"
+                )
+            except Exception:
+                pass
 
         cover_source_type = cover_source.get("type") if isinstance(cover_source, dict) else None
         if cover_source_type == "telegram":
