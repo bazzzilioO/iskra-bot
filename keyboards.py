@@ -479,6 +479,12 @@ def smartlink_edit_menu_kb(
             ],
             [
                 InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=f"smartlinks:delete:{smartlink_key}:{page}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="◀️ Назад",
                     callback_data=back_callback,
                 )
