@@ -107,6 +107,7 @@ from helpers import (
     build_smartlink_id,
     build_smartlink_key,
     escape_html,
+    filter_platform_links_by_allowlist,
     format_date_ru,
     parse_date,
     normalize_base_url,
@@ -1870,6 +1871,17 @@ async def resolve_links(url: str) -> tuple[dict[str, str], dict | None]:
         platform_key = SONGLINK_PLATFORM_ALIASES.get(detected, detected)
         if platform_key not in links:
             links[platform_key] = normalized_input_url
+    # Anti-phishing: keep only official domains for known platforms.
+    try:
+        safe_links, rejected = filter_platform_links_by_allowlist(links)
+        if rejected:
+            logger.warning(
+                "[resolve] dropped suspicious domains platforms=%s",
+                ",".join(sorted(rejected.keys())),
+            )
+        links = safe_links
+    except Exception:
+        pass
 
     return links, metadata or {}
 

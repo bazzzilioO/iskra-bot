@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -72,6 +73,93 @@ def normalize_base_url(base: str | None, default: str | None = DEFAULT_SMARTLINK
 
 
 SMARTLINK_WEB_BASE = normalize_base_url(os.getenv("SMARTLINK_WEB_BASE"), DEFAULT_SMARTLINK_BASE)
+
+
+# ==================== Anti-phishing URL allowlist ====================
+_PLATFORM_ALLOWED_HOSTS: dict[str, set[str]] = {
+    # Streaming platforms
+    "spotify": {"open.spotify.com"},
+    "apple": {"music.apple.com"},
+    # iTunes may still appear as itunes.apple.com in some places
+    "itunes": {"music.apple.com", "itunes.apple.com"},
+    "yandex": {"music.yandex.ru"},
+    "vk": {"vk.com", "m.vk.com"},
+    "deezer": {"deezer.com", "www.deezer.com"},
+    "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+    "youtubemusic": {"music.youtube.com"},
+    # Zvuk
+    "zvuk": {"zvuk.com", "open.zvuk.com"},
+    # MTS Music / KION
+    "kion": {"kion.ru", "music.mts.ru"},
+    # Aggregators we explicitly support
+    "bandlink": {"band.link", "bandlink.to"},
+}
+
+
+def _normalize_hostname(url: str) -> str:
+    """Extract lowercase hostname for allowlist checks."""
+    try:
+        parsed = urlparse((url or "").strip())
+    except Exception:
+        return ""
+    host = (parsed.hostname or "").strip().lower()
+    # Defensive normalization: strip trailing dot (rare but valid in DNS)
+    if host.endswith("."):
+        host = host[:-1]
+    return host
+
+
+def is_allowed_platform_url(platform: str, url: str) -> bool:
+    """Anti-phishing guard: ensure platform URL points to official domain.
+
+    For unknown platforms we return False (explicit allowlist).
+    """
+    platform = (platform or "").strip().lower()
+    url = (url or "").strip()
+    if not platform or not url:
+        return False
+    allowed = _PLATFORM_ALLOWED_HOSTS.get(platform)
+    if not allowed:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if (parsed.scheme or "").lower() not in {"http", "https"}:
+        return False
+    host = _normalize_hostname(url)
+    if not host:
+        return False
+    for canon in allowed:
+        canon = canon.lower()
+        if host == canon or host.endswith("." + canon):
+            return True
+    return False
+
+
+def filter_platform_links_by_allowlist(links: dict) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (allowed_links, rejected_links).
+
+    Rejected links are returned as {platform: url} for diagnostics.
+    """
+    allowed_links: dict[str, str] = {}
+    rejected: dict[str, str] = {}
+    if not isinstance(links, dict):
+        return allowed_links, rejected
+    for k, v in links.items():
+        if not k or not v or not isinstance(k, str) or not isinstance(v, str):
+            continue
+        platform = k.strip().lower()
+        url = v.strip()
+        if not url:
+            continue
+        if is_allowed_platform_url(platform, url):
+            allowed_links[platform] = url
+        else:
+            # Only keep rejections for known platforms (avoid noisy unknown keys)
+            if platform in _PLATFORM_ALLOWED_HOSTS:
+                rejected[platform] = url
+    return allowed_links, rejected
 
 
 def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
