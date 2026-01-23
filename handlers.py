@@ -1235,14 +1235,13 @@ async def smartlinks_edit_menu_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
 
-    parts = callback.data.split(":")
     # smartlinks:edit_menu:{smartlink_id}:{page}
-    if len(parts) != 4:
+    # NOTE: smartlink_id can contain ":" (format artist_slug:slug), so we must not rely on fixed split length.
+    smartlink_id, tail = parse_smartlink_callback_data(callback.data, 1)
+    page = parse_page_marker(tail[0] if tail else None, default=0)
+    if not smartlink_id:
         await callback.answer("Не понял", show_alert=True)
         return
-
-    smartlink_id = parts[2]
-    page = int(parts[3])
 
     smartlink = await fetch_owned_smartlink_by_smartlink_id(tg_id, smartlink_id)
     if not smartlink:

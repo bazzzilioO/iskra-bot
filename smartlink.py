@@ -1896,6 +1896,15 @@ async def finalize_smartlink_form(
                 allow_remind=allow_remind,
                 show_web_url=confirm_ok,
             )
+            # Send a separate management menu for the owner (keep the card itself clean for forwarding).
+            try:
+                await message.bot.send_message(
+                    tg_id,
+                    "Управление смартлинком:",
+                    reply_markup=smartlink_view_kb(smartlink, page=0),
+                )
+            except Exception:
+                logger.debug("[smartlink] owner menu send failed smartlink_id=%s", smartlink_id)
         except Exception:
             logger.exception(
                 "[smartlink] finalize send failed tg_id=%s smartlink_id=%s",
