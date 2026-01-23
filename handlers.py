@@ -73,6 +73,7 @@ from db import (
     delete_smartlink_state,
     fetch_owned_smartlink_from_d1,
     upsert_owned_smartlink_to_d1,
+    mark_deleted_smartlink,
 )
 from helpers import (
     format_date_ru,
@@ -1281,6 +1282,8 @@ async def smartlinks_delete_apply_cb(callback):
     )
 
     local_deleted = await delete_owned_smartlink_from_d1(tg_id, artist_slug, slug)
+    # Hide from bot lists even if web index can't delete yet.
+    await mark_deleted_smartlink(tg_id, artist_slug, slug)
     await delete_smartlink_state(smartlink_id)
 
     if index_ok:

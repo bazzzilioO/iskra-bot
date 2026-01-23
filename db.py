@@ -279,6 +279,18 @@ async def init_db():
             PRIMARY KEY (smartlink_id, chat_id)
         )
         """)
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS smartlink_deleted (
+            owner_tg_user_id TEXT NOT NULL,
+            artist_slug TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            deleted_at TEXT,
+            PRIMARY KEY (owner_tg_user_id, artist_slug, slug)
+        )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_smartlink_deleted_owner ON smartlink_deleted(owner_tg_user_id)"
+        )
         await db.execute(
             f"""
         CREATE TABLE IF NOT EXISTS {SMARTLINK_PUBLISH_QUEUE_TABLE} (
@@ -638,6 +650,94 @@ async def delete_smartlink_state(smartlink_id: int | str) -> None:
         except Exception:
             pass
         await db.commit()
+
+
+async def mark_deleted_smartlink(owner_tg_user_id: int | str, artist_slug: str, slug: str) -> bool:
+    """Mark a smartlink as deleted in bot DB.
+
+    Used to hide items from 'Мои смартлинки' even if the web index can't delete yet.
+    """
+    artist_slug = str(artist_slug or "").strip()
+    slug = str(slug or "").strip()
+    if not artist_slug or not slug:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO smartlink_deleted (owner_tg_user_id, artist_slug, slug, deleted_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    str(owner_tg_user_id),
+                    artist_slug,
+                    slug,
+                    dt.datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            logger.exception(
+                "[smartlink-deleted] failed to mark deleted owner=%s artist_slug=%s slug=%s",
+                owner_tg_user_id,
+                artist_slug,
+                slug,
+            )
+            return False
+
+
+async def clear_deleted_smartlink(owner_tg_user_id: int | str, artist_slug: str, slug: str) -> bool:
+    """Remove deleted mark (e.g. when a smartlink is recreated)."""
+    artist_slug = str(artist_slug or "").strip()
+    slug = str(slug or "").strip()
+    if not artist_slug or not slug:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                "DELETE FROM smartlink_deleted WHERE owner_tg_user_id=? AND artist_slug=? AND slug=?",
+                (str(owner_tg_user_id), artist_slug, slug),
+            )
+            await db.commit()
+            return True
+        except Exception:
+            logger.exception(
+                "[smartlink-deleted] failed to clear deleted owner=%s artist_slug=%s slug=%s",
+                owner_tg_user_id,
+                artist_slug,
+                slug,
+            )
+            return False
+
+
+async def list_deleted_smartlinks(owner_tg_user_id: int | str) -> set[tuple[str, str]]:
+    """Return set of (artist_slug, slug) marked as deleted for the owner."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS smartlink_deleted (
+                    owner_tg_user_id TEXT NOT NULL,
+                    artist_slug TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    deleted_at TEXT,
+                    PRIMARY KEY (owner_tg_user_id, artist_slug, slug)
+                )
+                """
+            )
+            cur = await db.execute(
+                "SELECT artist_slug, slug FROM smartlink_deleted WHERE owner_tg_user_id=?",
+                (str(owner_tg_user_id),),
+            )
+            rows = await cur.fetchall()
+            return {(str(r[0] or "").strip(), str(r[1] or "").strip()) for r in rows if r and r[0] and r[1]}
+        except Exception:
+            logger.exception(
+                "[smartlink-deleted] failed to list deleted owner=%s",
+                owner_tg_user_id,
+            )
+            return set()
 
 
 async def list_recent_smartlinks(limit: int) -> list[dict] | None:
