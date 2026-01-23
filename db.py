@@ -638,66 +638,6 @@ async def delete_smartlink_state(smartlink_id: int | str) -> None:
         except Exception:
             pass
         await db.commit()
-        try:
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS smartlinks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    owner_tg_user_id TEXT NOT NULL,
-                    owner_tg_username TEXT,
-                    owner_display_name TEXT,
-                    artist_slug TEXT NOT NULL,
-                    slug TEXT NOT NULL,
-                    artist TEXT,
-                    artist_name TEXT,
-                    title TEXT,
-                    release_date TEXT,
-                    cover_file_id TEXT,
-                    cover_url TEXT,
-                    cover_version INTEGER,
-                    caption_text TEXT,
-                    branding_disabled INTEGER,
-                    branding_paid INTEGER,
-                    pre_save_enabled INTEGER,
-                    reminders_enabled INTEGER,
-                    links_json TEXT,
-                    cover_source_json TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT,
-                    updated_at TEXT,
-                    cover_updated_at TEXT,
-                    UNIQUE(owner_tg_user_id, artist_slug, slug)
-                )
-                """
-            )
-            query = """
-                SELECT * FROM smartlinks
-                WHERE id=? AND owner_tg_user_id=?
-                LIMIT 1
-                """
-            logger.info(
-                "[smartlink-d1] fetch_by_id query=%s tg_id=%s id=%s",
-                "SELECT * FROM smartlinks WHERE id=? AND owner_tg_user_id=? LIMIT 1",
-                owner_tg_user_id,
-                smartlink_id,
-            )
-            cur = await db.execute(query, (smartlink_id, str(owner_tg_user_id)))
-            row = await cur.fetchone()
-            smartlink = _normalize_d1_smartlink(row) if row else None
-            logger.info(
-                "[smartlink-d1] fetch_by_id result tg_id=%s id=%s found=%s",
-                owner_tg_user_id,
-                smartlink_id,
-                bool(smartlink),
-            )
-            return smartlink
-        except Exception:
-            logger.exception(
-                "[smartlink-d1] failed to fetch smartlink owner=%s id=%s",
-                owner_tg_user_id,
-                smartlink_id,
-            )
-            return None
 
 
 async def list_recent_smartlinks(limit: int) -> list[dict] | None:
