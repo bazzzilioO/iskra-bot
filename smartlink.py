@@ -60,6 +60,7 @@ from helpers import (
     parse_date,
     get_smartlink_slugs,
     build_smartlink_index_payload,
+    get_artist_photo_from_links,
     log_missing_index_token,
     parse_smartlink_id,
     smartlink_can_remind,
@@ -1917,6 +1918,15 @@ async def finalize_smartlink_form(
             "metadata": metadata,
             "cover_version": 1,
         }
+
+        # Fetch artist photo from Yandex (if available)
+        try:
+            artist_photo_url = await get_artist_photo_from_links(links_clean)
+            if artist_photo_url:
+                smartlink["artist_photo_url"] = artist_photo_url
+                logger.info("[smartlink] artist photo fetched tg_id=%s url=%s", tg_id, artist_photo_url)
+        except Exception as e:
+            logger.warning("[smartlink] artist photo fetch failed tg_id=%s error=%s", tg_id, e)
 
         # If the user previously deleted this smartlink, unhide it on recreate.
         await clear_deleted_smartlink(tg_id, artist_slug, slug)

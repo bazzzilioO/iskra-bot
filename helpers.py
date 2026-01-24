@@ -17,6 +17,112 @@ def escape_html(text: str | None) -> str:
     return html.escape(text or "")
 
 
+# ==================== Yandex artist photo fetching ====================
+_YANDEX_ARTIST_PHOTO_CACHE: dict[str, tuple[str | None, float]] = {}
+_YANDEX_CACHE_TTL = 3600.0  # 1 hour
+
+
+async def fetch_yandex_artist_photo(yandex_url: str) -> str | None:
+    """Fetch artist photo from Yandex Music.
+
+    Given a Yandex album/track URL, fetches the page, finds the artist link,
+    then fetches the artist page and extracts the og:image.
+    """
+    import time
+
+    if not yandex_url or "music.yandex" not in yandex_url:
+        return None
+
+    # Check cache
+    cached = _YANDEX_ARTIST_PHOTO_CACHE.get(yandex_url)
+    if cached and (time.time() - cached[1]) < _YANDEX_CACHE_TTL:
+        return cached[0]
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        }
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Step 1: Fetch the album/track page to find artist link
+            async with session.get(yandex_url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning("[yandex-photo] page fetch failed url=%s status=%s", yandex_url, resp.status)
+                    _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                    return None
+
+                page_html = await resp.text()
+
+            # Find artist link: href="/artist/12345"
+            artist_match = re.search(r'href="(/artist/\d+)"', page_html)
+            if not artist_match:
+                logger.warning("[yandex-photo] no artist link found url=%s", yandex_url)
+                _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                return None
+
+            artist_path = artist_match.group(1)
+            artist_url = f"https://music.yandex.ru{artist_path}"
+
+            # Step 2: Fetch the artist page
+            async with session.get(artist_url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning("[yandex-photo] artist page fetch failed url=%s status=%s", artist_url, resp.status)
+                    _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                    return None
+
+                artist_html = await resp.text()
+
+            # Extract og:image
+            og_match = re.search(
+                r'<meta\s+(?:property=["\']og:image["\']\s+content=["\']([^"\']+)["\']|content=["\']([^"\']+)["\']\s+property=["\']og:image["\'])',
+                artist_html,
+                re.IGNORECASE,
+            )
+            if not og_match:
+                logger.warning("[yandex-photo] no og:image found url=%s", artist_url)
+                _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                return None
+
+            image_url = og_match.group(1) or og_match.group(2)
+            if not image_url:
+                _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                return None
+
+            # Ensure https
+            if image_url.startswith("//"):
+                image_url = "https:" + image_url
+
+            # Upgrade to larger size if possible
+            image_url = re.sub(r"%%$", "1000x1000", image_url)
+            image_url = re.sub(r"/\d+x\d+$", "/1000x1000", image_url)
+
+            logger.info("[yandex-photo] found artist photo url=%s image=%s", yandex_url, image_url)
+            _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (image_url, time.time())
+            return image_url
+
+    except asyncio.TimeoutError:
+        logger.warning("[yandex-photo] timeout url=%s", yandex_url)
+        _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+        return None
+    except Exception as e:
+        logger.warning("[yandex-photo] error url=%s error=%s", yandex_url, e)
+        _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+        return None
+
+
+async def get_artist_photo_from_links(links: dict) -> str | None:
+    """Try to get artist photo from platform links (currently only Yandex)."""
+    yandex_url = (links or {}).get("yandex")
+    if yandex_url:
+        return await fetch_yandex_artist_photo(yandex_url)
+    return None
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -486,6 +592,11 @@ def build_smartlink_index_payload(
         payload["cover_url"] = cover_url
     if owner:
         payload["owner"] = owner
+
+    # Artist photo URL (fetched from Yandex when smartlink is created/updated)
+    artist_photo_url = (smartlink or {}).get("artist_photo_url")
+    if isinstance(artist_photo_url, str) and artist_photo_url.strip():
+        payload["artist_photo_url"] = artist_photo_url.strip()
 
     return payload
 
