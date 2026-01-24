@@ -15,17 +15,12 @@ Options:
 
 import argparse
 import asyncio
-import json
 import logging
 import os
+import re
 import sys
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import aiohttp
-
-from helpers import fetch_yandex_artist_photo, normalize_base_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,6 +28,96 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# ==================== Standalone utility functions ====================
+
+def normalize_base_url(base: str | None, default: str | None = None) -> str:
+    base = (base or "").strip()
+    if not base:
+        if default is None:
+            return ""
+        base = default
+    if not re.match(r"^https?://", base):
+        base = f"https://{base}"
+    return base.rstrip("/")
+
+
+from urllib.parse import quote
+
+async def fetch_artist_photo_via_deezer(music_url: str) -> str | None:
+    """Fetch artist photo using song.link + Deezer.
+
+    1. Use song.link to get artist name from any music URL
+    2. Search for artist on Deezer
+    3. Return the artist photo URL
+    """
+    if not music_url:
+        return None
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            # Step 1: Get artist name from song.link
+            odesli_url = f"https://api.song.link/v1-alpha.1/links?url={quote(music_url)}"
+            async with session.get(odesli_url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning("[artist-photo] song.link failed url=%s status=%s", music_url, resp.status)
+                    return None
+                
+                data = await resp.json()
+                
+                # Extract artist name from any entity
+                artist_name = None
+                for entity in data.get("entitiesByUniqueId", {}).values():
+                    name = entity.get("artistName")
+                    if name:
+                        artist_name = name
+                        break
+                
+                if not artist_name:
+                    logger.warning("[artist-photo] no artist name found url=%s", music_url)
+                    return None
+
+            # Step 2: Search for artist on Deezer
+            deezer_url = f"https://api.deezer.com/search/artist?q={quote(artist_name)}"
+            async with session.get(deezer_url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning("[artist-photo] Deezer search failed artist=%s status=%s", artist_name, resp.status)
+                    return None
+                
+                deezer_data = await resp.json()
+                artists = deezer_data.get("data", [])
+                
+                if not artists:
+                    logger.warning("[artist-photo] no artist found on Deezer artist=%s", artist_name)
+                    return None
+                
+                # Get the first (best match) artist's photo
+                artist = artists[0]
+                photo_url = artist.get("picture_xl") or artist.get("picture_big") or artist.get("picture")
+                
+                if photo_url:
+                    logger.info("[artist-photo] found photo artist=%s url=%s", artist_name, photo_url)
+                    return photo_url
+                
+                return None
+
+    except asyncio.TimeoutError:
+        logger.warning("[artist-photo] timeout url=%s", music_url)
+        return None
+    except Exception as e:
+        logger.warning("[artist-photo] error url=%s error=%s", music_url, e)
+        return None
+
+
+# Alias for backward compatibility
+async def fetch_yandex_artist_photo(yandex_url: str) -> str | None:
+    return await fetch_artist_photo_via_deezer(yandex_url)
+
+
+# ==================== API functions ====================
 
 async def fetch_smartlinks_needing_migration(session: aiohttp.ClientSession, base_url: str, api_key: str) -> list[dict]:
     """Fetch smartlinks that need artist photo migration."""
@@ -77,7 +162,7 @@ async def update_smartlink(
     
     url = f"{base_url}/api/index/upsert"
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "X-API-Key": api_key,
         "Content-Type": "application/json",
         "X-Skip-Sync": "1",
     }
