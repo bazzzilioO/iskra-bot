@@ -17,109 +17,108 @@ def escape_html(text: str | None) -> str:
     return html.escape(text or "")
 
 
-# ==================== Yandex artist photo fetching ====================
-_YANDEX_ARTIST_PHOTO_CACHE: dict[str, tuple[str | None, float]] = {}
-_YANDEX_CACHE_TTL = 3600.0  # 1 hour
+# ==================== Artist photo fetching (via song.link + Deezer) ====================
+_ARTIST_PHOTO_CACHE: dict[str, tuple[str | None, float]] = {}
+_ARTIST_PHOTO_CACHE_TTL = 3600.0  # 1 hour
 
 
-async def fetch_yandex_artist_photo(yandex_url: str) -> str | None:
-    """Fetch artist photo from Yandex Music.
+async def fetch_artist_photo_via_deezer(music_url: str) -> str | None:
+    """Fetch artist photo using song.link + Deezer.
 
-    Given a Yandex album/track URL, fetches the page, finds the artist link,
-    then fetches the artist page and extracts the og:image.
+    1. Use song.link to get artist name from any music URL
+    2. Search for artist on Deezer
+    3. Return the artist photo URL
     """
     import time
+    from urllib.parse import quote
 
-    if not yandex_url or "music.yandex" not in yandex_url:
+    if not music_url:
         return None
 
     # Check cache
-    cached = _YANDEX_ARTIST_PHOTO_CACHE.get(yandex_url)
-    if cached and (time.time() - cached[1]) < _YANDEX_CACHE_TTL:
+    cached = _ARTIST_PHOTO_CACHE.get(music_url)
+    if cached and (time.time() - cached[1]) < _ARTIST_PHOTO_CACHE_TTL:
         return cached[0]
 
-    logger = logging.getLogger(__name__)
-
     try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        }
+        timeout = aiohttp.ClientTimeout(total=20)
+        headers = {"User-Agent": "Mozilla/5.0"}
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Step 1: Fetch the album/track page to find artist link
-            async with session.get(yandex_url, headers=headers) as resp:
+            # Step 1: Get artist name from song.link
+            odesli_url = f"https://api.song.link/v1-alpha.1/links?url={quote(music_url)}"
+            async with session.get(odesli_url, headers=headers) as resp:
                 if resp.status != 200:
-                    logger.warning("[yandex-photo] page fetch failed url=%s status=%s", yandex_url, resp.status)
-                    _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                    logger.warning("[artist-photo] song.link failed url=%s status=%s", music_url, resp.status)
+                    _ARTIST_PHOTO_CACHE[music_url] = (None, time.time())
                     return None
 
-                page_html = await resp.text()
+                data = await resp.json()
 
-            # Find artist link: href="/artist/12345"
-            artist_match = re.search(r'href="(/artist/\d+)"', page_html)
-            if not artist_match:
-                logger.warning("[yandex-photo] no artist link found url=%s", yandex_url)
-                _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
-                return None
+                # Extract artist name from any entity
+                artist_name = None
+                for entity in data.get("entitiesByUniqueId", {}).values():
+                    name = entity.get("artistName")
+                    if name:
+                        artist_name = name
+                        break
 
-            artist_path = artist_match.group(1)
-            artist_url = f"https://music.yandex.ru{artist_path}"
-
-            # Step 2: Fetch the artist page
-            async with session.get(artist_url, headers=headers) as resp:
-                if resp.status != 200:
-                    logger.warning("[yandex-photo] artist page fetch failed url=%s status=%s", artist_url, resp.status)
-                    _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                if not artist_name:
+                    logger.warning("[artist-photo] no artist name found url=%s", music_url)
+                    _ARTIST_PHOTO_CACHE[music_url] = (None, time.time())
                     return None
 
-                artist_html = await resp.text()
+            # Step 2: Search for artist on Deezer
+            deezer_url = f"https://api.deezer.com/search/artist?q={quote(artist_name)}"
+            async with session.get(deezer_url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning("[artist-photo] Deezer search failed artist=%s status=%s", artist_name, resp.status)
+                    _ARTIST_PHOTO_CACHE[music_url] = (None, time.time())
+                    return None
 
-            # Extract og:image
-            og_match = re.search(
-                r'<meta\s+(?:property=["\']og:image["\']\s+content=["\']([^"\']+)["\']|content=["\']([^"\']+)["\']\s+property=["\']og:image["\'])',
-                artist_html,
-                re.IGNORECASE,
-            )
-            if not og_match:
-                logger.warning("[yandex-photo] no og:image found url=%s", artist_url)
-                _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+                deezer_data = await resp.json()
+                artists = deezer_data.get("data", [])
+
+                if not artists:
+                    logger.warning("[artist-photo] no artist found on Deezer artist=%s", artist_name)
+                    _ARTIST_PHOTO_CACHE[music_url] = (None, time.time())
+                    return None
+
+                # Get the first (best match) artist's photo
+                artist = artists[0]
+                photo_url = artist.get("picture_xl") or artist.get("picture_big") or artist.get("picture")
+
+                if photo_url:
+                    logger.info("[artist-photo] found photo artist=%s url=%s", artist_name, photo_url)
+                    _ARTIST_PHOTO_CACHE[music_url] = (photo_url, time.time())
+                    return photo_url
+
+                _ARTIST_PHOTO_CACHE[music_url] = (None, time.time())
                 return None
-
-            image_url = og_match.group(1) or og_match.group(2)
-            if not image_url:
-                _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
-                return None
-
-            # Ensure https
-            if image_url.startswith("//"):
-                image_url = "https:" + image_url
-
-            # Upgrade to larger size if possible
-            image_url = re.sub(r"%%$", "1000x1000", image_url)
-            image_url = re.sub(r"/\d+x\d+$", "/1000x1000", image_url)
-
-            logger.info("[yandex-photo] found artist photo url=%s image=%s", yandex_url, image_url)
-            _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (image_url, time.time())
-            return image_url
 
     except asyncio.TimeoutError:
-        logger.warning("[yandex-photo] timeout url=%s", yandex_url)
-        _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+        logger.warning("[artist-photo] timeout url=%s", music_url)
+        _ARTIST_PHOTO_CACHE[music_url] = (None, time.time())
         return None
     except Exception as e:
-        logger.warning("[yandex-photo] error url=%s error=%s", yandex_url, e)
-        _YANDEX_ARTIST_PHOTO_CACHE[yandex_url] = (None, time.time())
+        logger.warning("[artist-photo] error url=%s error=%s", music_url, e)
+        _ARTIST_PHOTO_CACHE[music_url] = (None, time.time())
         return None
 
 
 async def get_artist_photo_from_links(links: dict) -> str | None:
-    """Try to get artist photo from platform links (currently only Yandex)."""
-    yandex_url = (links or {}).get("yandex")
-    if yandex_url:
-        return await fetch_yandex_artist_photo(yandex_url)
+    """Try to get artist photo from platform links.
+    
+    Uses song.link + Deezer to find artist photos from any streaming URL.
+    Priority: Spotify > Apple > Yandex > Deezer > other
+    """
+    # Try platforms in order of reliability for song.link
+    for platform in ("spotify", "apple", "itunes", "yandex", "deezer", "tidal"):
+        url = (links or {}).get(platform)
+        if url:
+            photo = await fetch_artist_photo_via_deezer(url)
+            if photo:
+                return photo
     return None
 
 
