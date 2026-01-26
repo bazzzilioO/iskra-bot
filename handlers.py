@@ -2549,8 +2549,8 @@ async def any_message_router(message: Message):
                     kind = (candidate.get("album_type") or candidate.get("kind") or "").strip()
                     kind_suffix = f" ({kind})" if kind else ""
                     label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}{kind_suffix}".strip(" —")
-                    if len(label) > 60:
-                        label = label[:57] + "…"
+                    if len(label) > 42:
+                        label = label[:39] + "…"
                     if not label:
                         label = f"Вариант {idx + 1}"
                     rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlink:upc_pick:{idx}")])
@@ -2665,8 +2665,8 @@ async def any_message_router(message: Message):
                 kind = (candidate.get("album_type") or candidate.get("kind") or "").strip()
                 kind_suffix = f" ({kind})" if kind else ""
                 label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}{kind_suffix}".strip(" —")
-                if len(label) > 60:
-                    label = label[:57] + "…"
+                if len(label) > 42:
+                    label = label[:39] + "…"
                 if not label:
                     label = f"Вариант {idx + 1}"
                 rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlink:upc_pick:{idx}")])
@@ -2716,18 +2716,18 @@ async def any_message_router(message: Message):
                 for idx, candidate in enumerate(results):
                     kind = (candidate.get("album_type") or candidate.get("kind") or "").strip()
                     kind_suffix = f" ({kind})" if kind else ""
-                    label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}{kind_suffix}".strip(" —")
-                    if len(label) > 60:
-                        label = label[:57] + "…"
-                    if not label:
-                        label = f"Вариант {idx + 1}"
-                    rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlink:upc_pick:{idx}")])
-                rows.append([InlineKeyboardButton(text="Отмена", callback_data="smartlink:upc_cancel")])
-                await message.answer(
-                    "Выбери релиз по UPC:",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-                )
-            return
+                label = f"{candidate.get('artist') or ''} — {candidate.get('title') or ''}{kind_suffix}".strip(" —")
+                if len(label) > 42:
+                    label = label[:39] + "…"
+                if not label:
+                    label = f"Вариант {idx + 1}"
+                rows.append([InlineKeyboardButton(text=label, callback_data=f"smartlink:upc_pick:{idx}")])
+            rows.append([InlineKeyboardButton(text="Отмена", callback_data="smartlink:upc_cancel")])
+            await message.answer(
+                "Выбери релиз по UPC:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+            )
+        return
 
         if not re.match(r"https?://", txt):
             await message.answer(
