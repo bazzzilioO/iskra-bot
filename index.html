@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SREDA</title>
-  <meta name="description" content="Инструменты для независимых артистов: релиз-план, смартлинки, напоминания." />
+  <meta name="description" content="Инфраструктура для инструментов независимых артистов. ИСКРА — первый запущенный продукт." />
   <style>
     :root { color-scheme: dark; }
     body{
@@ -29,6 +29,10 @@
       border:0;
     }
     .btn:hover{ opacity:.92; }
+    .btn-secondary{
+      background:transparent; color:#e8eef6; border:1px solid rgba(255,255,255,.2);
+    }
+    .btn-secondary:hover{ background:rgba(255,255,255,.05); }
     .row{ display:flex; gap:12px; flex-wrap:wrap; margin-top:14px; }
     .link{ color:#b9c6d6; text-decoration:none; }
     .link:hover{ color:#e8eef6; }
@@ -37,22 +41,32 @@
       border:1px solid rgba(255,255,255,.10);
       color:#b9c6d6; font-size:12px; margin-bottom:14px;
     }
+    .status{
+      margin-top:18px; font-size:13px; color:#8ea0b5;
+    }
   </style>
 </head>
 <body>
   <div class="card">
-    <div class="tag">SREDA • tools for artists</div>
     <h1>SREDA</h1>
-    <p>Инструменты для независимых артистов: релиз-план, смартлинки, напоминания, кабинеты артиста и питчинг.</p>
+    <p>Инфраструктура для инструментов независимых артистов.<br>ИСКРА — первый запущенный продукт.</p>
 
     <div class="row">
-      <a class="btn" href="https://t.me/iskramusic_bot" target="_blank" rel="noopener">
-        ⚡ Открыть ИСКРУ в Telegram
+      <a class="btn" href="https://go.sreda.pw/" target="_blank" rel="noopener">
+        Перейти к ИСКРЕ
       </a>
-      <a class="link" href="https://t.me/sreda_music" target="_blank" rel="noopener">
-        📰 Обновления проекта
+      <a class="btn btn-secondary" href="https://t.me/iskramusic_bot" target="_blank" rel="noopener">
+        Открыть ИСКРУ в Telegram
       </a>
     </div>
+    
+    <a class="link" href="/updates" style="display:block; margin-top:14px;">
+      Обновления проекта
+    </a>
+
+    <p class="status">
+      SREDA находится в разработке. Новые инструменты запускаются постепенно.
+    </p>
 
     <p style="margin-top:18px; font-size:13px; color:#8ea0b5;">
       © SREDA • beta
