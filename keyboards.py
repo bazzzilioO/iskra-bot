@@ -17,6 +17,7 @@ LINKS = {
     "kion_pitch": "https://music.mts.ru/pitch",  # КИОН (бывш. МТС Music)
     "zvuk_pitch": "https://help.zvuk.com/article/67859",
     "zvuk_studio": "https://studio.zvuk.com/",
+    "vk_studio": "https://studio.vk.com/",
     "vk_studio_info": "https://the-flow.ru/features/zachem-artistu-studiya-servis-vk-muzyki",
     "tiktok_for_artists": "https://artists.tiktok.com/",
 }
@@ -342,9 +343,26 @@ def build_accounts_checklist(accounts_state: dict[str, int]) -> tuple[str, Inlin
         v = accounts_state.get(key, 0)
         emoji = "▫️" if v == 0 else ("⏳" if v == 1 else "✅")
         text += f"{emoji} {name}\n"
-    inline = []
+
+    account_urls: dict[str, str] = {
+        "spotify": LINKS["spotify_for_artists"],
+        "yandex": LINKS["yandex_artists_hub"],
+        "vk": LINKS.get("vk_studio") or LINKS.get("vk_studio_info") or "",
+        "zvuk": LINKS["zvuk_studio"],
+        "tiktok": LINKS["tiktok_for_artists"],
+    }
+
+    inline: list[list[InlineKeyboardButton]] = []
     for key, name in ACCOUNTS:
-        inline.append([InlineKeyboardButton(text=f"{name}", callback_data=f"accounts:cycle:{key}")])
+        v = accounts_state.get(key, 0)
+        emoji = "▫️" if v == 0 else ("⏳" if v == 1 else "✅")
+        row: list[InlineKeyboardButton] = [
+            InlineKeyboardButton(text=f"{emoji} {name}", callback_data=f"accounts:cycle:{key}")
+        ]
+        url = account_urls.get(key) or ""
+        if url.startswith("http"):
+            row.append(InlineKeyboardButton(text="🔗 Открыть", url=url))
+        inline.append(row)
     inline.append([InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_focus")])
     return text, InlineKeyboardMarkup(inline_keyboard=inline)
 
@@ -380,10 +398,9 @@ def smartlinks_menu_kb() -> InlineKeyboardMarkup:
 def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
-    smartlink_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug)
-    rows = [
-        [InlineKeyboardButton(text="🔗 Открыть", callback_data=f"smartlinks:open:{smartlink_key}:{page}")],
-    ]
+    # Prefer short local numeric id to avoid Telegram callback_data limits.
+    smartlink_id = smartlink.get("d1_id") or smartlink.get("id") or build_smartlink_id(artist_slug, slug)
+    rows = [[InlineKeyboardButton(text="🔗 Открыть карточку", callback_data=f"smartlinks:open:{smartlink_key}:{page}")]]
     if smartlink_id:
         rows.append(
             [
@@ -393,6 +410,9 @@ def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
                 )
             ]
         )
+    # If BandLink is present, allow refreshing platforms from it.
+    if (smartlink.get("links") or {}).get("bandlink"):
+        rows.append([InlineKeyboardButton(text="🔄 Обновить ссылки (BandLink)", callback_data=f"smartlinks:refresh:{smartlink_key}:{page}")])
     rows.extend(
         [
             [InlineKeyboardButton(text="📋 Скопировать ссылки", callback_data=f"smartlinks:copy:{smartlink_key}")],
@@ -456,6 +476,12 @@ def smartlink_edit_menu_kb(
                 InlineKeyboardButton(
                     text=branding_text,
                     callback_data=f"smartlinks:branding_toggle:{smartlink_id}:{page}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Удалить",
+                    callback_data=f"smartlinks:delete:{smartlink_key}:{page}",
                 )
             ],
             [
@@ -544,6 +570,7 @@ def build_smartlink_buttons(
     page: int | None = None,
     web_url: str | None = None,
     can_update_web: bool = False,
+    include_tech: bool = True,
 ) -> InlineKeyboardMarkup | None:
     rows: list[list[InlineKeyboardButton]] = []
     links = smartlink.get("links") or {}
@@ -551,7 +578,8 @@ def build_smartlink_buttons(
     presave_active = smartlink_pre_save_active(smartlink)
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
-    smartlink_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug)
+    # Prefer short local numeric id to avoid Telegram callback_data limits.
+    smartlink_id = smartlink.get("d1_id") or smartlink.get("id") or build_smartlink_id(artist_slug, slug)
 
     platform_rows: list[list[InlineKeyboardButton]] = []
 
@@ -570,6 +598,11 @@ def build_smartlink_buttons(
 
     if web_url:
         rows.append([InlineKeyboardButton(text="🌐 Открыть web", url=web_url)])
+
+    # Keep the smartlink card clean for sharing: technical buttons can be accessed via the
+    # "📎 Мои смартлинки" menu (smartlink_view_kb) / edit menu.
+    if not include_tech:
+        return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
     if can_update_web:
         rows.append(
@@ -608,6 +641,7 @@ def build_smartlink_keyboard(
     page: int | None = None,
     web_url: str | None = None,
     can_update_web: bool = False,
+    include_tech: bool = True,
 ) -> InlineKeyboardMarkup | None:
     return build_smartlink_buttons(
         smartlink,
@@ -616,6 +650,7 @@ def build_smartlink_keyboard(
         page=page,
         web_url=web_url,
         can_update_web=can_update_web,
+        include_tech=include_tech,
     )
 
 

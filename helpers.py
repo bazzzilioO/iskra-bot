@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -23,6 +24,30 @@ DEFAULT_SMARTLINK_BASE = "https://go.sreda.pw"
 SMARTLINK_WEB_BASE = None
 
 
+def _is_html_response(body: str | None) -> bool:
+    """Проверяет, является ли ответ HTML страницей (например, от Cloudflare Rate Limit)."""
+    if not body:
+        return False
+    body_lower = body.strip().lower()
+    return body_lower.startswith("<!doctype") or body_lower.startswith("<html") or "<title>" in body_lower[:500]
+
+
+def _sanitize_body_for_logging(body: str | None, max_length: int = 200) -> str:
+    """Очищает тело ответа для логирования - убирает HTML и обрезает длинные строки."""
+    if not body:
+        return ""
+    if _is_html_response(body):
+        # Для HTML ищем название ошибки
+        if "rate limited" in body.lower():
+            return "<HTML: Cloudflare Rate Limit>"
+        if "error" in body.lower():
+            return "<HTML: Error page>"
+        return "<HTML response>"
+    if len(body) > max_length:
+        return body[:max_length] + "..."
+    return body
+
+
 def log_missing_index_token(status: int | None, body: str | None, context: str) -> bool:
     normalized_body = (body or "").lower()
     if status == 500 or "missing_index_token" in normalized_body:
@@ -30,7 +55,7 @@ def log_missing_index_token(status: int | None, body: str | None, context: str) 
             "[smartlink-index] missing index token context=%s status=%s body=%s",
             context,
             status,
-            body,
+            _sanitize_body_for_logging(body),
         )
         return True
     return False
@@ -48,6 +73,93 @@ def normalize_base_url(base: str | None, default: str | None = DEFAULT_SMARTLINK
 
 
 SMARTLINK_WEB_BASE = normalize_base_url(os.getenv("SMARTLINK_WEB_BASE"), DEFAULT_SMARTLINK_BASE)
+
+
+# ==================== Anti-phishing URL allowlist ====================
+_PLATFORM_ALLOWED_HOSTS: dict[str, set[str]] = {
+    # Streaming platforms
+    "spotify": {"open.spotify.com"},
+    "apple": {"music.apple.com"},
+    # iTunes may still appear as itunes.apple.com in some places
+    "itunes": {"music.apple.com", "itunes.apple.com"},
+    "yandex": {"music.yandex.ru"},
+    "vk": {"vk.com", "m.vk.com"},
+    "deezer": {"deezer.com", "www.deezer.com"},
+    "youtube": {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"},
+    "youtubemusic": {"music.youtube.com"},
+    # Zvuk
+    "zvuk": {"zvuk.com", "open.zvuk.com"},
+    # MTS Music / KION
+    "kion": {"kion.ru", "music.mts.ru"},
+    # Aggregators we explicitly support
+    "bandlink": {"band.link", "bandlink.to"},
+}
+
+
+def _normalize_hostname(url: str) -> str:
+    """Extract lowercase hostname for allowlist checks."""
+    try:
+        parsed = urlparse((url or "").strip())
+    except Exception:
+        return ""
+    host = (parsed.hostname or "").strip().lower()
+    # Defensive normalization: strip trailing dot (rare but valid in DNS)
+    if host.endswith("."):
+        host = host[:-1]
+    return host
+
+
+def is_allowed_platform_url(platform: str, url: str) -> bool:
+    """Anti-phishing guard: ensure platform URL points to official domain.
+
+    For unknown platforms we return False (explicit allowlist).
+    """
+    platform = (platform or "").strip().lower()
+    url = (url or "").strip()
+    if not platform or not url:
+        return False
+    allowed = _PLATFORM_ALLOWED_HOSTS.get(platform)
+    if not allowed:
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if (parsed.scheme or "").lower() not in {"http", "https"}:
+        return False
+    host = _normalize_hostname(url)
+    if not host:
+        return False
+    for canon in allowed:
+        canon = canon.lower()
+        if host == canon or host.endswith("." + canon):
+            return True
+    return False
+
+
+def filter_platform_links_by_allowlist(links: dict) -> tuple[dict[str, str], dict[str, str]]:
+    """Return (allowed_links, rejected_links).
+
+    Rejected links are returned as {platform: url} for diagnostics.
+    """
+    allowed_links: dict[str, str] = {}
+    rejected: dict[str, str] = {}
+    if not isinstance(links, dict):
+        return allowed_links, rejected
+    for k, v in links.items():
+        if not k or not v or not isinstance(k, str) or not isinstance(v, str):
+            continue
+        platform = k.strip().lower()
+        url = v.strip()
+        if not url:
+            continue
+        if is_allowed_platform_url(platform, url):
+            allowed_links[platform] = url
+        else:
+            # Only keep rejections for known platforms (avoid noisy unknown keys)
+            if platform in _PLATFORM_ALLOWED_HOSTS:
+                rejected[platform] = url
+    return allowed_links, rejected
 
 
 def format_date_ru(value: dt.date | dt.datetime | str | None) -> str:
@@ -71,7 +183,7 @@ async def safe_edit(target: Message, text: str, reply_markup: InlineKeyboardMark
         try:
             return await target.answer(text, reply_markup=reply_markup)
         except Exception as answer_err:
-            print(f"[safe_edit] edit failed: {edit_err}; answer failed: {answer_err}")
+            logger.warning("[safe_edit] edit failed: %s; answer failed: %s", edit_err, answer_err)
             return None
 
 
@@ -126,7 +238,7 @@ async def safe_edit_caption(message: Message, caption: str, kb: InlineKeyboardMa
                 parse_mode="HTML",
             )
         except Exception as answer_err:
-            print(f"[safe_edit_caption] edit failed: {edit_err}; answer failed: {answer_err}")
+            logger.warning("[safe_edit_caption] edit failed: %s; answer failed: %s", edit_err, answer_err)
             return None
 
 
@@ -312,7 +424,10 @@ def build_smartlink_index_payload(
     if telegram_file_id:
         cover_source_type = "telegram"
         cover_source_payload = {"type": "telegram", "file_id": telegram_file_id}
-        cover_url = f"{SMARTLINK_WEB_BASE}/api/cover/{artist_slug}/{slug}"
+        # Prefer an explicit cover_url already present in the smartlink payload (e.g. bot cover proxy).
+        # Fallback to SMARTLINK_WEB_BASE only if nothing was provided.
+        if not cover_url:
+            cover_url = f"{SMARTLINK_WEB_BASE}/api/cover/{artist_slug}/{slug}"
     elif cover_url:
         cover_source_type = "external"
     else:
@@ -380,7 +495,13 @@ async def push_smartlink_to_index(
 ) -> tuple[bool, int | None, str | None]:
     base_url = normalize_base_url(os.getenv("SMARTLINK_INDEX_BASE"), None)
     index_url = f"{base_url}/api/index/upsert"
-    api_key = os.getenv("SMARTLINK_API_KEY")
+    api_key = (
+        os.getenv("SMARTLINK_API_KEY")
+        or os.getenv("GO_API_KEY")
+        or os.getenv("GO_API_TOKEN")
+        or os.getenv("SMARTLINK_INDEX_TOKEN")
+        or os.getenv("SMARTLINK_TOKEN")
+    )
     if not base_url:
         logger.info("[smartlink-index] index url is not configured, skipping")
         return False, None, "config_missing"
@@ -412,15 +533,34 @@ async def push_smartlink_to_index(
                         body = await resp.text()
                     except Exception:
                         body = None
-                    truncated_body = (body[:1000] if body else body)
+                    sanitized_body = _sanitize_body_for_logging(body)
                     logger.info(
                         "[smartlink-index] worker response status=%s body=%s",
                         resp.status,
-                        truncated_body,
+                        sanitized_body,
                     )
                     last_status = resp.status
+                    
+                    # Обработка Rate Limit (429) от Cloudflare
+                    if resp.status == 429 or (body and _is_html_response(body) and "rate limited" in body.lower()):
+                        last_error = "rate_limit"
+                        logger.warning(
+                            "[smartlink-index] rate limited by Cloudflare, will retry with longer delay"
+                        )
+                        if attempt < max_attempts:
+                            # Для rate limit используем более длинную задержку
+                            backoff_seconds = min(60 * attempt, 300)  # До 5 минут
+                            logger.info(
+                                "[smartlink-index] retrying after rate limit backoff=%ss attempt=%s",
+                                backoff_seconds,
+                                attempt + 1,
+                            )
+                            await asyncio.sleep(backoff_seconds)
+                            continue
+                        return False, 429, "rate_limit"
+                    
                     if log_missing_index_token(resp.status, body, "push_smartlink_to_index"):
-                        return False, resp.status, truncated_body
+                        return False, resp.status, sanitized_body
                     if 200 <= resp.status < 300:
                         verified, verify_status, verify_error = await _verify_index_entry(
                             session, base_url, payload["artist_slug"], payload["slug"], headers
@@ -428,9 +568,9 @@ async def push_smartlink_to_index(
                         if verified:
                             return True, resp.status, None
                         return False, verify_status, verify_error
-                    last_error = truncated_body
+                    last_error = sanitized_body
                     if resp.status < 500:
-                        return False, resp.status, truncated_body
+                        return False, resp.status, sanitized_body
         except Exception as err:
             last_status = None
             last_error = str(err)
@@ -464,9 +604,9 @@ async def _verify_index_entry(
                 body = await resp.text()
             except Exception:
                 body = None
-            truncated_body = body[:1000] if body else body
+            sanitized_body = _sanitize_body_for_logging(body)
             if log_missing_index_token(status, body, "verify_index_entry"):
-                return False, status, truncated_body
+                return False, status, sanitized_body
             if status == 404:
                 logger.error(
                     "[smartlink-index] verify failed: not found artist_slug=%s slug=%s",
@@ -481,9 +621,9 @@ async def _verify_index_entry(
                 artist_slug,
                 slug,
                 status,
-                truncated_body,
+                sanitized_body,
             )
-            return False, status, truncated_body
+            return False, status, sanitized_body
     except Exception as err:
         logger.warning(
             "[smartlink-index] verify error artist_slug=%s slug=%s error=%s",
