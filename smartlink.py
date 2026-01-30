@@ -41,6 +41,7 @@ from db import (
     fetch_owned_smartlink_from_d1,
     delete_owned_smartlink_from_d1,
     delete_smartlink_state,
+    get_releases_by_artist,
     get_smartlinks_by_artist,
     get_user_artists,
     upsert_owned_smartlink_to_d1,
@@ -77,8 +78,10 @@ from keyboards import (
     PLATFORM_LABELS,
     SMARTLINK_BUTTON_ORDER,
     SMARTLINK_PLATFORMS,
+    build_artist_releases_kb,
     build_artist_smartlinks_kb,
     build_artists_list_kb,
+    build_release_artists_list_kb,
     build_smartlink_buttons,
     build_smartlink_keyboard,
     smartlink_step_kb,
@@ -86,7 +89,10 @@ from keyboards import (
     smartlinks_menu_kb,
 )
 from texts import (
+    ARTIST_EMPTY_RELEASES,
     ARTIST_EMPTY_SMARTLINKS,
+    MY_RELEASES_ARTISTS_TITLE,
+    MY_RELEASES_EMPTY_ARTISTS,
     MY_SMARTLINKS_ARTISTS_TITLE,
     MY_SMARTLINKS_EMPTY_ARTISTS,
     SMARTLINK_ARTIST_INPUT_PROMPT,
@@ -1523,9 +1529,28 @@ async def send_smartlink_photo(
         return await _send_smartlink_fallback(bot, chat_id, smartlink)
 
 
+async def _artists_from_index(tg_id: int, limit: int = 200) -> list[str]:
+    """Fallback: get unique artist names from Index when D1 is empty (e.g. smartlinks only in web)."""
+    ok, items, _, _ = await fetch_my_smartlinks_from_index(tg_id, page=0, limit=limit)
+    if not ok or not items:
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for it in items:
+        name = (it.get("artist_name") or it.get("artist") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    result.sort(key=lambda s: s.lower())
+    return result
+
+
 async def send_artists_list(message: Message, tg_id: int):
-    """Show list of user's artists (from artist_name in smartlinks). Store artists in FSM for stateless callbacks."""
+    """Show list of user's artists (D1 first; fallback to Index so «Мои смартлинки» sees web-only data)."""
     artists = await get_user_artists(tg_id)
+    if not artists:
+        artists = await _artists_from_index(tg_id)
     if not artists:
         await message.answer(
             MY_SMARTLINKS_EMPTY_ARTISTS,
@@ -1542,10 +1567,29 @@ async def send_artists_list(message: Message, tg_id: int):
     await message.answer(text, reply_markup=kb)
 
 
+async def _smartlinks_by_artist_with_index_fallback(
+    tg_id: int, artist_name: str
+) -> list[dict]:
+    """Smartlinks for one artist: D1 first; fallback to Index so web-only data is visible."""
+    items = await get_smartlinks_by_artist(tg_id, artist_name)
+    if items:
+        return items
+    ok, index_items, _, _ = await fetch_my_smartlinks_from_index(tg_id, page=0, limit=200)
+    if not ok or not index_items:
+        return []
+    artist_name_norm = (artist_name or "").strip()
+    out: list[dict] = []
+    for it in index_items:
+        name = (it.get("artist_name") or it.get("artist") or "").strip()
+        if name == artist_name_norm:
+            out.append(it)
+    return out
+
+
 async def send_artist_smartlinks(
     message: Message, tg_id: int, artist_name: str, artist_idx: int | None = None
 ):
-    """Show smartlinks for one artist (from D1). artist_idx used for edit-menu back callback."""
+    """Show smartlinks for one artist (D1 first; fallback Index). artist_idx for edit-menu back."""
     artist_name = (artist_name or "").strip()
     if not artist_name:
         await message.answer(
@@ -1553,7 +1597,7 @@ async def send_artist_smartlinks(
             reply_markup=smartlinks_menu_kb(),
         )
         return
-    items = await get_smartlinks_by_artist(tg_id, artist_name)
+    items = await _smartlinks_by_artist_with_index_fallback(tg_id, artist_name)
     try:
         deleted = await list_deleted_smartlinks(tg_id)
     except Exception:
@@ -1581,6 +1625,69 @@ async def send_artist_smartlinks(
         lines.append(f"{idx}. {title}")
     text = "\n".join(lines)
     kb = build_artist_smartlinks_kb(items, artist_idx if artist_idx is not None else -1)
+    await message.answer(text, reply_markup=kb)
+
+
+async def send_releases_list(message: Message, tg_id: int):
+    """Show list of user's artists for «Мои релизы». D1 first; fallback to Index."""
+    artists = await get_user_artists(tg_id)
+    if not artists:
+        artists = await _artists_from_index(tg_id)
+    if not artists:
+        await message.answer(
+            MY_RELEASES_EMPTY_ARTISTS,
+            reply_markup=smartlinks_menu_kb(),
+        )
+        return
+    await form_start(tg_id, "release_artists_list")
+    await form_set(tg_id, 0, {"artists": artists})
+    if len(artists) == 1:
+        await send_artist_releases(message, tg_id, artists[0], artist_idx=0)
+        return
+    text = MY_RELEASES_ARTISTS_TITLE
+    kb = build_release_artists_list_kb(artists)
+    await message.answer(text, reply_markup=kb)
+
+
+async def send_artist_releases(
+    message: Message, tg_id: int, artist_name: str, artist_idx: int | None = None
+):
+    """Show releases (smartlinks) for one artist. D1 first; fallback Index. artist_idx for edit back."""
+    artist_name = (artist_name or "").strip()
+    if not artist_name:
+        await message.answer(
+            MY_RELEASES_EMPTY_ARTISTS,
+            reply_markup=smartlinks_menu_kb(),
+        )
+        return
+    items = await _smartlinks_by_artist_with_index_fallback(tg_id, artist_name)
+    try:
+        deleted = await list_deleted_smartlinks(tg_id)
+    except Exception:
+        deleted = set()
+    if deleted and items:
+        items = [
+            it
+            for it in items
+            if (str(it.get("artist_slug") or "").strip(), str(it.get("slug") or "").strip())
+            not in deleted
+        ]
+    if not items:
+        text = f"{artist_name}\n\n{ARTIST_EMPTY_RELEASES}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Новый смартлинк", callback_data="smartlinks:create")],
+                [InlineKeyboardButton(text="◀️ К артистам", callback_data="release_back")],
+            ]
+        )
+        await message.answer(text, reply_markup=kb)
+        return
+    lines = [artist_name, ""]
+    for idx, item in enumerate(items, 1):
+        title = item.get("title") or item.get("track_title") or "Без названия"
+        lines.append(f"{idx}. {title}")
+    text = "\n".join(lines)
+    kb = build_artist_releases_kb(items, artist_idx if artist_idx is not None else -1)
     await message.answer(text, reply_markup=kb)
 
 

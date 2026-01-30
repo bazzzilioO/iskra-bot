@@ -390,6 +390,7 @@ def smartlinks_menu_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Создать смарт-линк", callback_data="smartlinks:create")],
             [InlineKeyboardButton(text="📎 Мои смартлинки", callback_data="smartlinks:my:0")],
+            [InlineKeyboardButton(text="📀 Мои релизы", callback_data="releases:my:0")],
             [InlineKeyboardButton(text="❓ Помощь по смарт-линкам", callback_data="smartlinks:help")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_focus")],
         ]
@@ -452,6 +453,62 @@ def build_artist_smartlinks_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def build_release_artists_list_kb(artists: list[str]) -> InlineKeyboardMarkup:
+    """One button per artist for «Мои релизы»; callback_data = release_open_idx:n (FSM)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for idx, name in enumerate(artists):
+        rows.append([
+            InlineKeyboardButton(text=name, callback_data=f"release_open_idx:{idx}"),
+        ])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="release_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_artist_releases_kb(
+    items: list[dict],
+    artist_idx: int,
+    *,
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    """Keyboard for one artist's releases list (same items as smartlinks). artist_idx for back from edit."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items:
+        artist_slug = str(item.get("artist_slug") or "").strip()
+        slug = str(item.get("slug") or "").strip()
+        smartlink_id = item.get("id")
+        if not artist_slug or not slug:
+            artist_slug, slug = get_smartlink_slugs(item)
+        if not smartlink_id and artist_slug and slug:
+            smartlink_id = build_smartlink_id(artist_slug, slug)
+        base = (SMARTLINK_WEB_BASE or "https://go.sreda.pw").rstrip("/")
+        canonical_url = (
+            f"{base}/{artist_slug}/{slug}" if artist_slug and slug else None
+        )
+        row: list[InlineKeyboardButton] = []
+        if canonical_url:
+            row.append(InlineKeyboardButton(text="🌐 Открыть", url=canonical_url))
+        if smartlink_id:
+            if artist_idx >= 0:
+                row.append(
+                    InlineKeyboardButton(
+                        text="✏️ Редактировать",
+                        callback_data=f"smartlinks:edit:{smartlink_id}:ridx{artist_idx}",
+                    )
+                )
+            else:
+                row.append(
+                    InlineKeyboardButton(
+                        text="✏️ Редактировать",
+                        callback_data=f"smartlinks:edit:{smartlink_id}:p0",
+                    )
+                )
+        if row:
+            rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ К артистам", callback_data="release_back")])
+    rows.append([InlineKeyboardButton(text="➕ Новый смартлинк", callback_data="smartlinks:create")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def smartlink_view_kb(smartlink: dict, page: int) -> InlineKeyboardMarkup:
     artist_slug, slug = get_smartlink_slugs(smartlink)
     smartlink_key = build_smartlink_key(artist_slug, slug)
@@ -489,6 +546,7 @@ def smartlink_edit_menu_kb(
     branding_disabled: bool = False,
     branding_paid: bool = False,
     back_artist_idx: int | None = None,
+    back_release_artist_idx: int | None = None,
 ) -> InlineKeyboardMarkup:
     if branding_disabled:
         branding_text = "🏷 Брендинг ИСКРЫ: Выкл"
@@ -497,7 +555,9 @@ def smartlink_edit_menu_kb(
     else:
         branding_text = "Убрать брендинг ⭐10"
     smartlink_key = build_smartlink_key(artist_slug, slug)
-    if back_artist_idx is not None and back_artist_idx >= 0:
+    if back_release_artist_idx is not None and back_release_artist_idx >= 0:
+        back_callback = f"releases:artist_idx:{back_release_artist_idx}"
+    elif back_artist_idx is not None and back_artist_idx >= 0:
         back_callback = f"smartlinks:artist_idx:{back_artist_idx}"
     else:
         back_callback = f"smartlinks:view:{smartlink_key}:{page}" if smartlink_key else f"smartlinks:my:{page}"

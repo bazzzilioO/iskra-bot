@@ -149,7 +149,9 @@ from smartlink import (
     schedule_smartlink_update,
     send_smartlink_photo,
     send_artists_list,
+    send_artist_releases,
     send_artist_smartlinks,
+    send_releases_list,
     send_my_smartlinks,
     send_smartlink_list,
     show_smartlink_view,
@@ -1064,6 +1066,72 @@ async def smartlinks_artist_idx_cb(callback):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("releases:my:"))
+async def releases_my_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await send_releases_list(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "release_back")
+async def release_back_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await send_releases_list(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("release_open_idx:"))
+async def release_open_idx_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    form = await form_get(tg_id)
+    data = (form or {}).get("data") or {}
+    artists = data.get("artists") or []
+    if not artists and form and form.get("form_name") == "release_artists_list":
+        from smartlink import get_user_artists
+        artists = await get_user_artists(tg_id)
+    if idx < 0 or idx >= len(artists):
+        await callback.answer("Список устарел. Открываю заново.", show_alert=True)
+        await send_releases_list(callback.message, tg_id)
+        await callback.answer()
+        return
+    artist_name = artists[idx]
+    await send_artist_releases(callback.message, tg_id, artist_name, artist_idx=idx)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("releases:artist_idx:"))
+async def releases_artist_idx_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    form = await form_get(tg_id)
+    data = (form or {}).get("data") or {}
+    artists = data.get("artists") or []
+    if not artists:
+        from smartlink import get_user_artists
+        artists = await get_user_artists(tg_id)
+    if idx < 0 or idx >= len(artists):
+        await callback.answer("Список устарел. Открываю заново.", show_alert=True)
+        await send_releases_list(callback.message, tg_id)
+        await callback.answer()
+        return
+    artist_name = artists[idx]
+    await send_artist_releases(callback.message, tg_id, artist_name, artist_idx=idx)
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("smartlinks:edit:"))
 async def smartlinks_edit_cb(callback):
     tg_id = callback.from_user.id
@@ -1071,10 +1139,16 @@ async def smartlinks_edit_cb(callback):
     smartlink_id, tail = parse_smartlink_callback_data(callback.data, 1)
     page_part = tail[0] if tail else None
     back_artist_idx: int | None = None
+    back_release_artist_idx: int | None = None
     page = 0
     if page_part is not None:
         s = str(page_part)
-        if s.startswith("aidx"):
+        if s.startswith("ridx"):
+            try:
+                back_release_artist_idx = int(s[4:])
+            except ValueError:
+                pass
+        elif s.startswith("aidx"):
             try:
                 back_artist_idx = int(s[4:])
             except ValueError:
@@ -1121,6 +1195,7 @@ async def smartlinks_edit_cb(callback):
             smartlink.get("branding_disabled"),
             smartlink.get("branding_paid"),
             back_artist_idx=back_artist_idx,
+            back_release_artist_idx=back_release_artist_idx,
         ),
     )
     await callback.answer()

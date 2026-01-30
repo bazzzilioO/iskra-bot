@@ -464,7 +464,8 @@ async def count_owned_smartlinks(owner_tg_user_id: int | str) -> int | None:
 
 
 async def get_user_artists(owner_tg_user_id: int | str) -> list[str]:
-    """Return distinct artist_name for user's smartlinks (source of truth: artist_name in smartlinks)."""
+    """Return distinct artist_name for user (smartlinks; can be extended to UNION with releases table).
+    Used for both «Мои смартлинки» and «Мои релизы» navigation."""
     async with _smartlink_d1_connection() as db:
         if not db:
             return []
@@ -520,6 +521,14 @@ async def get_smartlinks_by_artist(
                 artist_name,
             )
             return []
+
+
+async def get_releases_by_artist(
+    owner_tg_user_id: int | str, artist_name: str
+) -> list[dict]:
+    """Return releases (smartlinks) for the given user and artist_name, ordered by created_at DESC.
+    In this bot releases = smartlinks; if a separate releases table is added later, query it here."""
+    return await get_smartlinks_by_artist(owner_tg_user_id, artist_name)
 
 
 async def fetch_owned_smartlink_from_d1(

@@ -107,3 +107,8 @@ ARTIST_EMPTY_SMARTLINKS = "У этого артиста пока нет смар
 SMARTLINK_ARTIST_SELECT_TITLE = "Выберите артиста для нового смартлинка"
 SMARTLINK_ARTIST_NEW = "Новый артист"
 SMARTLINK_ARTIST_INPUT_PROMPT = "Введите имя артиста/проекта (как будет на площадках):"
+
+# Мои релизы по артистам
+MY_RELEASES_ARTISTS_TITLE = "Выберите артиста"
+MY_RELEASES_EMPTY_ARTISTS = "У тебя пока нет релизов. Создай первый смарт-линк через «➕ Создать смарт-линк»."
+ARTIST_EMPTY_RELEASES = "У этого артиста пока нет релизов. Создайте первый."
