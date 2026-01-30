@@ -1209,17 +1209,8 @@ async def smartlinks_edit_cb(callback):
         return
     artist_slug = str(smartlink.get("artist_slug") or "").strip()
     slug = str(smartlink.get("slug") or "").strip()
-    # Use local numeric id for all edit-menu callbacks to avoid BUTTON_DATA_INVALID (64-byte limit).
-    d1_id = smartlink.get("d1_id")
-    if d1_id is None and artist_slug and slug:
-        d1 = await fetch_owned_smartlink_from_d1(tg_id, artist_slug, slug)
-        if not d1:
-            # Ensure a local record exists so we can obtain a short id.
-            await upsert_owned_smartlink_to_d1({**smartlink, "owner_tg_user_id": str(tg_id), "artist_slug": artist_slug, "slug": slug})
-            d1 = await fetch_owned_smartlink_from_d1(tg_id, artist_slug, slug)
-        if isinstance(d1, dict) and d1.get("d1_id") is not None:
-            d1_id = d1.get("d1_id")
-    resolved_id = d1_id or smartlink.get("id") or build_smartlink_id(artist_slug, slug) or smartlink_id
+    # Id из D1: artist_slug:slug (единый идентификатор, без числовых сущностей).
+    resolved_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug) or smartlink_id
     text = build_smartlink_view_text(smartlink)
     await callback.message.answer(
         text + "\n\nВыбери, что обновить:",
@@ -1504,16 +1495,8 @@ async def smartlinks_edit_menu_cb(callback):
         return
     artist_slug = str(smartlink.get("artist_slug") or "").strip()
     slug = str(smartlink.get("slug") or "").strip()
-    # Use local numeric id for edit-menu callbacks to avoid BUTTON_DATA_INVALID.
-    d1_id = smartlink.get("d1_id")
-    if d1_id is None and artist_slug and slug:
-        d1 = await fetch_owned_smartlink_from_d1(tg_id, artist_slug, slug)
-        if not d1:
-            await upsert_owned_smartlink_to_d1({**smartlink, "owner_tg_user_id": str(tg_id), "artist_slug": artist_slug, "slug": slug})
-            d1 = await fetch_owned_smartlink_from_d1(tg_id, artist_slug, slug)
-        if isinstance(d1, dict) and d1.get("d1_id") is not None:
-            d1_id = d1.get("d1_id")
-    resolved_id = d1_id or smartlink.get("id") or build_smartlink_id(artist_slug, slug) or smartlink_id
+    # Id из D1: artist_slug:slug.
+    resolved_id = smartlink.get("id") or build_smartlink_id(artist_slug, slug) or smartlink_id
 
     text = build_smartlink_view_text(smartlink)
 

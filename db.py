@@ -85,8 +85,9 @@ def _normalize_d1_smartlink(row: aiosqlite.Row) -> dict:
 
     cover_file_id = data.get("cover_file_id") or cover_source.get("file_id") or ""
 
+    # Единый id как в D1: artist_slug:slug. Числовой id из SQLite не используем в UI.
     smartlink = {
-        "id": f"{artist_slug}:{slug}" if artist_slug and slug else str(data.get("id") or ""),
+        "id": f"{artist_slug}:{slug}" if (artist_slug and slug) else "",
         "d1_id": data.get("id"),
         "owner_tg_user_id": owner_tg_user_id,
         "artist": data.get("artist") or data.get("artist_name") or "",
@@ -471,6 +472,7 @@ async def get_user_artists(owner_tg_user_id: int | str) -> list[str]:
         if not db:
             return []
         try:
+            await _ensure_smartlinks_table(db)
             cur = await db.execute(
                 """
                 SELECT DISTINCT artist_name FROM smartlinks
@@ -497,6 +499,7 @@ async def get_smartlinks_by_artist(
         if not db:
             return []
         try:
+            await _ensure_smartlinks_table(db)
             cur = await db.execute("PRAGMA table_info(smartlinks)")
             rows = await cur.fetchall()
             columns = {row[1] for row in rows}
@@ -725,12 +728,66 @@ async def fetch_owned_smartlink_from_d1(
             return None
 
 
+SMARTLINKS_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS smartlinks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_tg_user_id TEXT NOT NULL,
+        owner_tg_username TEXT,
+        owner_display_name TEXT,
+        artist_slug TEXT NOT NULL,
+        slug TEXT NOT NULL,
+        artist TEXT,
+        artist_name TEXT,
+        title TEXT,
+        release_date TEXT,
+        cover_file_id TEXT,
+        cover_url TEXT,
+        cover_version INTEGER,
+        caption_text TEXT,
+        branding_disabled INTEGER,
+        branding_paid INTEGER,
+        pre_save_enabled INTEGER,
+        reminders_enabled INTEGER,
+        links_json TEXT,
+        cover_source_json TEXT,
+        metadata_json TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        cover_updated_at TEXT,
+        UNIQUE(owner_tg_user_id, artist_slug, slug)
+    )
+"""
+
+
+async def _ensure_smartlinks_table(db) -> None:
+    await db.execute(SMARTLINKS_TABLE_DDL)
+
+
 async def fetch_owned_smartlink_by_id(
     owner_tg_user_id: int | str,
     smartlink_id: int | str,
 ) -> dict | None:
+    try:
+        sid = int(smartlink_id)
+    except (TypeError, ValueError):
+        return None
     async with _smartlink_d1_connection() as db:
         if not db:
+            return None
+        try:
+            await _ensure_smartlinks_table(db)
+            cur = await db.execute(
+                "SELECT * FROM smartlinks WHERE owner_tg_user_id=? AND id=? LIMIT 1",
+                (str(owner_tg_user_id), sid),
+            )
+            row = await cur.fetchone()
+            return _normalize_d1_smartlink(row) if row else None
+        except Exception:
+            logger.exception(
+                "[smartlink-d1] fetch_by_id failed owner=%s id=%s",
+                owner_tg_user_id,
+                smartlink_id,
+            )
             return None
 
 
