@@ -390,7 +390,6 @@ def smartlinks_menu_kb() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Создать смарт-линк", callback_data="smartlinks:create")],
             [InlineKeyboardButton(text="📎 Мои смартлинки", callback_data="smartlinks:my:0")],
-            [InlineKeyboardButton(text="📀 Мои релизы", callback_data="releases:my:0")],
             [InlineKeyboardButton(text="❓ Помощь по смарт-линкам", callback_data="smartlinks:help")],
             [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_focus")],
         ]
