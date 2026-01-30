@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 # Import from other modules (lazy imports inside functions where needed)
 from db import (
+    create_bulk_job,
     ensure_user as db_ensure_user,
     form_clear,
     form_get,
@@ -116,6 +117,7 @@ from keyboards import (
     smartlinks_menu_kb,
 )
 from texts import (
+    BULK_COLLECT_START,
     EXPERIENCE_PROMPT_TEXT,
     EXPECTATIONS_TEXT,
     HELP,
@@ -152,6 +154,7 @@ from smartlink import (
     send_artist_releases,
     send_artist_smartlinks,
     send_releases_list,
+    process_bulk_collect_job,
     send_my_smartlinks,
     send_smartlink_list,
     show_smartlink_view,
@@ -1064,6 +1067,39 @@ async def smartlinks_artist_idx_cb(callback):
     artist_name = artists[idx]
     await send_artist_smartlinks(callback.message, tg_id, artist_name, artist_idx=idx)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:bulk_collect:"))
+async def smartlinks_bulk_collect_cb(callback):
+    """Start bulk collect job: expand links for all releases with a seed link."""
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    form = await form_get(tg_id)
+    data = (form or {}).get("data") or {}
+    artists = data.get("artists") or []
+    if not artists:
+        from smartlink import get_user_artists
+        artists = await get_user_artists(tg_id)
+    if idx < 0 or idx >= len(artists):
+        await callback.answer("Список устарел. Открой артиста заново.", show_alert=True)
+        return
+    artist_name = artists[idx]
+    from db import get_smartlinks_by_artist
+    items = await get_smartlinks_by_artist(tg_id, artist_name)
+    n = len(items)
+    job_id = await create_bulk_job(tg_id, artist_name)
+    await callback.answer()
+    await callback.message.answer(BULK_COLLECT_START.format(n=n))
+    bot = callback.bot
+    chat_id = callback.message.chat.id
+    asyncio.create_task(
+        process_bulk_collect_job(tg_id, artist_name, job_id, chat_id, bot)
+    )
 
 
 @dp.callback_query(F.data.startswith("releases:my:"))

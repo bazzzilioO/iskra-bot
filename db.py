@@ -3,6 +3,7 @@ from datetime import timezone
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Iterable
 
@@ -529,6 +530,121 @@ async def get_releases_by_artist(
     """Return releases (smartlinks) for the given user and artist_name, ordered by created_at DESC.
     In this bot releases = smartlinks; if a separate releases table is added later, query it here."""
     return await get_smartlinks_by_artist(owner_tg_user_id, artist_name)
+
+
+BULK_JOBS_TABLE = "bulk_jobs"
+BULK_JOB_TYPE_COLLECT = "bulk_collect_smartlinks"
+BULK_JOB_STATUS_QUEUED = "queued"
+BULK_JOB_STATUS_RUNNING = "running"
+BULK_JOB_STATUS_DONE = "done"
+BULK_JOB_STATUS_FAILED = "failed"
+BULK_JOB_STATUS_CANCELED = "canceled"
+
+
+async def _ensure_bulk_jobs_table(db) -> None:
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bulk_jobs (
+            id TEXT PRIMARY KEY,
+            owner_tg_user_id TEXT NOT NULL,
+            artist_name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            progress_total INTEGER DEFAULT 0,
+            progress_done INTEGER DEFAULT 0,
+            result_json TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+
+
+async def create_bulk_job(
+    owner_tg_user_id: int | str,
+    artist_name: str,
+    job_type: str = BULK_JOB_TYPE_COLLECT,
+) -> str:
+    """Create a queued bulk job; returns job_id (uuid)."""
+    job_id = str(uuid.uuid4())
+    now_iso = dt.datetime.now(timezone.utc).isoformat()
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            raise RuntimeError("D1 not available")
+        await _ensure_bulk_jobs_table(db)
+        await db.execute(
+            """
+            INSERT INTO bulk_jobs (id, owner_tg_user_id, artist_name, type, status, progress_total, progress_done, result_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+            """,
+            (job_id, str(owner_tg_user_id), (artist_name or "").strip(), job_type, BULK_JOB_STATUS_QUEUED, "{}", now_iso, now_iso),
+        )
+        await db.commit()
+    return job_id
+
+
+async def get_bulk_job(job_id: str) -> dict | None:
+    """Return job row as dict or None."""
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return None
+        await _ensure_bulk_jobs_table(db)
+        cur = await db.execute(
+            "SELECT id, owner_tg_user_id, artist_name, type, status, progress_total, progress_done, result_json, created_at, updated_at FROM bulk_jobs WHERE id=?",
+            (job_id,),
+        )
+        row = await cur.fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "owner_tg_user_id": row[1],
+        "artist_name": row[2],
+        "type": row[3],
+        "status": row[4],
+        "progress_total": row[5] or 0,
+        "progress_done": row[6] or 0,
+        "result_json": row[7],
+        "created_at": row[8],
+        "updated_at": row[9],
+    }
+
+
+async def update_bulk_job(
+    job_id: str,
+    *,
+    status: str | None = None,
+    progress_total: int | None = None,
+    progress_done: int | None = None,
+    result_json: str | dict | None = None,
+) -> bool:
+    now_iso = dt.datetime.now(timezone.utc).isoformat()
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return False
+        await _ensure_bulk_jobs_table(db)
+        updates = ["updated_at=?"]
+        params: list = [now_iso]
+        if status is not None:
+            updates.append("status=?")
+            params.append(status)
+        if progress_total is not None:
+            updates.append("progress_total=?")
+            params.append(progress_total)
+        if progress_done is not None:
+            updates.append("progress_done=?")
+            params.append(progress_done)
+        if result_json is not None:
+            raw = json.dumps(result_json, ensure_ascii=False) if isinstance(result_json, dict) else result_json
+            updates.append("result_json=?")
+            params.append(raw)
+        params.append(job_id)
+        await db.execute(
+            f"UPDATE bulk_jobs SET {', '.join(updates)} WHERE id=?",
+            params,
+        )
+        await db.commit()
+    return True
 
 
 async def fetch_owned_smartlink_from_d1(

@@ -447,6 +447,13 @@ def build_artist_smartlinks_kb(
                 )
         if row:
             rows.append(row)
+    if artist_idx >= 0:
+        rows.append([
+            InlineKeyboardButton(
+                text="⚡ Собрать смарт-линки по релизам",
+                callback_data=f"smartlinks:bulk_collect:{artist_idx}",
+            )
+        ])
     rows.append([InlineKeyboardButton(text="◀️ К артистам", callback_data="artist_back")])
     rows.append([InlineKeyboardButton(text="➕ Новый смартлинк", callback_data="smartlinks:create")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -503,6 +510,13 @@ def build_artist_releases_kb(
                 )
         if row:
             rows.append(row)
+    if artist_idx >= 0:
+        rows.append([
+            InlineKeyboardButton(
+                text="⚡ Собрать смарт-линки по релизам",
+                callback_data=f"smartlinks:bulk_collect:{artist_idx}",
+            )
+        ])
     rows.append([InlineKeyboardButton(text="◀️ К артистам", callback_data="release_back")])
     rows.append([InlineKeyboardButton(text="➕ Новый смартлинк", callback_data="smartlinks:create")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

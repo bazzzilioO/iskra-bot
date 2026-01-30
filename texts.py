@@ -112,3 +112,17 @@ SMARTLINK_ARTIST_INPUT_PROMPT = "Введите имя артиста/проек
 MY_RELEASES_ARTISTS_TITLE = "Выберите артиста"
 MY_RELEASES_EMPTY_ARTISTS = "У тебя пока нет релизов. Создай первый смарт-линк через «➕ Создать смарт-линк»."
 ARTIST_EMPTY_RELEASES = "У этого артиста пока нет релизов. Создайте первый."
+
+# Сбор смарт-линков по релизам (bulk collect)
+BULK_COLLECT_START = "Запустил сбор. Проверю {n} релизов. Результат пришлю сообщением."
+BULK_COLLECT_DONE = (
+    "Готово.\n\n"
+    "Проверено: {total}\n"
+    "Обновлено: {updated}\n"
+    "Пропущено (нет seed-ссылки): {skipped}\n"
+    "Ошибки: {errors_count}"
+)
+BULK_COLLECT_DONE_EXTRA = (
+    "\n\nЧтобы собрать остальные — открой релиз и добавь хотя бы одну ссылку на любую площадку."
+)
+BULK_COLLECT_ERRORS_PREVIEW = "Ошибки (первые 5): {preview}"

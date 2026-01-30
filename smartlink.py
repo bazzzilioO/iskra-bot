@@ -31,6 +31,12 @@ from config import (
     SONGLINK_PLATFORM_ALIASES,
 )
 from db import (
+    BULK_JOB_STATUS_DONE,
+    BULK_JOB_STATUS_FAILED,
+    BULK_JOB_STATUS_RUNNING,
+    create_bulk_job,
+    get_bulk_job,
+    update_bulk_job,
     count_owned_smartlinks,
     enqueue_smartlink_publish_retry,
     list_due_smartlink_publish_jobs,
@@ -91,6 +97,9 @@ from keyboards import (
 from texts import (
     ARTIST_EMPTY_RELEASES,
     ARTIST_EMPTY_SMARTLINKS,
+    BULK_COLLECT_DONE,
+    BULK_COLLECT_DONE_EXTRA,
+    BULK_COLLECT_ERRORS_PREVIEW,
     MY_RELEASES_ARTISTS_TITLE,
     MY_RELEASES_EMPTY_ARTISTS,
     MY_SMARTLINKS_ARTISTS_TITLE,
@@ -160,6 +169,145 @@ def is_rate_limited_response(status: int, body: str | None) -> bool:
 def platform_label(platform: str) -> str:
     """Get platform label."""
     return PLATFORM_LABELS.get(platform, platform)
+
+
+BULK_COLLECT_RATE_LIMIT_SLEEP = 0.35  # seconds between resolve_links calls
+
+
+async def expand_links_by_seed(seed_url: str) -> dict[str, str]:
+    """Get multi-platform links from one seed URL (Songlink/resolver). Returns dict platform -> url.
+    Rate-limited; no artist/title search — strict seed-only."""
+    seed_url = (seed_url or "").strip()
+    if not seed_url or not seed_url.startswith("http"):
+        return {}
+    from bot import resolve_links
+    await asyncio.sleep(BULK_COLLECT_RATE_LIMIT_SLEEP)
+    try:
+        links, _ = await resolve_links(seed_url)
+        return dict(links) if isinstance(links, dict) else {}
+    except Exception as e:
+        logger.warning("[bulk-collect] expand_links_by_seed failed seed=%s err=%s", seed_url[:60], e)
+        return {}
+
+
+def _pick_seed_url_from_smartlink(item: dict) -> str | None:
+    """Get any one platform URL from smartlink links to use as seed. Returns None if no link."""
+    links = item.get("links") or {}
+    if not isinstance(links, dict):
+        return None
+    for _platform, url in links.items():
+        u = (url or "").strip()
+        if u and u.startswith("http"):
+            return u
+    return None
+
+
+async def process_bulk_collect_job(
+    owner_tg_user_id: int | str,
+    artist_name: str,
+    job_id: str,
+    chat_id: int,
+    bot: "Bot",
+) -> None:
+    """Process bulk collect: for each release (smartlink) with a seed link, expand and upsert.
+    Updates job progress/result in D1 and sends final report to chat_id."""
+    owner = str(owner_tg_user_id)
+    artist_name = (artist_name or "").strip()
+    result = {"total": 0, "updated": 0, "skipped": 0, "errors": []}
+    try:
+        items = await get_smartlinks_by_artist(owner, artist_name)
+        result["total"] = len(items)
+        await update_bulk_job(
+            job_id,
+            status=BULK_JOB_STATUS_RUNNING,
+            progress_total=len(items),
+            progress_done=0,
+        )
+        for i, item in enumerate(items):
+            release_id = item.get("id") or item.get("d1_id") or ""
+            title = (item.get("title") or "").strip() or "Без названия"
+            seed = _pick_seed_url_from_smartlink(item)
+            if not seed:
+                result["skipped"] += 1
+                result["errors"].append(
+                    {"release_id": str(release_id), "title": title, "reason": "no_seed"}
+                )
+                await update_bulk_job(job_id, progress_done=i + 1, result_json=result)
+                continue
+            try:
+                new_links = await expand_links_by_seed(seed)
+                if not new_links:
+                    result["errors"].append(
+                        {"release_id": str(release_id), "title": title, "reason": "expand_empty"}
+                    )
+                    await update_bulk_job(job_id, progress_done=i + 1, result_json=result)
+                    continue
+                existing = (item.get("links") or {}).copy()
+                merged = {**existing, **new_links}
+                item["links"] = merged
+                if not item.get("owner_tg_user_id"):
+                    item["owner_tg_user_id"] = owner
+                ok = await upsert_owned_smartlink_to_d1(item)
+                if ok:
+                    result["updated"] += 1
+                else:
+                    result["errors"].append(
+                        {"release_id": str(release_id), "title": title, "reason": "upsert_failed"}
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[bulk-collect] item failed release_id=%s title=%s err=%s",
+                    release_id,
+                    title[:40],
+                    e,
+                )
+                result["errors"].append(
+                    {
+                        "release_id": str(release_id),
+                        "title": title,
+                        "reason": str(e)[:200],
+                    }
+                )
+            await update_bulk_job(job_id, progress_done=i + 1, result_json=result)
+        await update_bulk_job(
+            job_id,
+            status=BULK_JOB_STATUS_DONE,
+            progress_done=result["total"],
+            result_json=result,
+        )
+    except Exception as e:
+        logger.exception("[bulk-collect] job failed job_id=%s", job_id)
+        result["job_error"] = str(e)[:500]
+        await update_bulk_job(
+            job_id,
+            status=BULK_JOB_STATUS_FAILED,
+            result_json=result,
+        )
+    # Send report to user
+    try:
+        err_list = result.get("errors") or []
+        errors_count = len([e for e in err_list if e.get("reason") != "no_seed"])
+        skipped = result.get("skipped", 0)
+        text = BULK_COLLECT_DONE.format(
+            total=result.get("total", 0),
+            updated=result.get("updated", 0),
+            skipped=skipped,
+            errors_count=errors_count,
+        )
+        job_error = result.get("job_error")
+        if job_error:
+            text += f"\n\nЗадача прервана: {job_error[:300]}"
+        if errors_count > 0:
+            real_errors = [e for e in err_list if e.get("reason") != "no_seed"]
+            preview = "; ".join(
+                f"{e.get('title', '')[:20]} ({e.get('reason', '')})" for e in real_errors[:5]
+            )
+            text += "\n\n" + BULK_COLLECT_ERRORS_PREVIEW.format(preview=preview)
+        if skipped > 0:
+            text += BULK_COLLECT_DONE_EXTRA
+        await bot.send_message(chat_id, text)
+    except Exception as e:
+        logger.warning("[bulk-collect] send report failed chat_id=%s err=%s", chat_id, e)
 
 
 # ==================== Text/UI Functions ====================
