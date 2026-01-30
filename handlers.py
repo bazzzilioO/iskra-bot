@@ -148,11 +148,14 @@ from smartlink import (
     smartlink_can_remind,
     schedule_smartlink_update,
     send_smartlink_photo,
+    send_artists_list,
+    send_artist_smartlinks,
     send_my_smartlinks,
     send_smartlink_list,
     show_smartlink_view,
     resend_smartlink_card,
     start_smartlink_form,
+    continue_smartlink_import_after_artist,
     start_smartlink_import,
     skip_prefilled_smartlink_steps,
     log_smartlink_step,
@@ -999,11 +1002,65 @@ async def smartlinks_help_cb(callback):
 async def smartlinks_my_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
+    await send_artists_list(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "artist_back")
+async def artist_back_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    await send_artists_list(callback.message, tg_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("artist_open_idx:"))
+async def artist_open_idx_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
     try:
-        page = int(callback.data.split(":")[-1])
+        idx = int(callback.data.split(":")[-1])
     except ValueError:
-        page = 0
-    await send_my_smartlinks(callback.message, tg_id, page=page)
+        await callback.answer("Не понял", show_alert=True)
+        return
+    form = await form_get(tg_id)
+    data = (form or {}).get("data") or {}
+    artists = data.get("artists") or []
+    if not artists and form and form.get("form_name") == "smartlink_artists_list":
+        from smartlink import get_user_artists
+        artists = await get_user_artists(tg_id)
+    if idx < 0 or idx >= len(artists):
+        await callback.answer("Список устарел. Открываю заново.", show_alert=True)
+        await send_artists_list(callback.message, tg_id)
+        await callback.answer()
+        return
+    artist_name = artists[idx]
+    await send_artist_smartlinks(callback.message, tg_id, artist_name, artist_idx=idx)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("smartlinks:artist_idx:"))
+async def smartlinks_artist_idx_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    form = await form_get(tg_id)
+    data = (form or {}).get("data") or {}
+    artists = data.get("artists") or []
+    if not artists:
+        from smartlink import get_user_artists
+        artists = await get_user_artists(tg_id)
+    if idx < 0 or idx >= len(artists):
+        await callback.answer("Список устарел. Открываю заново.", show_alert=True)
+        await send_artists_list(callback.message, tg_id)
+        await callback.answer()
+        return
+    artist_name = artists[idx]
+    await send_artist_smartlinks(callback.message, tg_id, artist_name, artist_idx=idx)
     await callback.answer()
 
 
@@ -1012,7 +1069,18 @@ async def smartlinks_edit_cb(callback):
     tg_id = callback.from_user.id
     await ensure_user(tg_id)
     smartlink_id, tail = parse_smartlink_callback_data(callback.data, 1)
-    page = parse_page_marker(tail[0] if tail else None, default=0)
+    page_part = tail[0] if tail else None
+    back_artist_idx: int | None = None
+    page = 0
+    if page_part is not None:
+        s = str(page_part)
+        if s.startswith("aidx"):
+            try:
+                back_artist_idx = int(s[4:])
+            except ValueError:
+                pass
+        else:
+            page = parse_page_marker(page_part, default=0)
 
     if not smartlink_id:
         await callback.answer("Не понял", show_alert=True)
@@ -1052,6 +1120,7 @@ async def smartlinks_edit_cb(callback):
             resolved_id,
             smartlink.get("branding_disabled"),
             smartlink.get("branding_paid"),
+            back_artist_idx=back_artist_idx,
         ),
     )
     await callback.answer()
@@ -1842,6 +1911,51 @@ async def smartlink_import_cancel_cb(callback):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("smartlink:artist_idx:"))
+async def smartlink_artist_idx_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") != "smartlink_import_artist":
+        await callback.answer("Нет данных", show_alert=True)
+        return
+    data = form.get("data") or {}
+    names = data.get("artist_names") or []
+    try:
+        idx = int(callback.data.split(":")[-1])
+    except ValueError:
+        await callback.answer("Не понял", show_alert=True)
+        return
+    if idx < 0 or idx >= len(names):
+        await callback.answer("Нет такого артиста", show_alert=True)
+        return
+    artist_name = (names[idx] or "").strip()
+    if not artist_name:
+        await callback.answer("Имя артиста пусто", show_alert=True)
+        return
+    await continue_smartlink_import_after_artist(callback.message, tg_id, artist_name)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "smartlink:artist_new")
+async def smartlink_artist_new_cb(callback):
+    tg_id = callback.from_user.id
+    await ensure_user(tg_id)
+    form = await form_get(tg_id)
+    if not form or form.get("form_name") != "smartlink_import_artist":
+        await callback.answer("Нет данных", show_alert=True)
+        return
+    from texts import SMARTLINK_ARTIST_INPUT_PROMPT
+    data = form.get("data") or {}
+    data["awaiting_new_artist"] = True
+    await form_set(tg_id, 0, data)
+    await callback.message.answer(
+        f"{SMARTLINK_ARTIST_INPUT_PROMPT}\n\nОтмена: /cancel",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("smartlink:prefill_edit:"))
 async def smartlink_prefill_field_cb(callback):
     tg_id = callback.from_user.id
@@ -2583,6 +2697,18 @@ async def any_message_router(message: Message):
         return
 
     form_name = form.get("form_name")
+    if form_name == "smartlink_import_artist":
+        artist_name = txt.strip()
+        if not artist_name:
+            from texts import SMARTLINK_ARTIST_INPUT_PROMPT
+            await message.answer(
+                f"{SMARTLINK_ARTIST_INPUT_PROMPT}\n\nОтмена: /cancel",
+                reply_markup=await user_menu_keyboard(tg_id),
+            )
+            return
+        await continue_smartlink_import_after_artist(message, tg_id, artist_name)
+        return
+
     if form_name == "donate_custom":
         if not txt.isdigit():
             await message.answer(
@@ -2792,9 +2918,14 @@ async def any_message_router(message: Message):
         )
 
         if ready_for_autofill:
+            # Preserve artist_name from creation step if user chose/entered it
+            artist_from_form = (data.get("artist_name") or data.get("artist") or "").strip()
+            artist_from_meta = (selected_meta.get("artist") or "").strip()
+            artist_final = artist_from_form or artist_from_meta
             data.update(
                 {
-                    "artist": selected_meta.get("artist", ""),
+                    "artist": artist_final,
+                    "artist_name": artist_final,
                     "title": selected_meta.get("title", ""),
                     "cover_file_id": cover_file_id,
                     "links": merged_links,
@@ -2836,16 +2967,26 @@ async def any_message_router(message: Message):
                 reply_markup=await user_menu_keyboard(tg_id),
             )
 
+        artist_from_form = (data.get("artist_name") or data.get("artist") or "").strip()
         if total >= 2 and meta_complete:
-            await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
+            await show_import_confirmation(
+                message, tg_id, merged_links, merged_metadata, latest,
+                artist_name_override=artist_from_form or None,
+            )
             return
 
         if meta_complete:
-            await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
+            await show_import_confirmation(
+                message, tg_id, merged_links, merged_metadata, latest,
+                artist_name_override=artist_from_form or None,
+            )
             return
 
         if total >= 2:
-            await show_import_confirmation(message, tg_id, merged_links, merged_metadata, latest)
+            await show_import_confirmation(
+                message, tg_id, merged_links, merged_metadata, latest,
+                artist_name_override=artist_from_form or None,
+            )
             return
 
         data.update({

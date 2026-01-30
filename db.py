@@ -463,6 +463,65 @@ async def count_owned_smartlinks(owner_tg_user_id: int | str) -> int | None:
             return None
 
 
+async def get_user_artists(owner_tg_user_id: int | str) -> list[str]:
+    """Return distinct artist_name for user's smartlinks (source of truth: artist_name in smartlinks)."""
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return []
+        try:
+            cur = await db.execute(
+                """
+                SELECT DISTINCT artist_name FROM smartlinks
+                WHERE owner_tg_user_id = ? AND artist_name IS NOT NULL AND TRIM(artist_name) != ''
+                ORDER BY artist_name COLLATE NOCASE
+                """,
+                (str(owner_tg_user_id),),
+            )
+            rows = await cur.fetchall()
+            return [str(r[0] or "").strip() for r in rows if r and r[0]]
+        except Exception:
+            logger.exception("[smartlink-d1] get_user_artists failed owner=%s", owner_tg_user_id)
+            return []
+
+
+async def get_smartlinks_by_artist(
+    owner_tg_user_id: int | str, artist_name: str
+) -> list[dict]:
+    """Return smartlinks for the given user and artist_name, ordered by created_at DESC."""
+    artist_name = str(artist_name or "").strip()
+    if not artist_name:
+        return []
+    async with _smartlink_d1_connection() as db:
+        if not db:
+            return []
+        try:
+            cur = await db.execute("PRAGMA table_info(smartlinks)")
+            rows = await cur.fetchall()
+            columns = {row[1] for row in rows}
+            if "created_at" not in columns:
+                order_expr = "rowid DESC"
+            else:
+                order_expr = "created_at DESC"
+            query = (
+                "SELECT * FROM smartlinks "
+                "WHERE owner_tg_user_id = ? AND TRIM(COALESCE(artist_name, '')) = ? "
+                f"ORDER BY {order_expr}"
+            )
+            cur = await db.execute(
+                query,
+                (str(owner_tg_user_id), artist_name),
+            )
+            rows = await cur.fetchall()
+            return [_normalize_d1_smartlink(row) for row in rows]
+        except Exception:
+            logger.exception(
+                "[smartlink-d1] get_smartlinks_by_artist failed owner=%s artist_name=%s",
+                owner_tg_user_id,
+                artist_name,
+            )
+            return []
+
+
 async def fetch_owned_smartlink_from_d1(
     owner_tg_user_id: int | str,
     artist_slug: str,

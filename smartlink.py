@@ -7,6 +7,7 @@ from datetime import timezone
 import json
 import logging
 import os
+import time
 import traceback
 from urllib.parse import urlparse
 
@@ -40,6 +41,8 @@ from db import (
     fetch_owned_smartlink_from_d1,
     delete_owned_smartlink_from_d1,
     delete_smartlink_state,
+    get_smartlinks_by_artist,
+    get_user_artists,
     upsert_owned_smartlink_to_d1,
     clear_deleted_smartlink,
     list_deleted_smartlinks,
@@ -74,13 +77,24 @@ from keyboards import (
     PLATFORM_LABELS,
     SMARTLINK_BUTTON_ORDER,
     SMARTLINK_PLATFORMS,
+    build_artist_smartlinks_kb,
+    build_artists_list_kb,
     build_smartlink_buttons,
     build_smartlink_keyboard,
     smartlink_step_kb,
     smartlink_view_kb,
     smartlinks_menu_kb,
 )
-from texts import SMARTLINKS_HELP_TEXT, SMARTLINK_IMPORT_PROMPT
+from texts import (
+    ARTIST_EMPTY_SMARTLINKS,
+    MY_SMARTLINKS_ARTISTS_TITLE,
+    MY_SMARTLINKS_EMPTY_ARTISTS,
+    SMARTLINK_ARTIST_INPUT_PROMPT,
+    SMARTLINK_ARTIST_NEW,
+    SMARTLINK_ARTIST_SELECT_TITLE,
+    SMARTLINKS_HELP_TEXT,
+    SMARTLINK_IMPORT_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1509,6 +1523,67 @@ async def send_smartlink_photo(
         return await _send_smartlink_fallback(bot, chat_id, smartlink)
 
 
+async def send_artists_list(message: Message, tg_id: int):
+    """Show list of user's artists (from artist_name in smartlinks). Store artists in FSM for stateless callbacks."""
+    artists = await get_user_artists(tg_id)
+    if not artists:
+        await message.answer(
+            MY_SMARTLINKS_EMPTY_ARTISTS,
+            reply_markup=smartlinks_menu_kb(),
+        )
+        return
+    await form_start(tg_id, "smartlink_artists_list")
+    await form_set(tg_id, 0, {"artists": artists})
+    if len(artists) == 1:
+        await send_artist_smartlinks(message, tg_id, artists[0], artist_idx=0)
+        return
+    text = MY_SMARTLINKS_ARTISTS_TITLE
+    kb = build_artists_list_kb(artists)
+    await message.answer(text, reply_markup=kb)
+
+
+async def send_artist_smartlinks(
+    message: Message, tg_id: int, artist_name: str, artist_idx: int | None = None
+):
+    """Show smartlinks for one artist (from D1). artist_idx used for edit-menu back callback."""
+    artist_name = (artist_name or "").strip()
+    if not artist_name:
+        await message.answer(
+            MY_SMARTLINKS_EMPTY_ARTISTS,
+            reply_markup=smartlinks_menu_kb(),
+        )
+        return
+    items = await get_smartlinks_by_artist(tg_id, artist_name)
+    try:
+        deleted = await list_deleted_smartlinks(tg_id)
+    except Exception:
+        deleted = set()
+    if deleted and items:
+        items = [
+            it
+            for it in items
+            if (str(it.get("artist_slug") or "").strip(), str(it.get("slug") or "").strip())
+            not in deleted
+        ]
+    if not items:
+        text = f"{artist_name}\n\n{ARTIST_EMPTY_SMARTLINKS}"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Новый смартлинк", callback_data="smartlinks:create")],
+                [InlineKeyboardButton(text="◀️ К артистам", callback_data="artist_back")],
+            ]
+        )
+        await message.answer(text, reply_markup=kb)
+        return
+    lines = [artist_name, ""]
+    for idx, item in enumerate(items, 1):
+        title = item.get("title") or item.get("track_title") or "Без названия"
+        lines.append(f"{idx}. {title}")
+    text = "\n".join(lines)
+    kb = build_artist_smartlinks_kb(items, artist_idx if artist_idx is not None else -1)
+    await message.answer(text, reply_markup=kb)
+
+
 async def send_my_smartlinks(message: Message, tg_id: int, page: int = 0):
     ok, items, total_count, total_pages = await fetch_my_smartlinks_from_index(
         tg_id,
@@ -1767,14 +1842,62 @@ async def start_smartlink_form(
 
 
 async def start_smartlink_import(message: Message, tg_id: int):
-    """Start smartlink import - lazy import to avoid circular dependencies."""
+    """Start smartlink import: first resolve artist_name (select or new), then ask for link."""
     from bot import user_menu_keyboard
-    
+
+    artists = await get_user_artists(tg_id)
+    await form_start(tg_id, "smartlink_import_artist")
+    if artists:
+        data = {"artist_names": artists}
+        await form_set(tg_id, 0, data)
+        rows: list[list[InlineKeyboardButton]] = []
+        for idx, name in enumerate(artists):
+            rows.append([
+                InlineKeyboardButton(
+                    text=name,
+                    callback_data=f"smartlink:artist_idx:{idx}",
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(text=SMARTLINK_ARTIST_NEW, callback_data="smartlink:artist_new"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="Отмена", callback_data="smartlink:import_cancel"),
+        ])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+        await message.answer(
+            SMARTLINK_ARTIST_SELECT_TITLE,
+            reply_markup=kb,
+        )
+        return
+    await form_set(tg_id, 0, {})
+    await message.answer(
+        f"{SMARTLINK_ARTIST_INPUT_PROMPT}\n\nОтмена: /cancel",
+        reply_markup=await user_menu_keyboard(tg_id),
+    )
+
+
+async def continue_smartlink_import_after_artist(
+    message: Message, tg_id: int, artist_name: str
+):
+    """After artist is chosen: set form to smartlink_import and show link prompt. artist_name must be stripped."""
+    from bot import user_menu_keyboard
+
+    artist_name = (artist_name or "").strip()
+    if not artist_name:
+        return
     await form_start(tg_id, "smartlink_import")
     await form_set(
         tg_id,
         0,
-        {"links": {}, "metadata": {}, "bandlink_help_shown": False, "low_links_hint_shown": False},
+        {
+            "links": {},
+            "metadata": {},
+            "artist_name": artist_name,
+            "artist": artist_name,
+            "bandlink_help_shown": False,
+            "low_links_hint_shown": False,
+        },
     )
     await message.answer(
         SMARTLINK_IMPORT_PROMPT,
@@ -1802,7 +1925,7 @@ async def finalize_smartlink_form(
         pass
     
     try:
-        artist = data.get("artist") or ""
+        artist = (data.get("artist_name") or data.get("artist") or "").strip()
         title = data.get("title") or ""
         release_iso = data.get("release_date") or ""
         cover_file_id = data.get("cover_file_id") or ""
@@ -1903,6 +2026,7 @@ async def finalize_smartlink_form(
             "owner_tg_username": owner_username or "",
             "owner_display_name": owner_display_name or "",
             "artist": artist,
+            "artist_name": artist,
             "title": title,
             "release_date": release_iso,
             "cover_file_id": cover_file_id,
@@ -2406,8 +2530,11 @@ async def show_import_confirmation(
     links: dict[str, str],
     metadata: dict | None,
     latest: dict | None = None,
+    artist_name_override: str | None = None,
 ):
-    """Show import confirmation - lazy import to avoid circular dependencies."""
+    """Show import confirmation - lazy import to avoid circular dependencies.
+    artist_name_override: if set (from creation step), use it for artist.
+    """
     sources = filter_human_sources((metadata or {}).get("sources") or {})
     preferred_source = (metadata or {}).get("preferred_source") or (metadata or {}).get("source_platform")
     if preferred_source:
@@ -2416,8 +2543,8 @@ async def show_import_confirmation(
         preferred_source = next(iter(sources.keys()))
     selected_meta = sources.get(preferred_source, metadata or {}) if metadata else {}
 
-    # Never fall back to latest smartlink for artist/title: that can silently create a wrong release.
-    artist = selected_meta.get("artist") or ""
+    # Prefer artist from creation step (artist_name_override); else from metadata.
+    artist = (artist_name_override or "").strip() or (selected_meta.get("artist") or "")
     title = selected_meta.get("title") or ""
     release_date = selected_meta.get("release_date") or ((latest.get("release_date") or "") if latest else "")
     caption_text = (latest.get("caption_text") or "") if latest else ""
@@ -2489,6 +2616,7 @@ async def show_import_confirmation(
         0,
         {
             "artist": artist,
+            "artist_name": artist,
             "title": title,
             "release_date": release_date,
             "cover_file_id": cover_file_id,
